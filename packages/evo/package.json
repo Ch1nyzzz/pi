@@ -1,0 +1,68 @@
+{
+	"name": "@earendil-works/pi-evo",
+	"version": "0.80.6",
+	"description": "Self-evolving coding agent workflows for pi",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./extension": {
+			"types": "./dist/extension.d.ts",
+			"import": "./dist/extension.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"bin": {
+		"evo-pi": "./dist/bin.js"
+	},
+	"pi": {
+		"extensions": [
+			"./dist/extension.js"
+		]
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"CHANGELOG.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"copy-assets": "shx mkdir -p dist/prompts && shx cp src/prompts/*.md dist/prompts/",
+		"build": "tsgo -p tsconfig.build.json && npm run copy-assets && shx chmod +x dist/bin.js",
+		"test": "vitest --run",
+		"prepublishOnly": "npm run clean && npm run build"
+	},
+	"keywords": [
+		"pi",
+		"pi-package",
+		"coding-agent",
+		"self-evolution"
+	],
+	"author": "Earendil Works",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/earendil-works/pi.git",
+		"directory": "packages/evo"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-agent-core": "0.80.6",
+		"@earendil-works/pi-ai": "0.80.6",
+		"@earendil-works/pi-coding-agent": "0.80.6",
+		"@types/node": "24.12.4",
+		"shx": "0.4.0",
+		"typescript": "5.9.3",
+		"vitest": "4.1.9"
+	}
+}
