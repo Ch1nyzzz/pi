@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -45,6 +45,25 @@ async function compileSource(
 	summary = "Test bundle",
 ): Promise<CompiledBundle> {
 	return compileBundle({ paths, sourceDirectory, parentDigest, summary });
+}
+
+async function compileRegistryPair(
+	paths: EvoPaths,
+	temporaryRoot: string,
+	label: string,
+): Promise<{ initial: CompiledBundle; candidate: CompiledBundle }> {
+	const initialSource = join(temporaryRoot, `${label}-initial-source`);
+	const candidateSource = join(temporaryRoot, `${label}-candidate-source`);
+	await writeBundleSource(initialSource);
+	const initial = await compileSource(paths, initialSource, null, `${label} initial bundle`);
+	await writeBundleSource(candidateSource, {
+		files: [
+			["prompts/system.md", "Follow repository instructions and preserve atomic registry state."],
+			["memory/user.md", "The user prefers concise technical prose."],
+		],
+	});
+	const candidate = await compileSource(paths, candidateSource, initial.digest, `${label} candidate bundle`);
+	return { initial, candidate };
 }
 
 describe("bundle compilation and registry", () => {
@@ -141,6 +160,29 @@ describe("bundle compilation and registry", () => {
 		await expect(compileSource(paths, source)).rejects.toThrow("Prompt bytes 65537 exceed limit 65536");
 	});
 
+	it("accepts the bundle compilation check that staging actually executes", async () => {
+		const source = join(temporaryRoot, "bundle-check-source");
+		await writeBundleSource(source, {
+			policy: { ...DEFAULT_POLICY, validation: { requiredChecks: ["bundle-compile"] } },
+		});
+
+		const bundle = await compileSource(paths, source);
+		expect(bundle.policy.validation?.requiredChecks).toEqual(["bundle-compile"]);
+	});
+
+	it.each(["lint", "typecheck", "unit-tests"])("rejects the unimplemented %s policy check", async (check) => {
+		const source = join(temporaryRoot, `${check}-check-source`);
+		await writeBundleSource(source);
+		await writeFile(
+			join(source, "policy.json"),
+			`${JSON.stringify({ ...DEFAULT_POLICY, validation: { requiredChecks: [check] } }, undefined, "\t")}\n`,
+		);
+
+		await expect(compileSource(paths, source)).rejects.toThrow(
+			"policy.validation.requiredChecks contains an unsupported check",
+		);
+	});
+
 	it("rejects path traversal in policy asset references", async () => {
 		const source = join(temporaryRoot, "traversal-source");
 		await writeBundleSource(source, {
@@ -212,6 +254,254 @@ describe("bundle compilation and registry", () => {
 			.split("\n")
 			.map((line) => (JSON.parse(line) as { action: string }).action);
 		expect(historyActions).toEqual(["initialize", "trial-start", "trial-keep", "rollback"]);
+	});
+
+	it("fails closed when recovery sees a state outside the recorded before/after images", async () => {
+		const initialSource = join(temporaryRoot, "recovery-initial-source");
+		const candidateSource = join(temporaryRoot, "recovery-candidate-source");
+		await writeBundleSource(initialSource);
+		const initial = await compileSource(paths, initialSource, null, "Recovery initial bundle");
+		await writeBundleSource(candidateSource, {
+			files: [
+				["prompts/system.md", "Follow the repository instructions and recover safely."],
+				["memory/user.md", "The user prefers concise technical prose."],
+			],
+		});
+		const candidate = await compileSource(paths, candidateSource, initial.digest, "Recovery candidate");
+		await new BundleRegistry(paths).initialize(initial.digest);
+
+		let failed = false;
+		const interrupted = new BundleRegistry(paths, {
+			afterTransitionStep(step, action) {
+				if (!failed && action === "activate-trial" && step === "prepared") {
+					failed = true;
+					throw new Error("simulated registry interruption");
+				}
+			},
+		});
+		await expect(
+			interrupted.activateTrial({
+				digest: candidate.digest,
+				proposalId: "proposal-recovery",
+				plan: "Exercise crash recovery",
+			}),
+		).rejects.toThrow("simulated registry interruption");
+
+		const thirdDigest = "f".repeat(64);
+		await writeFile(paths.stable, `${thirdDigest}\n`);
+		const recovering = new BundleRegistry(paths);
+		await expect(recovering.pause("Trigger pending recovery")).rejects.toThrow(
+			"unexpected stable state; refusing to overwrite it",
+		);
+		expect((await readFile(paths.stable, "utf8")).trim()).toBe(thirdDigest);
+		expect(JSON.parse(await readFile(paths.transition, "utf8"))).toMatchObject({
+			action: "activate-trial",
+			stableBefore: initial.digest,
+			stableAfter: candidate.digest,
+		});
+	});
+
+	it.each(["stable", "trial", "paused", "status"] as const)(
+		"recovers a half-committed transition before the %s read API returns",
+		async (reader) => {
+			const { initial, candidate } = await compileRegistryPair(paths, temporaryRoot, `consistent-read-${reader}`);
+			await new BundleRegistry(paths).initialize(initial.digest);
+			let failed = false;
+			const interrupted = new BundleRegistry(paths, {
+				afterTransitionStep(step, action) {
+					if (!failed && action === "activate-trial" && step === "trial-written") {
+						failed = true;
+						throw new Error("simulated half-commit");
+					}
+				},
+			});
+			await expect(
+				interrupted.activateTrial({
+					digest: candidate.digest,
+					proposalId: "proposal-consistent-read",
+					plan: "Recover before public reads",
+				}),
+			).rejects.toThrow("simulated half-commit");
+
+			const recovering = new BundleRegistry(paths);
+			if (reader === "stable") {
+				expect(await recovering.readStableDigest()).toBe(candidate.digest);
+			} else if (reader === "trial") {
+				expect(await recovering.readTrial()).toMatchObject({ digest: candidate.digest });
+			} else if (reader === "paused") {
+				expect(await recovering.isPaused()).toBe(false);
+			} else {
+				expect(await recovering.getStatus()).toMatchObject({
+					stableDigest: candidate.digest,
+					trial: { digest: candidate.digest },
+					paused: false,
+				});
+			}
+
+			expect((await readFile(paths.stable, "utf8")).trim()).toBe(candidate.digest);
+			expect(JSON.parse(await readFile(paths.trial, "utf8"))).toMatchObject({ digest: candidate.digest });
+			await expect(readFile(paths.transition, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+		},
+	);
+
+	it("repairs a torn history tail before replaying a valid pending transition", async () => {
+		const { initial, candidate } = await compileRegistryPair(paths, temporaryRoot, "torn-history");
+		await new BundleRegistry(paths).initialize(initial.digest);
+		let failed = false;
+		const interrupted = new BundleRegistry(paths, {
+			afterTransitionStep(step, action) {
+				if (!failed && action === "activate-trial" && step === "history-appended") {
+					failed = true;
+					throw new Error("simulated response interruption");
+				}
+			},
+		});
+		await expect(
+			interrupted.activateTrial({
+				digest: candidate.digest,
+				proposalId: "proposal-torn-history",
+				plan: "Repair torn history",
+			}),
+		).rejects.toThrow("simulated response interruption");
+		await appendFile(paths.history, '{"eventId":"torn');
+
+		expect(await new BundleRegistry(paths).readStableDigest()).toBe(candidate.digest);
+		const content = await readFile(paths.history, "utf8");
+		expect(content.endsWith("\n")).toBe(true);
+		const history = content
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as { action: string });
+		expect(history.filter((entry) => entry.action === "trial-start")).toHaveLength(1);
+		await expect(readFile(paths.transition, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it.each(["deleted", "corrupted"] as const)("fails closed when a prepared candidate bundle is %s", async (mode) => {
+		const { initial, candidate } = await compileRegistryPair(paths, temporaryRoot, `invalid-candidate-${mode}`);
+		await new BundleRegistry(paths).initialize(initial.digest);
+		let failed = false;
+		const interrupted = new BundleRegistry(paths, {
+			afterTransitionStep(step, action) {
+				if (!failed && action === "activate-trial" && step === "prepared") {
+					failed = true;
+					throw new Error("simulated prepared interruption");
+				}
+			},
+		});
+		await expect(
+			interrupted.activateTrial({
+				digest: candidate.digest,
+				proposalId: "proposal-invalid-candidate",
+				plan: "Validate before replay",
+			}),
+		).rejects.toThrow("simulated prepared interruption");
+
+		if (mode === "deleted") {
+			await rm(candidate.directory, { recursive: true, force: true });
+		} else {
+			const promptPath = join(candidate.directory, "prompts", "system.md");
+			await chmod(promptPath, 0o644);
+			await writeFile(promptPath, "corrupted candidate");
+		}
+
+		await expect(new BundleRegistry(paths).readStableDigest()).rejects.toThrow();
+		expect((await readFile(paths.stable, "utf8")).trim()).toBe(initial.digest);
+		await expect(readFile(paths.trial, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+		expect(JSON.parse(await readFile(paths.transition, "utf8"))).toMatchObject({
+			action: "activate-trial",
+			stableAfter: candidate.digest,
+		});
+	});
+
+	it("does not treat a different reason as a retry of a pending operation", async () => {
+		const { initial, candidate } = await compileRegistryPair(paths, temporaryRoot, "distinct-reason");
+		const registry = new BundleRegistry(paths);
+		await registry.initialize(initial.digest);
+		await registry.activateTrial({
+			digest: candidate.digest,
+			proposalId: "proposal-distinct-reason",
+			plan: "Exercise distinct requests",
+		});
+		let failed = false;
+		const interrupted = new BundleRegistry(paths, {
+			afterTransitionStep(step, action) {
+				if (!failed && action === "keep-trial" && step === "prepared") {
+					failed = true;
+					throw new Error("simulated keep interruption");
+				}
+			},
+		});
+		await expect(interrupted.keepTrial("first reason")).rejects.toThrow("simulated keep interruption");
+
+		await expect(new BundleRegistry(paths).keepTrial("different reason")).rejects.toThrow("No trial is active");
+		const history = (await readFile(paths.history, "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as { action: string; reason: string });
+		expect(history.filter((entry) => entry.action === "trial-keep")).toEqual([
+			expect.objectContaining({ reason: "first reason" }),
+		]);
+	});
+
+	it("rejects rollback to the current stable digest without side effects", async () => {
+		const { initial, candidate } = await compileRegistryPair(paths, temporaryRoot, "same-target");
+		const registry = new BundleRegistry(paths);
+		await registry.initialize(initial.digest);
+		const trial = await registry.activateTrial({
+			digest: candidate.digest,
+			proposalId: "proposal-same-target",
+			plan: "Preserve the active trial",
+		});
+
+		await expect(registry.rollback(candidate.digest, "same target")).rejects.toThrow(
+			"Rollback target is already stable",
+		);
+		await expect(registry.rollbackProposal(candidate.digest, "same target")).rejects.toThrow(
+			"Rollback target is already stable",
+		);
+		expect(await registry.readTrial()).toEqual(trial);
+		const history = (await readFile(paths.history, "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as { action: string });
+		expect(history.filter((entry) => entry.action === "rollback")).toHaveLength(0);
+	});
+
+	it("rejects rollback to a compiled candidate that was never stable", async () => {
+		const { initial, candidate } = await compileRegistryPair(paths, temporaryRoot, "pending-target");
+		const registry = new BundleRegistry(paths);
+		await registry.initialize(initial.digest);
+		const historyBefore = await readFile(paths.history, "utf8");
+
+		await expect(registry.rollback(candidate.digest, "bypass pending approval")).rejects.toThrow(
+			"was never committed as stable",
+		);
+		await expect(registry.rollbackProposal(candidate.digest, "bypass pending approval")).rejects.toThrow(
+			"was never committed as stable",
+		);
+
+		expect(await registry.readStableDigest()).toBe(initial.digest);
+		expect(await registry.readTrial()).toBeUndefined();
+		expect(await readFile(paths.history, "utf8")).toBe(historyBefore);
+		await expect(readFile(paths.transition, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("rejects malformed persisted trial fields", async () => {
+		const { initial } = await compileRegistryPair(paths, temporaryRoot, "invalid-trial");
+		const registry = new BundleRegistry(paths);
+		await registry.initialize(initial.digest);
+		await writeFile(
+			paths.trial,
+			JSON.stringify({
+				digest: initial.digest,
+				parent: initial.digest,
+				proposalId: "../escape",
+				startedAt: "not-a-date",
+				plan: "invalid trial",
+			}),
+		);
+
+		await expect(registry.readTrial()).rejects.toThrow("registry/trial.json is invalid");
 	});
 
 	it("pauses and resumes background evolution", async () => {

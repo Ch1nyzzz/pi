@@ -1,13 +1,29 @@
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
-import type { ExtensionCommandContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import type { ExtensionCommandContext, ExtensionContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { type EvoPaths, getEvoPaths } from "./paths.ts";
+import { proposalApproval } from "./proposal.ts";
+import { readEvaluationArtifact } from "./proposal-artifacts.ts";
 import { createPiModelRunner, type ModelRunner } from "./reflect/model-runner.ts";
+import {
+	askProposalQuestion,
+	recordPermitDefer,
+	recordPermitReopen,
+	reviseProposalFromInstruction,
+} from "./reflect/permit.ts";
 import { runReflector, runReport } from "./reflect/reflector.ts";
 import { runRetrospective } from "./reflect/retrospective.ts";
+import {
+	type EvoScheduleConfig,
+	type EvoScheduleStatus,
+	getScheduleStatus,
+	parseScheduleCadence,
+	readScheduleConfig,
+	runConfiguredImprove,
+	type ScheduledImproveResult,
+	writeScheduleConfig,
+} from "./scheduler.ts";
 import { EvoService } from "./service.ts";
-import type { EvoStatus, Proposal } from "./types.ts";
+import type { EvoStatus, Proposal, ProposalArtifactKind } from "./types.ts";
 
 const SUBCOMMANDS = [
 	"help",
@@ -15,6 +31,8 @@ const SUBCOMMANDS = [
 	"status",
 	"report",
 	"improve",
+	"scheduled-improve",
+	"schedule",
 	"list",
 	"show",
 	"note",
@@ -28,13 +46,19 @@ const SUBCOMMANDS = [
 	"resume",
 ] as const;
 
+const QUICK_APPROVE_SHORTCUT = "ctrl+alt+e" as const;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const SCHEDULE_USAGE = "/evo schedule [daily | 3d | weekly | every <n>d | manual]";
+
 export const EVO_HELP = `Usage: /evo <command>
 
   help                         Show this help
-  init                         Initialize an empty data bundle
+  init                         Initialize and migrate Pi data into a bundle
   status                       Show registry and trial status
   report                       Generate a read-only evidence report
   improve                      Run reflection and stage proposals
+  scheduled-improve            Run one guarded background reflection attempt
+  schedule [cadence]           Show or set the reflection cadence (daily, 3d, weekly, manual)
   list                         List proposals
   show <proposal-id>           Show a proposal card
   note <text>                  Record an explicit note
@@ -114,26 +138,78 @@ function formatStatus(status: EvoStatus): string {
 		`stable: ${status.stableDigest ?? "none"}`,
 		`trial: ${status.trial ? `${status.trial.proposalId} (${status.trial.digest})` : "none"}`,
 		`pending proposals: ${status.pendingProposals}`,
+		`deferred proposals: ${status.deferredProposals}`,
 		`paused: ${String(status.paused)}`,
 	].join("\n");
 }
 
 function formatProposalSummary(proposal: Proposal): string {
-	return `${proposal.id}  ${proposal.status}  ${proposal.tier}/${proposal.kind}  ${proposal.motivation}`;
+	return `${proposal.id}  r${proposal.revision}  ${proposal.status}  ${proposal.tier}/${proposal.kind}  ${proposal.motivation}`;
 }
 
+function compactStatusText(value: string, maxLength = 48): string {
+	const compact = value.replace(/\s+/g, " ").trim();
+	if (compact.length <= maxLength) return compact;
+	return `${compact.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+async function findPendingT0Proposal(dependencies: { service: EvoService }): Promise<Proposal | undefined> {
+	return (await dependencies.service.listProposals()).find(
+		(proposal) => proposal.status === "pending" && proposal.kind === "data" && proposal.tier === "T0",
+	);
+}
+
+export function describeScheduleCadence(config: EvoScheduleConfig): string {
+	if (config.mode === "manual") return "manual (reflection only runs through /evo improve)";
+	if (config.everyDays === 1) return "auto (reflect once a day)";
+	return `auto (reflect once every ${config.everyDays} days)`;
+}
+
+function formatScheduleStatus(status: EvoScheduleStatus): string {
+	return [
+		`cadence: ${describeScheduleCadence(status.config)}`,
+		`quiet hours: ${status.config.quietHours ? `${status.config.quietHours.start}-${status.config.quietHours.end}` : "any time"}`,
+		`last background run: ${status.lastCompletedAt ?? "never"}`,
+		`next eligible day: ${status.config.mode === "manual" ? "n/a" : (status.nextEligibleDay ?? "today")}`,
+		`runs today: ${status.runsToday}/${status.config.dailyRunLimit}`,
+		`trial reminder after: ${status.config.trialDueAfterDays} days`,
+	].join("\n");
+}
+
+function describeImproveSkip(result: Extract<ScheduledImproveResult<unknown>, { status: "skipped" }>): string {
+	const detail =
+		result.reason === "interval-not-elapsed" && result.nextEligibleDay
+			? ` (next eligible ${result.nextEligibleDay})`
+			: "";
+	return `Scheduled improve skipped: ${result.reason}${detail}`;
+}
+
+const SCHEDULE_CADENCE_CHOICES: ReadonlyArray<{
+	label: string;
+	input: { mode: "auto" | "manual"; everyDays?: number };
+}> = [
+	{ label: "Every day", input: { mode: "auto", everyDays: 1 } },
+	{ label: "Every 3 days", input: { mode: "auto", everyDays: 3 } },
+	{ label: "Every week", input: { mode: "auto", everyDays: 7 } },
+	{ label: "Manual only", input: { mode: "manual" } },
+];
 async function readProposalArtifact(
 	paths: EvoPaths,
 	proposal: Proposal,
-	file: string | undefined,
+	kind: ProposalArtifactKind,
 ): Promise<string | undefined> {
-	if (!file || !["review.md", "replay.md", "retrospective.md"].includes(file)) return undefined;
-	try {
-		return (await readFile(join(paths.proposals, proposal.id, file), "utf8")).trim();
-	} catch (error) {
-		if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return undefined;
-		throw error;
-	}
+	const reference = proposal.artifacts[kind];
+	if (!reference) return undefined;
+	return (
+		await readEvaluationArtifact({
+			paths,
+			proposalId: proposal.id,
+			revision: proposal.revision,
+			diffDigest: proposal.diffDigest,
+			kind,
+			reference,
+		})
+	).trim();
 }
 
 export async function formatProposalCard(paths: EvoPaths, proposal: Proposal): Promise<string> {
@@ -145,17 +221,29 @@ export async function formatProposalCard(paths: EvoPaths, proposal: Proposal): P
 				)
 				.join("\n")
 		: "- none";
-	const review = await readProposalArtifact(paths, proposal, proposal.reviewFile);
-	const replay = await readProposalArtifact(paths, proposal, proposal.replayFile);
-	const retrospective = await readProposalArtifact(paths, proposal, proposal.retrospectiveFile);
+	const review = await readProposalArtifact(paths, proposal, "review");
+	const replay = await readProposalArtifact(paths, proposal, "replay");
+	const validation = await readProposalArtifact(paths, proposal, "validation");
+	const retrospective = await readProposalArtifact(paths, proposal, "retrospective");
 	return [
 		`# Evo proposal ${proposal.id}`,
 		"",
 		`Status: ${proposal.status}`,
+		`Revision: ${proposal.revision}`,
 		`Tier: ${proposal.tier}`,
 		`Kind: ${proposal.kind}`,
 		`Parent bundle: ${proposal.parentBundleDigest}`,
-		`Approval digest: ${proposal.approvalDigest}`,
+		`Final diff digest: ${proposal.diffDigest}`,
+		...(proposal.codeWorkspace
+			? [
+					`Approval context digest: ${proposal.approvalDigest}`,
+					`Repository root: ${proposal.codeWorkspace.repositoryRoot}`,
+					`Repository identity: ${proposal.codeWorkspace.repositoryId}`,
+					`Base commit: ${proposal.codeWorkspace.baseCommit}`,
+					`Worktree: ${proposal.codeWorkspace.worktreePath}`,
+					`Branch: ${proposal.codeWorkspace.branch}`,
+				]
+			: []),
 		"",
 		"## Motivation",
 		proposal.motivation,
@@ -179,6 +267,7 @@ export async function formatProposalCard(paths: EvoPaths, proposal: Proposal): P
 		"",
 		"## Trial plan",
 		proposal.trialPlan,
+		...(validation ? ["", "## L1 validation", validation] : []),
 		...(review ? ["", "## Critic review", review] : []),
 		...(replay ? ["", "## Counterfactual replay", replay] : []),
 		...(retrospective ? ["", "## Retrospective", retrospective] : []),
@@ -197,19 +286,40 @@ function createDependencies(options: EvoCommandExtensionOptions): EvoCommandDepe
 	};
 }
 
-function modelOptions(dependencies: EvoCommandDependencies) {
+function modelOptions(dependencies: EvoCommandDependencies, signal?: AbortSignal) {
 	return {
 		paths: dependencies.paths,
 		runner: dependencies.runner,
 		...(dependencies.cwd ? { cwd: dependencies.cwd } : {}),
 		...(dependencies.agentDir ? { agentDir: dependencies.agentDir } : {}),
 		...(dependencies.model ? { model: dependencies.model } : {}),
+		...(signal ? { signal } : {}),
 	};
 }
 
-async function refreshPendingStatus(dependencies: EvoCommandDependencies, ctx: ExtensionCommandContext): Promise<void> {
-	const pending = (await dependencies.service.status()).pendingProposals;
-	ctx.ui.setStatus("evo", pending > 0 ? `evo: ${pending} pending` : undefined);
+export async function refreshEvoStatusIndicator(
+	dependencies: { service: EvoService; paths: EvoPaths },
+	ctx: ExtensionContext,
+	now: () => Date = () => new Date(),
+): Promise<void> {
+	const status = await dependencies.service.status();
+	const parts: string[] = [];
+	if (status.pendingProposals > 0) {
+		const quick = await findPendingT0Proposal(dependencies);
+		parts.push(
+			quick
+				? `T0 ${compactStatusText(quick.motivation)} [Ctrl+Alt+E apply; /evo show ${quick.id}]`
+				: `${status.pendingProposals} pending`,
+		);
+	}
+	if (status.trial) {
+		const schedule = await readScheduleConfig(dependencies.paths);
+		const dueAt = Date.parse(status.trial.startedAt) + schedule.trialDueAfterDays * DAY_MS;
+		if (Number.isFinite(dueAt) && now().getTime() >= dueAt) {
+			parts.push(`trial ${status.trial.proposalId} due [/evo keep or /evo rollback]`);
+		}
+	}
+	ctx.ui.setStatus("evo", parts.length > 0 ? `evo: ${parts.join("; ")}` : undefined);
 }
 
 function sendCustomCard(
@@ -242,14 +352,22 @@ async function showProposal(
 	});
 }
 
+async function confirmExtensionMutation(
+	ctx: ExtensionCommandContext,
+	title: string,
+	message: string,
+): Promise<boolean> {
+	if (!ctx.hasUI) throw new Error("Changing Evo-Pi state requires an interactive UI");
+	return ctx.ui.confirm(title, message);
+}
+
 async function confirmProposal(proposal: Proposal, ctx: ExtensionCommandContext): Promise<boolean> {
 	if (!ctx.hasUI) throw new Error("Proposal approval requires an interactive UI");
-	if (proposal.tier === "T2") {
-		const digest = await ctx.ui.input(
-			`Approve ${proposal.id}`,
-			`Type the full approval digest: ${proposal.approvalDigest}`,
-		);
-		if (digest?.trim() !== proposal.approvalDigest) {
+	if (proposal.kind === "code" || proposal.tier === "T2") {
+		const digest = proposal.kind === "code" ? proposal.approvalDigest : proposal.diffDigest;
+		const label = proposal.kind === "code" ? "code approval context digest" : "final diff digest";
+		const confirmed = await ctx.ui.input(`Approve ${proposal.id}`, `Type the ${label}: ${digest}`);
+		if (confirmed?.trim() !== digest) {
 			ctx.ui.notify("Approval digest did not match; proposal remains pending", "error");
 			return false;
 		}
@@ -257,8 +375,104 @@ async function confirmProposal(proposal: Proposal, ctx: ExtensionCommandContext)
 	}
 	return ctx.ui.confirm(
 		`Approve ${proposal.id}`,
-		`${proposal.tier}/${proposal.kind}: ${proposal.motivation}\n\nApply digest ${proposal.approvalDigest}?`,
+		`${proposal.tier}/${proposal.kind}: ${proposal.motivation}\n\nApply final diff ${proposal.diffDigest}?`,
 	);
+}
+
+async function runExtensionPermit(
+	pi: Parameters<ExtensionFactory>[0],
+	dependencies: EvoCommandDependencies,
+	id: string,
+	ctx: ExtensionCommandContext,
+): Promise<Proposal | undefined> {
+	if (!ctx.hasUI) throw new Error("Proposal approval requires an interactive UI");
+	let proposal = await dependencies.service.getProposal(id);
+	while (true) {
+		await showProposal(pi, dependencies, proposal);
+		const strictPermit = proposal.kind === "code" || proposal.tier === "T2";
+		if (!strictPermit && proposal.tier === "T0" && proposal.status === "pending") {
+			if (!(await confirmProposal(proposal, ctx))) return undefined;
+			return dependencies.service.approve(id, proposalApproval(proposal));
+		}
+
+		const actions =
+			proposal.status === "deferred"
+				? ["Reopen", ...(!strictPermit && proposal.tier === "T0" ? [] : ["Ask why"]), "Reject", "Close"]
+				: ["Ask why", ...(strictPermit ? ["Request revision"] : []), "Approve", "Reject", "Defer", "Close"];
+		const action = await ctx.ui.select(`Permit ${proposal.id} r${proposal.revision}`, actions);
+		if (!action || action === "Close") return undefined;
+		const expected = proposalApproval(proposal);
+		if (action === "Ask why") {
+			const question = await ctx.ui.input(`Question ${proposal.id}`, "Ask why, or request evidence");
+			if (!question?.trim()) continue;
+			const answer = await askProposalQuestion({
+				paths: dependencies.paths,
+				runner: dependencies.runner,
+				proposalId: proposal.id,
+				expected,
+				question,
+				...(dependencies.cwd ? { cwd: dependencies.cwd } : {}),
+				...(dependencies.agentDir ? { agentDir: dependencies.agentDir } : {}),
+				...(dependencies.model ? { model: dependencies.model } : {}),
+			});
+			sendCustomCard(pi, "evo.permit-answer", answer.answerMarkdown, {
+				proposalId: proposal.id,
+				revision: proposal.revision,
+			});
+			proposal = await dependencies.service.getProposal(id);
+			continue;
+		}
+		if (action === "Request revision") {
+			const instruction = await ctx.ui.input(
+				`Revise ${proposal.id}`,
+				"Describe the exact constraints for the revised diff",
+			);
+			if (!instruction?.trim()) continue;
+			proposal = await reviseProposalFromInstruction({
+				paths: dependencies.paths,
+				runner: dependencies.runner,
+				proposalId: proposal.id,
+				expected,
+				instruction,
+				...(dependencies.cwd ? { cwd: dependencies.cwd, repositoryCwd: dependencies.cwd } : {}),
+				...(dependencies.agentDir ? { agentDir: dependencies.agentDir } : {}),
+				...(dependencies.model ? { model: dependencies.model } : {}),
+			});
+			continue;
+		}
+		if (action === "Approve") {
+			if (!(await confirmProposal(proposal, ctx))) return undefined;
+			return dependencies.service.approve(id, expected);
+		}
+		if (action === "Reject") {
+			const reason = await ctx.ui.input(`Reject ${proposal.id}`, "Reason for rejection");
+			if (!reason?.trim()) continue;
+			return dependencies.service.reject(id, reason);
+		}
+		if (action === "Defer") {
+			const reason = await ctx.ui.input(`Defer ${proposal.id}`, "Reason for deferral");
+			if (!reason?.trim()) continue;
+			proposal = await dependencies.service.defer(id, reason);
+			await recordPermitDefer({
+				paths: dependencies.paths,
+				proposalId: proposal.id,
+				revision: proposal.revision,
+				diffDigest: proposal.diffDigest,
+				reason,
+			});
+			continue;
+		}
+		if (action === "Reopen") {
+			proposal = await dependencies.service.reopen(id, "User reopened deferred proposal");
+			await recordPermitReopen({
+				paths: dependencies.paths,
+				proposalId: proposal.id,
+				revision: proposal.revision,
+				diffDigest: proposal.diffDigest,
+				reason: "User reopened deferred proposal",
+			});
+		}
+	}
 }
 
 async function dispatchExtensionCommand(
@@ -275,7 +489,7 @@ async function dispatchExtensionCommand(
 			sendCustomCard(pi, "evo.help", EVO_HELP, { command: "help" });
 			return;
 		case "init": {
-			const bundle = await dependencies.service.init();
+			const bundle = await dependencies.service.init(pi.getActiveTools());
 			ctx.ui.notify(`Evo-Pi initialized at ${bundle.digest}`, "info");
 			return;
 		}
@@ -294,6 +508,49 @@ async function dispatchExtensionCommand(
 			});
 			for (const proposal of result.proposals) await showProposal(pi, dependencies, proposal);
 			if (result.proposals.length === 0) ctx.ui.notify("No grounded proposal was produced", "info");
+			return;
+		}
+		case "scheduled-improve": {
+			const scheduled = await runConfiguredImprove({
+				paths: dependencies.paths,
+				improve: (signal) => runReflector(modelOptions(dependencies, signal)),
+			});
+			if (scheduled.status === "skipped") {
+				ctx.ui.notify(describeImproveSkip(scheduled), "info");
+				return;
+			}
+			const result = scheduled.value;
+			sendCustomCard(pi, "evo.observations", result.observationsMarkdown, {
+				proposalIds: result.proposals.map((proposal) => proposal.id),
+				runId: scheduled.runId,
+			});
+			for (const proposal of result.proposals) await showProposal(pi, dependencies, proposal);
+			return;
+		}
+		case "schedule": {
+			if (rest) {
+				const cadence = parseScheduleCadence(rest);
+				if (!cadence) throw new Error(`Usage: ${SCHEDULE_USAGE}`);
+				const updated = await writeScheduleConfig(dependencies.paths, cadence);
+				ctx.ui.notify(`Evo-Pi schedule updated — ${describeScheduleCadence(updated)}`, "info");
+				return;
+			}
+			const status = await getScheduleStatus(dependencies.paths);
+			if (!ctx.hasUI) {
+				ctx.ui.notify(formatScheduleStatus(status), "info");
+				return;
+			}
+			const choice = await ctx.ui.select(
+				`Evo-Pi schedule — ${describeScheduleCadence(status.config)}`,
+				SCHEDULE_CADENCE_CHOICES.map((entry) => entry.label).concat("Keep current"),
+			);
+			const selected = SCHEDULE_CADENCE_CHOICES.find((entry) => entry.label === choice);
+			if (!selected) {
+				ctx.ui.notify(formatScheduleStatus(status), "info");
+				return;
+			}
+			const updated = await writeScheduleConfig(dependencies.paths, selected.input);
+			ctx.ui.notify(`Evo-Pi schedule updated — ${describeScheduleCadence(updated)}`, "info");
 			return;
 		}
 		case "list": {
@@ -330,18 +587,20 @@ async function dispatchExtensionCommand(
 		}
 		case "permit": {
 			const id = requireValue(rest, "/evo permit <proposal-id>");
-			const proposal = await dependencies.service.getProposal(id);
-			await showProposal(pi, dependencies, proposal);
-			if (!(await confirmProposal(proposal, ctx))) return;
-			const approved = await dependencies.service.approve(id, proposal.approvalDigest);
-			await showProposal(pi, dependencies, approved);
-			ctx.ui.notify(`Proposal ${id} is ${approved.status}`, "info");
+			const result = await runExtensionPermit(pi, dependencies, id, ctx);
+			if (!result) return;
+			await showProposal(pi, dependencies, result);
+			ctx.ui.notify(`Proposal ${id} is ${result.status}`, "info");
 			return;
 		}
 		case "reject": {
 			const { first: id, rest: reason } = splitFirst(rest);
 			requireValue(id, "/evo reject <proposal-id> <reason>");
 			requireValue(reason, "/evo reject <proposal-id> <reason>");
+			if (!(await confirmExtensionMutation(ctx, `Reject ${id}`, `Reject proposal ${id}?`))) {
+				ctx.ui.notify("Rejection cancelled", "info");
+				return;
+			}
 			await dependencies.service.reject(id, reason);
 			ctx.ui.notify(`Rejected ${id}`, "info");
 			return;
@@ -350,6 +609,11 @@ async function dispatchExtensionCommand(
 			const { first, rest: trailing } = splitFirst(rest);
 			const hasDigest = /^[a-f0-9]{64}$/.test(first);
 			const reason = (hasDigest ? trailing : rest).trim() || "User requested rollback";
+			const target = hasDigest ? `bundle ${first}` : "the active trial or stable bundle parent";
+			if (!(await confirmExtensionMutation(ctx, "Roll back Evo-Pi", `Roll back ${target}?`))) {
+				ctx.ui.notify("Rollback cancelled", "info");
+				return;
+			}
 			const result = await dependencies.service.rollback(hasDigest ? first : undefined, reason);
 			ctx.ui.notify(`Rolled back ${result.from} → ${result.to}`, "info");
 			return;
@@ -379,14 +643,24 @@ async function dispatchExtensionCommand(
 			});
 			return;
 		}
-		case "pause":
+		case "pause": {
+			if (!(await confirmExtensionMutation(ctx, "Pause Evo-Pi", "Pause reflection work?"))) {
+				ctx.ui.notify("Pause cancelled", "info");
+				return;
+			}
 			await dependencies.service.pause(rest || "User paused Evo-Pi");
 			ctx.ui.notify("Evo-Pi paused", "info");
 			return;
-		case "resume":
+		}
+		case "resume": {
+			if (!(await confirmExtensionMutation(ctx, "Resume Evo-Pi", "Resume reflection work?"))) {
+				ctx.ui.notify("Resume cancelled", "info");
+				return;
+			}
 			await dependencies.service.resume(rest || "User resumed Evo-Pi");
 			ctx.ui.notify("Evo-Pi resumed", "info");
 			return;
+		}
 		default:
 			throw new Error(`Unknown /evo command: ${command}`);
 	}
@@ -397,13 +671,43 @@ export function createEvoCommandExtension(options: EvoCommandExtensionOptions = 
 	return (pi) => {
 		pi.on("session_start", async (_event, ctx) => {
 			try {
-				await refreshPendingStatus(dependencies, ctx as ExtensionCommandContext);
+				await refreshEvoStatusIndicator(dependencies, ctx);
 			} catch {
 				ctx.ui.setStatus("evo", undefined);
 			}
 		});
 		pi.on("session_shutdown", (_event, ctx) => {
 			ctx.ui.setStatus("evo", undefined);
+		});
+		pi.registerShortcut(QUICK_APPROVE_SHORTCUT, {
+			description: "Apply the first pending T0 Evo-Pi proposal",
+			handler: async (ctx) => {
+				if (!ctx.hasUI || ctx.mode !== "tui") {
+					ctx.ui.notify("T0 quick approval requires the interactive TUI", "error");
+					return;
+				}
+				if (!ctx.isIdle()) {
+					ctx.ui.notify("Wait for the active turn before applying a T0 proposal", "warning");
+					return;
+				}
+				try {
+					const proposal = await findPendingT0Proposal(dependencies);
+					if (!proposal) {
+						ctx.ui.notify("No pending T0 proposal", "info");
+						return;
+					}
+					const approved = await dependencies.service.approve(proposal.id, proposalApproval(proposal));
+					ctx.ui.notify(`Applied T0 proposal ${approved.id}`, "info");
+				} catch (error) {
+					ctx.ui.notify(`Evo-Pi: ${errorMessage(error)}`, "error");
+				} finally {
+					try {
+						await refreshEvoStatusIndicator(dependencies, ctx);
+					} catch {
+						ctx.ui.setStatus("evo", undefined);
+					}
+				}
+			},
 		});
 		pi.registerCommand("evo", {
 			description: "Inspect and control Evo-Pi",
@@ -420,7 +724,7 @@ export function createEvoCommandExtension(options: EvoCommandExtensionOptions = 
 					ctx.ui.notify(`Evo-Pi: ${errorMessage(error)}`, "error");
 				} finally {
 					try {
-						await refreshPendingStatus(dependencies, ctx);
+						await refreshEvoStatusIndicator(dependencies, ctx);
 					} catch {
 						ctx.ui.setStatus("evo", undefined);
 					}
@@ -447,18 +751,118 @@ function createNodeCliIO(): EvoCliIO {
 }
 
 function requireInteractive(io: EvoCliIO): void {
-	if (!io.interactive) throw new Error("This approval requires an interactive terminal");
+	if (!io.interactive) throw new Error("Changing Evo-Pi state requires an interactive terminal");
+}
+
+async function confirmLocalMutation(io: EvoCliIO, prompt: string): Promise<boolean> {
+	requireInteractive(io);
+	const answer = await io.question(`${prompt} [y/N] `);
+	return /^(?:y|yes)$/i.test(answer.trim());
 }
 
 async function confirmLocalProposal(io: EvoCliIO, proposal: Proposal): Promise<boolean> {
 	requireInteractive(io);
-	if (proposal.tier === "T2") {
-		const digest = await io.question(`Type the full approval digest ${proposal.approvalDigest}: `);
-		if (digest.trim() !== proposal.approvalDigest) throw new Error("Approval digest did not match");
+	if (proposal.kind === "code" || proposal.tier === "T2") {
+		const expected = proposal.kind === "code" ? proposal.approvalDigest : proposal.diffDigest;
+		const label = proposal.kind === "code" ? "code approval context digest" : "final diff digest";
+		const digest = await io.question(`Type the ${label} ${expected}: `);
+		if (digest.trim() !== expected) throw new Error("Approval digest did not match");
 		return true;
 	}
 	const answer = await io.question(`Approve ${proposal.id} (${proposal.tier}/${proposal.kind})? [y/N] `);
 	return /^(?:y|yes)$/i.test(answer.trim());
+}
+
+async function runLocalPermit(
+	io: EvoCliIO,
+	dependencies: EvoCommandDependencies,
+	id: string,
+): Promise<Proposal | undefined> {
+	requireInteractive(io);
+	let proposal = await dependencies.service.getProposal(id);
+	while (true) {
+		io.write(await formatProposalCard(dependencies.paths, proposal));
+		const strictPermit = proposal.kind === "code" || proposal.tier === "T2";
+		if (!strictPermit && proposal.tier === "T0" && proposal.status === "pending") {
+			if (!(await confirmLocalProposal(io, proposal))) return undefined;
+			return dependencies.service.approve(id, proposalApproval(proposal));
+		}
+		if (proposal.status !== "pending" && proposal.status !== "deferred") return proposal;
+		const prompt =
+			proposal.status === "deferred"
+				? !strictPermit && proposal.tier === "T0"
+					? "Action: [o] reopen, [x] reject, [c] close: "
+					: "Action: [o] reopen, [q] ask why, [x] reject, [c] close: "
+				: `Action: [q] ask why, ${strictPermit ? "[v] revise, " : ""}[a] approve, [x] reject, [d] defer, [c] close: `;
+		const action = (await io.question(prompt)).trim().toLowerCase();
+		if (!action || action === "c" || action === "close") return undefined;
+		const expected = proposalApproval(proposal);
+		if (action === "q" || action === "ask") {
+			const question = await io.question("Question: ");
+			if (!question.trim()) continue;
+			const answer = await askProposalQuestion({
+				paths: dependencies.paths,
+				runner: dependencies.runner,
+				proposalId: proposal.id,
+				expected,
+				question,
+				...(dependencies.cwd ? { cwd: dependencies.cwd } : {}),
+				...(dependencies.agentDir ? { agentDir: dependencies.agentDir } : {}),
+				...(dependencies.model ? { model: dependencies.model } : {}),
+			});
+			io.write(answer.answerMarkdown);
+			proposal = await dependencies.service.getProposal(id);
+			continue;
+		}
+		if ((action === "v" || action === "revise") && strictPermit && proposal.status === "pending") {
+			const instruction = await io.question("Revision instruction: ");
+			if (!instruction.trim()) continue;
+			proposal = await reviseProposalFromInstruction({
+				paths: dependencies.paths,
+				runner: dependencies.runner,
+				proposalId: proposal.id,
+				expected,
+				instruction,
+				...(dependencies.cwd ? { cwd: dependencies.cwd, repositoryCwd: dependencies.cwd } : {}),
+				...(dependencies.agentDir ? { agentDir: dependencies.agentDir } : {}),
+				...(dependencies.model ? { model: dependencies.model } : {}),
+			});
+			continue;
+		}
+		if ((action === "a" || action === "approve") && proposal.status === "pending") {
+			if (!(await confirmLocalProposal(io, proposal))) continue;
+			return dependencies.service.approve(id, expected);
+		}
+		if (action === "x" || action === "reject") {
+			const reason = await io.question("Rejection reason: ");
+			if (!reason.trim()) continue;
+			return dependencies.service.reject(id, reason);
+		}
+		if ((action === "d" || action === "defer") && proposal.status === "pending") {
+			const reason = await io.question("Deferral reason: ");
+			if (!reason.trim()) continue;
+			proposal = await dependencies.service.defer(id, reason);
+			await recordPermitDefer({
+				paths: dependencies.paths,
+				proposalId: proposal.id,
+				revision: proposal.revision,
+				diffDigest: proposal.diffDigest,
+				reason,
+			});
+			continue;
+		}
+		if ((action === "o" || action === "reopen") && proposal.status === "deferred") {
+			const reason = "User reopened deferred proposal";
+			proposal = await dependencies.service.reopen(id, reason);
+			await recordPermitReopen({
+				paths: dependencies.paths,
+				proposalId: proposal.id,
+				revision: proposal.revision,
+				diffDigest: proposal.diffDigest,
+				reason,
+			});
+		}
+	}
 }
 
 function parseSessionText(value: string, usage: string): { sessionId: string; text: string } {
@@ -499,6 +903,31 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 			for (const proposal of result.proposals) io.write(await formatProposalCard(dependencies.paths, proposal));
 			return;
 		}
+		case "scheduled-improve": {
+			const scheduled = await runConfiguredImprove({
+				paths: dependencies.paths,
+				improve: (signal) => runReflector(modelOptions(dependencies, signal)),
+			});
+			if (scheduled.status === "skipped") {
+				io.write(describeImproveSkip(scheduled));
+				return;
+			}
+			io.write(scheduled.value.observationsMarkdown);
+			for (const proposal of scheduled.value.proposals)
+				io.write(await formatProposalCard(dependencies.paths, proposal));
+			return;
+		}
+		case "schedule": {
+			if (!rest) {
+				io.write(formatScheduleStatus(await getScheduleStatus(dependencies.paths)));
+				return;
+			}
+			const cadence = parseScheduleCadence(rest);
+			if (!cadence) throw new Error(`Usage: ${SCHEDULE_USAGE.replace("/evo", "evo-pi")}`);
+			const updated = await writeScheduleConfig(dependencies.paths, cadence);
+			io.write(`Evo-Pi schedule updated — ${describeScheduleCadence(updated)}`);
+			return;
+		}
 		case "list": {
 			const proposals = await dependencies.service.listProposals();
 			io.write(proposals.length ? proposals.map(formatProposalSummary).join("\n") : "No Evo-Pi proposals");
@@ -524,18 +953,17 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 		}
 		case "permit": {
 			const id = requireValue(args[1] ?? "", "evo-pi permit <proposal-id>");
-			const proposal = await dependencies.service.getProposal(id);
-			io.write(await formatProposalCard(dependencies.paths, proposal));
-			if (!(await confirmLocalProposal(io, proposal))) {
-				io.write("Approval cancelled");
-				return;
-			}
-			io.write(`Proposal ${id} is ${(await dependencies.service.approve(id, proposal.approvalDigest)).status}`);
+			const result = await runLocalPermit(io, dependencies, id);
+			io.write(result ? `Proposal ${id} is ${result.status}` : "Approval closed without a decision");
 			return;
 		}
 		case "reject": {
 			const id = requireValue(args[1] ?? "", "evo-pi reject <proposal-id> <reason>");
 			const reason = requireValue(args.slice(2).join(" "), "evo-pi reject <proposal-id> <reason>");
+			if (!(await confirmLocalMutation(io, `Reject proposal ${id}?`))) {
+				io.write("Rejection cancelled");
+				return;
+			}
 			await dependencies.service.reject(id, reason);
 			io.write(`Rejected ${id}`);
 			return;
@@ -547,6 +975,11 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 					.slice(hasDigest ? 2 : 1)
 					.join(" ")
 					.trim() || "User requested rollback";
+			const target = hasDigest ? `to ${args[1]}` : "the active trial or stable bundle";
+			if (!(await confirmLocalMutation(io, `Roll back ${target}?`))) {
+				io.write("Rollback cancelled");
+				return;
+			}
 			const result = await dependencies.service.rollback(hasDigest ? args[1] : undefined, reason);
 			io.write(`Rolled back ${result.from} → ${result.to}`);
 			return;
@@ -569,10 +1002,18 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 			return;
 		}
 		case "pause":
+			if (!(await confirmLocalMutation(io, "Pause Evo-Pi reflection work?"))) {
+				io.write("Pause cancelled");
+				return;
+			}
 			await dependencies.service.pause(rest || "User paused Evo-Pi");
 			io.write("Evo-Pi paused");
 			return;
 		case "resume":
+			if (!(await confirmLocalMutation(io, "Resume Evo-Pi reflection work?"))) {
+				io.write("Resume cancelled");
+				return;
+			}
 			await dependencies.service.resume(rest || "User resumed Evo-Pi");
 			io.write("Evo-Pi resumed");
 			return;

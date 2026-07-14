@@ -1,4 +1,7 @@
+import { isAbsolute, normalize } from "node:path";
 import type {
+	BundleManagedSource,
+	BundleManagedSourceKind,
 	BundleManifest,
 	BundleModelRouting,
 	BundlePolicy,
@@ -15,15 +18,27 @@ const POLICY_KEYS = new Set([
 	"stablePromptPaths",
 	"dynamicPromptPaths",
 	"enabledTools",
+	"enabledFeatures",
 	"coreAssets",
 	"limits",
 	"modelRouting",
 	"validation",
+	"managedSources",
 ]);
 const LIMIT_KEYS = new Set(["promptBytes", "skillBytes", "totalBytes"]);
 const MODEL_ROUTING_KEYS = new Set(["worker", "reflector", "critic"]);
 const VALIDATION_KEYS = new Set(["requiredChecks"]);
-const DETERMINISTIC_CHECKS = new Set<DeterministicCheck>(["bundle-compile", "lint", "typecheck", "unit-tests"]);
+const MANAGED_SOURCE_KEYS = new Set(["kind", "sourceRoot", "relativePath", "targetPath", "sourceSha256"]);
+const MANAGED_SOURCE_KINDS = new Set<BundleManagedSourceKind>([
+	"custom-prompt",
+	"append-prompt",
+	"context",
+	"prompt",
+	"skill",
+	"memory",
+	"preference",
+]);
+const DETERMINISTIC_CHECKS = new Set<DeterministicCheck>(["bundle-compile"]);
 
 function asRecord(value: unknown, label: string): Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -92,6 +107,80 @@ function parseValidation(value: unknown): BundleValidationPolicy | undefined {
 	return { requiredChecks: checks as DeterministicCheck[] | undefined };
 }
 
+function assertManagedSourceRelativePath(path: string, label: string): void {
+	if (path.includes("\\") || path.startsWith("/") || path.includes("\0")) {
+		throw new Error(`${label} must be a normalized relative path`);
+	}
+	const parts = path.split("/");
+	if (parts.some((part) => !part || part === "." || part === "..")) {
+		throw new Error(`${label} contains an unsafe segment`);
+	}
+}
+
+function parseManagedSources(value: unknown): BundleManagedSource[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) throw new Error("policy.managedSources must be an array");
+	const sources = value.map((entry, index) => {
+		const label = `policy.managedSources[${index}]`;
+		const record = asRecord(entry, label);
+		rejectUnknownKeys(record, MANAGED_SOURCE_KEYS, label);
+		if (typeof record.kind !== "string" || !MANAGED_SOURCE_KINDS.has(record.kind as BundleManagedSourceKind)) {
+			throw new Error(`${label}.kind is unsupported`);
+		}
+		if (
+			typeof record.sourceRoot !== "string" ||
+			!record.sourceRoot ||
+			record.sourceRoot.length > 4096 ||
+			record.sourceRoot.includes("\0") ||
+			!isAbsolute(record.sourceRoot) ||
+			normalize(record.sourceRoot) !== record.sourceRoot
+		) {
+			throw new Error(`${label}.sourceRoot must be a canonical absolute path`);
+		}
+		if (typeof record.relativePath !== "string") throw new Error(`${label}.relativePath must be a string`);
+		assertManagedSourceRelativePath(record.relativePath, `${label}.relativePath`);
+		if (typeof record.targetPath !== "string") throw new Error(`${label}.targetPath must be a string`);
+		assertAssetPath(record.targetPath);
+		if (record.targetPath === "policy.json" || record.targetPath === "bundle.json") {
+			throw new Error(`${label}.targetPath must reference a managed data asset`);
+		}
+		if (typeof record.sourceSha256 !== "string" || !isDigest(record.sourceSha256)) {
+			throw new Error(`${label}.sourceSha256 must be a digest`);
+		}
+		const kind = record.kind as BundleManagedSourceKind;
+		const expectedPrefix =
+			kind === "custom-prompt" || kind === "append-prompt" || kind === "prompt"
+				? "prompts/"
+				: kind === "skill"
+					? "skills/"
+					: "memory/";
+		if (!record.targetPath.startsWith(expectedPrefix)) {
+			throw new Error(`${label}.targetPath does not match kind ${kind}`);
+		}
+		return {
+			kind,
+			sourceRoot: record.sourceRoot,
+			relativePath: record.relativePath,
+			targetPath: record.targetPath,
+			sourceSha256: record.sourceSha256,
+		};
+	});
+	const targets = sources.map((source) => source.targetPath);
+	if (new Set(targets).size !== targets.length) {
+		throw new Error("policy.managedSources must not contain duplicate target paths");
+	}
+	const origins = sources.map((source) => `${source.sourceRoot}\0${source.relativePath}`);
+	if (new Set(origins).size !== origins.length) {
+		throw new Error("policy.managedSources must not contain duplicate source paths");
+	}
+	for (const singletonKind of ["custom-prompt", "append-prompt"] as const) {
+		if (sources.filter((source) => source.kind === singletonKind).length > 1) {
+			throw new Error(`policy.managedSources may contain at most one ${singletonKind}`);
+		}
+	}
+	return sources;
+}
+
 export function isDigest(value: string): boolean {
 	return DIGEST_PATTERN.test(value);
 }
@@ -125,10 +214,12 @@ export function parseBundlePolicy(value: unknown): BundlePolicy {
 		stablePromptPaths: parseStringArray(record.stablePromptPaths, "policy.stablePromptPaths"),
 		dynamicPromptPaths: parseStringArray(record.dynamicPromptPaths, "policy.dynamicPromptPaths"),
 		enabledTools: parseStringArray(record.enabledTools, "policy.enabledTools"),
+		enabledFeatures: parseStringArray(record.enabledFeatures, "policy.enabledFeatures"),
 		coreAssets: parseStringArray(record.coreAssets, "policy.coreAssets"),
 		limits: parseLimits(record.limits),
 		modelRouting: parseModelRouting(record.modelRouting),
 		validation: parseValidation(record.validation),
+		managedSources: parseManagedSources(record.managedSources),
 	};
 	for (const path of [
 		...(policy.promptOrder ?? []),

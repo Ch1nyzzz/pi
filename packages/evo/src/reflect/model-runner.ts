@@ -19,6 +19,7 @@ export interface ModelRunRequest {
 	history?: readonly AgentMessage[];
 	/** Stable provider session identity used to reuse replay prompt caches. */
 	sessionIdentity?: string;
+	signal?: AbortSignal;
 }
 
 export interface ModelRunResult {
@@ -85,8 +86,15 @@ export function createPiModelRunner(options: PiModelRunnerOptions = {}): ModelRu
 				thinkingLevel: request.thinkingLevel ?? resolvedModel?.thinkingLevel,
 				noTools: "all",
 			});
+			const abortSession = () => {
+				void session.abort();
+			};
+			request.signal?.addEventListener("abort", abortSession, { once: true });
 
 			try {
+				if (request.signal?.aborted) {
+					throw request.signal.reason instanceof Error ? request.signal.reason : new Error("Model run aborted");
+				}
 				const activeModel = session.model;
 				if (!activeModel) {
 					throw new Error(modelFallbackMessage ?? "No model is available for the model runner");
@@ -121,6 +129,7 @@ export function createPiModelRunner(options: PiModelRunnerOptions = {}): ModelRu
 					model: { provider: activeModel.provider, id: activeModel.id },
 				};
 			} finally {
+				request.signal?.removeEventListener("abort", abortSession);
 				session.dispose();
 			}
 		},

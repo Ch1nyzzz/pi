@@ -90,7 +90,50 @@ describe("evidence", () => {
 		expect(corpus.inboxFiles).toEqual([inbox.fileName]);
 		expect(corpus.bundleDigest).toBe(bundle.digest);
 		expect(corpus.text.indexOf("sequence 1")).toBeLessThan(corpus.text.indexOf("sequence 2"));
+		const repeated = await collectEvidenceCorpus(paths, { maxBytes: 128 * 1024 });
+		expect(repeated.evidenceDigest).toBe(corpus.evidenceDigest);
+		await writeFile(inbox.path, `${JSON.stringify({ ...inbox.entry, text: "REQUEST: changed content" })}\n`);
+		const changed = await collectEvidenceCorpus(paths, { maxBytes: 128 * 1024 });
+		expect(changed.nextReviewCursor.inboxFiles).toEqual(corpus.nextReviewCursor.inboxFiles);
+		expect(changed.nextReviewCursor.sessionSequences).toEqual(corpus.nextReviewCursor.sessionSequences);
+		expect(changed.evidenceDigest).not.toBe(corpus.evidenceDigest);
 		expect((await collectEvidenceCorpus(paths, { maxBytes: 2 * 1024 })).text).toMatch(/^## Current bundle/);
+	});
+
+	it("reserves independent byte budgets for bundle, history, inbox, and session evidence", async () => {
+		const { root, paths } = await createPaths();
+		const source = join(root, "quota-bundle-source");
+		await mkdir(join(source, "prompts"), { recursive: true });
+		await writeFile(
+			join(source, "policy.json"),
+			`${JSON.stringify({ schemaVersion: 1, promptOrder: ["prompts/system.md"] })}\n`,
+		);
+		await writeFile(join(source, "prompts", "system.md"), `oversized-bundle-${"b".repeat(12 * 1024)}`);
+		const bundle = await compileBundle({
+			paths,
+			sourceDirectory: source,
+			parentDigest: null,
+			summary: "Independent evidence budgets",
+		});
+		await new BundleRegistry(paths).initialize(bundle.digest);
+
+		const store = await createRecorderStore({ paths, sessionId: "quota-session" });
+		await store.append({ type: "session_start", reason: "startup", cwd: "/workspace/quota" });
+		await appendMessage(store, "user", "session-budget-signal");
+		await store.writeInbox("REQUEST: inbox-budget-signal", "interactive");
+
+		const corpus = await collectEvidenceCorpus(paths, { maxBytes: 4 * 1024 });
+
+		expect(corpus.text).toContain("## Current bundle");
+		expect(corpus.text).toContain('"action": "initialize"');
+		expect(corpus.text).toContain("inbox-budget-signal");
+		expect(corpus.text).toContain("session-budget-signal");
+		expect(corpus.sources.bundle.truncated).toBe(true);
+		for (const sourceSummary of Object.values(corpus.sources)) {
+			expect(sourceSummary.maxBytes).toBeGreaterThan(0);
+			expect(sourceSummary.bytes).toBeLessThanOrEqual(sourceSummary.maxBytes);
+		}
+		expect(corpus.bytes).toBeLessThanOrEqual(corpus.maxBytes);
 	});
 
 	it("rejects forged references, false quotes, and non-independent pattern evidence", async () => {
@@ -127,6 +170,14 @@ describe("evidence", () => {
 		const store = await createRecorderStore({ paths, sessionId: "explicit-session" });
 		const userMessage = await appendMessage(store, "user", "Please add a release checklist.");
 		const inbox = await store.writeInbox("REQUEST: add a release checklist", "interactive");
+		const note = await store.writeInbox("NOTE: investigate the release checklist", "interactive");
+		const feedbackText = "Always add a release checklist.";
+		const feedback = await store.append({
+			type: "explicit_feedback",
+			source: "interactive",
+			text: await store.storePayload(feedbackText),
+			inboxFile: "recorded-feedback.json",
+		});
 
 		expect(
 			await validateDraftGrounding(
@@ -134,6 +185,9 @@ describe("evidence", () => {
 				createDraft({ source: "explicit-request", inboxReferences: [inbox.fileName] }),
 			),
 		).toEqual([]);
+		await expect(
+			validateDraftGrounding(paths, createDraft({ source: "explicit-request", inboxReferences: [note.fileName] })),
+		).rejects.toThrow("require a REQUEST inbox entry or quoted user request");
 		expect(
 			await validateDraftGrounding(
 				paths,
@@ -145,6 +199,15 @@ describe("evidence", () => {
 				}),
 			),
 		).toHaveLength(1);
+		expect(
+			await validateDraftGrounding(
+				paths,
+				createDraft({
+					source: "explicit-request",
+					evidence: [{ sessionId: feedback.sessionId, sequence: feedback.sequence, quote: feedbackText }],
+				}),
+			),
+		).toHaveLength(1);
 		await expect(
 			validateDraftGrounding(
 				paths,
@@ -153,7 +216,7 @@ describe("evidence", () => {
 					evidence: [{ sessionId: userMessage.sessionId, sequence: userMessage.sequence }],
 				}),
 			),
-		).rejects.toThrow("require a valid inbox reference or explicit user evidence");
+		).rejects.toThrow("require a REQUEST inbox entry or quoted user request");
 		await expect(
 			validateDraftGrounding(
 				paths,
@@ -161,7 +224,7 @@ describe("evidence", () => {
 			),
 		).rejects.toThrow("must be a plain file name");
 		await expect(validateDraftGrounding(paths, createDraft({ source: "explicit-request" }))).rejects.toThrow(
-			"require a valid inbox reference or explicit user evidence",
+			"require a REQUEST inbox entry or quoted user request",
 		);
 	});
 

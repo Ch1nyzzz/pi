@@ -1,19 +1,34 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { lstat, mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { generateUnifiedPatch } from "@earendil-works/pi-coding-agent";
 import { compileBundle, loadCompiledBundle, materializeBundle } from "./bundle/compile.ts";
 import { assertAssetPath } from "./bundle/schema.ts";
+import {
+	type CodeL1Result,
+	type CodeValidationExecutor,
+	codeApprovalDigest,
+	revalidateCodeWorktree,
+	stageCodeWorktree,
+} from "./code/worktree.ts";
 import type { EvoPaths } from "./paths.ts";
+import {
+	saveProposalRevisionSnapshot,
+	validateEvaluationArtifact,
+	writeEvaluationArtifact,
+	writeRetrospectiveArtifact,
+} from "./proposal-artifacts.ts";
 import type { RecordedEvent } from "./recorder/schema.ts";
 import { readSessionLog, resolveStoredPayload } from "./recorder/store.ts";
 import { BundleRegistry } from "./registry/registry.ts";
-import { atomicWriteJson, canonicalJson, readJson, sha256 } from "./storage.ts";
+import { atomicWriteJson, canonicalJson, readJson, sha256, withFileLock } from "./storage.ts";
 import type {
 	BundlePolicy,
 	CompiledBundle,
 	EvidenceReference,
 	Proposal,
+	ProposalApproval,
+	ProposalArtifactKind,
 	ProposalTier,
 	ReplayScenario,
 } from "./types.ts";
@@ -33,13 +48,21 @@ export interface DraftProposal {
 	evidence: EvidenceReference[];
 	inboxReferences: string[];
 	replayScenarios: ReplayScenario[];
+	suggestedTier?: ProposalTier;
 	changes?: DraftChange[];
 	codePatch?: string;
 }
 
 export interface ReflectorOutput {
 	observationsMarkdown: string;
+	observationEvidence: EvidenceReference[];
 	proposals: DraftProposal[];
+}
+
+function assertCodeDraftReplayScenario(draft: DraftProposal): void {
+	if ((draft.codePatch !== undefined || draft.changes === undefined) && !draft.replayScenarios[0]) {
+		throw new Error("Code proposals require at least one replay scenario");
+	}
 }
 
 function asRecord(value: unknown, label: string): Record<string, unknown> {
@@ -109,6 +132,7 @@ function extractJsonObject(text: string): unknown {
 export function parseReflectorOutput(text: string): ReflectorOutput {
 	const root = asRecord(extractJsonObject(text), "reflector output");
 	const observationsMarkdown = requiredString(root, "observationsMarkdown", "reflector output");
+	const observationEvidence = parseEvidence(root.observationEvidence ?? [], "reflector output.observationEvidence");
 	if (!Array.isArray(root.proposals)) throw new Error("reflector output.proposals must be an array");
 	const proposals = root.proposals.map((entry, index) => {
 		const record = asRecord(entry, `proposals[${index}]`);
@@ -120,6 +144,10 @@ export function parseReflectorOutput(text: string): ReflectorOutput {
 		if (codePatch !== undefined && typeof codePatch !== "string") {
 			throw new Error(`proposals[${index}].codePatch must be a string`);
 		}
+		const suggestedTier = record.suggestedTier;
+		if (suggestedTier !== undefined && suggestedTier !== "T0" && suggestedTier !== "T1" && suggestedTier !== "T2") {
+			throw new Error(`proposals[${index}].suggestedTier must be T0, T1, or T2`);
+		}
 		return {
 			motivation: requiredString(record, "motivation", `proposals[${index}]`),
 			expectedEffect: requiredString(record, "expectedEffect", `proposals[${index}]`),
@@ -130,11 +158,12 @@ export function parseReflectorOutput(text: string): ReflectorOutput {
 			evidence: parseEvidence(record.evidence, `proposals[${index}].evidence`),
 			inboxReferences: parseStringArray(record.inboxReferences, `proposals[${index}].inboxReferences`),
 			replayScenarios: parseReplays(record.replayScenarios, `proposals[${index}].replayScenarios`),
+			suggestedTier: suggestedTier as ProposalTier | undefined,
 			changes: parseChanges(record.changes, `proposals[${index}].changes`),
 			codePatch,
 		} satisfies DraftProposal;
 	});
-	return { observationsMarkdown, proposals };
+	return { observationsMarkdown, observationEvidence, proposals };
 }
 
 function formatProposalId(): string {
@@ -148,6 +177,12 @@ function normalizeText(content: string): string {
 		.map((line) => line.trimEnd())
 		.join("\n")
 		.trim();
+}
+
+function stricterTier(determined: ProposalTier, suggested: ProposalTier | undefined): ProposalTier {
+	if (!suggested) return determined;
+	const rank: Record<ProposalTier, number> = { T0: 0, T1: 1, T2: 2 };
+	return rank[suggested] > rank[determined] ? suggested : determined;
 }
 
 function withoutLayoutPolicy(policy: BundlePolicy): Record<string, unknown> {
@@ -183,32 +218,23 @@ function isCoreChange(parentPolicy: BundlePolicy, candidatePolicy: BundlePolicy,
 	if (changedPaths.some((path) => coreAssets.has(path))) return true;
 	const parentCorePolicy = {
 		coreAssets: parentPolicy.coreAssets ?? [],
+		enabledFeatures: parentPolicy.enabledFeatures ?? [],
+		enabledTools: parentPolicy.enabledTools ?? [],
 		limits: parentPolicy.limits ?? {},
+		managedSources: parentPolicy.managedSources ?? [],
 		modelRouting: parentPolicy.modelRouting ?? {},
 		validation: parentPolicy.validation ?? {},
 	};
 	const candidateCorePolicy = {
 		coreAssets: candidatePolicy.coreAssets ?? [],
+		enabledFeatures: candidatePolicy.enabledFeatures ?? [],
+		enabledTools: candidatePolicy.enabledTools ?? [],
 		limits: candidatePolicy.limits ?? {},
+		managedSources: candidatePolicy.managedSources ?? [],
 		modelRouting: candidatePolicy.modelRouting ?? {},
 		validation: candidatePolicy.validation ?? {},
 	};
 	return canonicalJson(parentCorePolicy) !== canonicalJson(candidateCorePolicy);
-}
-
-function userMessageText(value: unknown): string | undefined {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-	const message = value as Record<string, unknown>;
-	if (message.role !== "user") return undefined;
-	if (typeof message.content === "string") return message.content;
-	if (!Array.isArray(message.content)) return undefined;
-	const parts: string[] = [];
-	for (const block of message.content) {
-		if (typeof block !== "object" || block === null || Array.isArray(block)) continue;
-		const content = block as Record<string, unknown>;
-		if (content.type === "text" && typeof content.text === "string") parts.push(content.text);
-	}
-	return parts.length > 0 ? parts.join("\n") : undefined;
 }
 
 async function isDirectPreference(
@@ -233,11 +259,6 @@ async function isDirectPreference(
 		if (event?.type === "explicit_feedback") {
 			const text = await resolveStoredPayload(paths, event.text);
 			if (typeof text === "string" && normalizeText(text) === normalizeText(reference.quote)) return true;
-		}
-		if (event?.type === "message" && event.role === "user") {
-			const message = await resolveStoredPayload(paths, event.message);
-			const text = userMessageText(message);
-			if (text !== undefined && normalizeText(text) === normalizeText(reference.quote)) return true;
 		}
 	}
 	return false;
@@ -302,6 +323,7 @@ async function evaluateDataCandidate(options: {
 	parent: CompiledBundle;
 	candidate: CompiledBundle;
 	evidence: EvidenceReference[];
+	suggestedTier?: ProposalTier;
 }): Promise<DataCandidateEvaluation> {
 	if (options.candidate.manifest.parentDigest !== options.parent.digest) {
 		throw new Error("Candidate bundle parent does not match the proposal parent");
@@ -327,12 +349,18 @@ async function evaluateDataCandidate(options: {
 		before,
 		after,
 	});
+	const tier = stricterTier(classification.tier, options.suggestedTier);
 	return {
 		kind: "data",
-		tier: classification.tier,
+		tier,
 		changedPaths,
 		diff: renderDiff(before, after, changedPaths),
-		l1: { passed: true, reason: classification.reason, errors: [] },
+		l1: {
+			passed: true,
+			reason:
+				tier === classification.tier ? classification.reason : `${classification.reason}; model requested ${tier}`,
+			errors: [],
+		},
 	};
 }
 
@@ -354,12 +382,33 @@ async function applyDraftChanges(candidateDirectory: string, changes: DraftChang
 	}
 }
 
+function renderCodeValidation(result: CodeL1Result): string {
+	const checks = result.checks
+		.map(({ name, result: command }) => {
+			const outcome = command.code === 0 && !command.killed && !command.outputLimitExceeded ? "passed" : "failed";
+			return `- ${name}: ${outcome} (exit ${command.code ?? "signal"})`;
+		})
+		.join("\n");
+	return [
+		"# Sandboxed L1 validation",
+		"",
+		`Result: ${result.passed ? "passed" : "failed"}`,
+		...(checks ? ["", checks] : []),
+		...(result.errors.length > 0 ? ["", "## Errors", "", ...result.errors.map((error) => `- ${error}`)] : []),
+		"",
+	].join("\n");
+}
+
 export async function stageProposal(options: {
 	paths: EvoPaths;
 	parentDigest: string;
 	draft: DraftProposal;
 	observationsMarkdown: string;
+	repositoryCwd?: string;
+	codeValidationExecutor?: CodeValidationExecutor;
+	signal?: AbortSignal;
 }): Promise<Proposal> {
+	assertCodeDraftReplayScenario(options.draft);
 	const id = formatProposalId();
 	const temporaryDirectory = join(options.paths.proposals, `.tmp-${id}`);
 	const proposalDirectory = join(options.paths.proposals, id);
@@ -367,15 +416,28 @@ export async function stageProposal(options: {
 	try {
 		if (options.draft.codePatch !== undefined || options.draft.changes === undefined) {
 			const codePatch = options.draft.codePatch ?? "";
+			await rm(temporaryDirectory, { recursive: true, force: true });
+			const staged = await stageCodeWorktree({
+				paths: options.paths,
+				repositoryCwd: options.repositoryCwd ?? process.cwd(),
+				proposalId: id,
+				revision: 1,
+				parentBundleDigest: options.parentDigest,
+				patch: codePatch,
+				...(options.codeValidationExecutor ? { validationExecutor: options.codeValidationExecutor } : {}),
+				...(options.signal ? { signal: options.signal } : {}),
+			});
+			const diffDigest = staged.diffDigest;
 			const proposal: Proposal = {
-				schemaVersion: 1,
+				schemaVersion: 2,
 				id,
 				createdAt: new Date().toISOString(),
+				revision: 1,
 				parentBundleDigest: options.parentDigest,
 				kind: "code",
 				tier: "T2",
 				motivation: options.draft.motivation,
-				diff: codePatch,
+				diff: staged.diff,
 				expectedEffect: options.draft.expectedEffect,
 				risk: options.draft.risk,
 				verifyPlan: options.draft.verifyPlan,
@@ -385,21 +447,41 @@ export async function stageProposal(options: {
 				evidence: options.draft.evidence,
 				inboxReferences: options.draft.inboxReferences,
 				replayScenarios: options.draft.replayScenarios,
-				changedPaths: [],
-				approvalDigest: sha256(codePatch),
+				changedPaths: staged.changedPaths,
+				diffDigest,
+				approvalDigest: staged.approvalDigest,
 				codePatch,
-				l1: {
-					passed: false,
-					reason: "Code proposals require the M4 isolated-worktree validation flow",
-					errors: ["No isolated worktree is attached to this proposal"],
+				codeWorkspace: {
+					repositoryRoot: staged.repositoryRoot,
+					repositoryId: staged.repositoryIdentity,
+					worktreePath: staged.worktreePath,
+					branch: staged.branch,
+					baseCommit: staged.baseCommit,
+					integrityDigest: staged.approvalDigest,
 				},
+				suggestedTier: options.draft.suggestedTier,
+				l1: {
+					passed: staged.l1.passed,
+					reason: staged.l1.passed ? "Sandboxed code validation passed" : "Sandboxed code validation failed",
+					errors: staged.l1.errors,
+				},
+				artifacts: {},
 			};
-			await writeFile(join(temporaryDirectory, "observations.md"), options.observationsMarkdown, "utf8");
-			await atomicWriteJson(join(temporaryDirectory, "proposal.json"), proposal);
-			await rename(temporaryDirectory, proposalDirectory);
+			await writeFile(join(proposalDirectory, "observations.md"), options.observationsMarkdown, "utf8");
+			proposal.artifacts.validation = await writeEvaluationArtifact({
+				paths: options.paths,
+				proposalId: id,
+				revision: proposal.revision,
+				diffDigest,
+				kind: "validation",
+				content: renderCodeValidation(staged.l1),
+			});
+			await saveProposal(options.paths, proposal);
+			await saveProposalRevisionSnapshot(options.paths, proposal);
 			return proposal;
 		}
 
+		options.signal?.throwIfAborted();
 		const parent = await loadCompiledBundle(options.paths, options.parentDigest);
 		const candidateDirectory = join(temporaryDirectory, "candidate");
 		await materializeBundle(options.paths, options.parentDigest, candidateDirectory);
@@ -415,11 +497,14 @@ export async function stageProposal(options: {
 			parent,
 			candidate,
 			evidence: options.draft.evidence,
+			suggestedTier: options.draft.suggestedTier,
 		});
+		const diffDigest = sha256(evaluation.diff);
 		const proposal: Proposal = {
-			schemaVersion: 1,
+			schemaVersion: 2,
 			id,
 			createdAt: new Date().toISOString(),
+			revision: 1,
 			parentBundleDigest: options.parentDigest,
 			kind: evaluation.kind,
 			tier: evaluation.tier,
@@ -435,14 +520,18 @@ export async function stageProposal(options: {
 			inboxReferences: options.draft.inboxReferences,
 			replayScenarios: options.draft.replayScenarios,
 			changedPaths: evaluation.changedPaths,
-			approvalDigest: candidate.digest,
+			diffDigest,
+			approvalDigest: diffDigest,
 			candidateDigest: candidate.digest,
+			suggestedTier: options.draft.suggestedTier,
 			l1: evaluation.l1,
+			artifacts: {},
 		};
 		await rm(candidateDirectory, { recursive: true, force: true });
 		await writeFile(join(temporaryDirectory, "observations.md"), options.observationsMarkdown, "utf8");
 		await atomicWriteJson(join(temporaryDirectory, "proposal.json"), proposal);
 		await rename(temporaryDirectory, proposalDirectory);
+		await saveProposalRevisionSnapshot(options.paths, proposal);
 		return proposal;
 	} catch (error) {
 		await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {});
@@ -464,25 +553,111 @@ export async function saveProposal(paths: EvoPaths, proposal: Proposal): Promise
 	await atomicWriteJson(join(paths.proposals, proposal.id, "proposal.json"), proposal);
 }
 
-async function assertApprovalArtifact(
-	paths: EvoPaths,
-	proposal: Proposal,
-	field: "reviewFile" | "replayFile",
-	expectedFile: "review.md" | "replay.md",
-): Promise<void> {
-	if (proposal[field] !== expectedFile) {
-		throw new Error(`Proposal ${proposal.id} requires ${field} to be ${expectedFile} before approval`);
-	}
-	try {
-		if (!(await lstat(join(paths.proposals, proposal.id, expectedFile))).isFile()) {
-			throw new Error(`Proposal ${proposal.id} ${expectedFile} is not a regular file`);
+function withProposalLock<T>(paths: EvoPaths, id: string, operation: () => Promise<T>): Promise<T> {
+	assertProposalId(id);
+	return withFileLock(paths, `proposal-${id}`, operation, { staleAfterMs: 4 * 60 * 60 * 1000 });
+}
+
+export async function attachProposalArtifact(options: {
+	paths: EvoPaths;
+	proposalId: string;
+	expected: ProposalApproval;
+	kind: ProposalArtifactKind;
+	content: string;
+	allowedStatuses: readonly Proposal["status"][];
+}): Promise<Proposal> {
+	return withProposalLock(options.paths, options.proposalId, async () => {
+		const proposal = await loadProposal(options.paths, options.proposalId);
+		assertProposalApproval(proposal, options.expected);
+		if (!options.allowedStatuses.includes(proposal.status)) {
+			throw new Error(`Proposal ${proposal.id} is ${proposal.status}; cannot attach ${options.kind}`);
 		}
-	} catch (error) {
-		if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
-			throw new Error(`Proposal ${proposal.id} is missing required artifact ${expectedFile}`);
+		const existing = proposal.artifacts[options.kind];
+		if (existing) {
+			await validateEvaluationArtifact({
+				paths: options.paths,
+				proposalId: proposal.id,
+				revision: proposal.revision,
+				diffDigest: proposal.diffDigest,
+				kind: options.kind,
+				reference: existing,
+			});
+			if (existing.sha256 !== sha256(options.content)) {
+				throw new Error(`Proposal ${options.kind} artifact is already fixed for revision ${proposal.revision}`);
+			}
+			return proposal;
 		}
-		throw error;
-	}
+		proposal.artifacts[options.kind] = await writeEvaluationArtifact({
+			paths: options.paths,
+			proposalId: proposal.id,
+			revision: proposal.revision,
+			diffDigest: proposal.diffDigest,
+			kind: options.kind,
+			content: options.content,
+		});
+		await saveProposal(options.paths, proposal);
+		await saveProposalRevisionSnapshot(options.paths, proposal);
+		return proposal;
+	});
+}
+
+export async function attachRetrospectiveArtifact(options: {
+	paths: EvoPaths;
+	proposalId: string;
+	expected: ProposalApproval;
+	content: string;
+	evidenceDigest: string;
+	evidenceCutoff: string;
+}): Promise<Proposal> {
+	return withProposalLock(options.paths, options.proposalId, async () => {
+		const proposal = await loadProposal(options.paths, options.proposalId);
+		assertProposalApproval(proposal, options.expected);
+		if (proposal.status !== "trialing") {
+			throw new Error(`Proposal ${proposal.id} is ${proposal.status}; cannot attach retrospective`);
+		}
+		const existing = proposal.artifacts.retrospective;
+		if (existing) {
+			await validateEvaluationArtifact({
+				paths: options.paths,
+				proposalId: proposal.id,
+				revision: proposal.revision,
+				diffDigest: proposal.diffDigest,
+				kind: "retrospective",
+				reference: existing,
+			});
+			if (existing.evidence?.digest === options.evidenceDigest) {
+				if (existing.sha256 !== sha256(options.content)) {
+					throw new Error(`Proposal retrospective is already fixed for evidence ${options.evidenceDigest}`);
+				}
+				return proposal;
+			}
+		}
+		proposal.artifacts.retrospective = await writeRetrospectiveArtifact({
+			paths: options.paths,
+			proposalId: proposal.id,
+			revision: proposal.revision,
+			diffDigest: proposal.diffDigest,
+			content: options.content,
+			evidenceDigest: options.evidenceDigest,
+			evidenceCutoff: options.evidenceCutoff,
+		});
+		await saveProposal(options.paths, proposal);
+		await saveProposalRevisionSnapshot(options.paths, proposal);
+		return proposal;
+	});
+}
+
+async function assertApprovalArtifact(paths: EvoPaths, proposal: Proposal, kind: "review" | "replay" | "validation") {
+	const reference = proposal.artifacts[kind];
+	if (!reference) throw new Error(`Proposal ${proposal.id} is missing required ${kind} artifact`);
+	await validateEvaluationArtifact({
+		paths,
+		proposalId: proposal.id,
+		revision: proposal.revision,
+		diffDigest: proposal.diffDigest,
+		kind,
+		reference,
+	});
 }
 
 function matchesApprovalDigest(expected: string, current: string): boolean {
@@ -490,67 +665,432 @@ function matchesApprovalDigest(expected: string, current: string): boolean {
 	return timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(current, "hex"));
 }
 
+function approvalArtifactsDigest(proposal: Proposal): string {
+	return sha256(
+		canonicalJson({
+			schemaVersion: 1,
+			review: proposal.artifacts.review ?? null,
+			replay: proposal.artifacts.replay ?? null,
+			validation: proposal.artifacts.validation ?? null,
+		}),
+	);
+}
+
 async function revalidateDataProposal(
 	paths: EvoPaths,
 	proposal: Proposal,
 ): Promise<{ candidate: CompiledBundle; evaluation: DataCandidateEvaluation }> {
-	if (!proposal.candidateDigest || !matchesApprovalDigest(proposal.approvalDigest, proposal.candidateDigest)) {
-		throw new Error("Proposal approval digest does not match its candidate bundle");
+	if (!proposal.candidateDigest) throw new Error("Data proposal has no candidate bundle");
+	if (
+		!matchesApprovalDigest(proposal.approvalDigest, proposal.diffDigest) ||
+		!matchesApprovalDigest(proposal.diffDigest, sha256(proposal.diff))
+	) {
+		throw new Error("Proposal approval digest does not match its displayed diff");
 	}
 	const [parent, candidate] = await Promise.all([
 		loadCompiledBundle(paths, proposal.parentBundleDigest),
 		loadCompiledBundle(paths, proposal.candidateDigest),
 	]);
-	const evaluation = await evaluateDataCandidate({ paths, parent, candidate, evidence: proposal.evidence });
+	const evaluation = await evaluateDataCandidate({
+		paths,
+		parent,
+		candidate,
+		evidence: proposal.evidence,
+		suggestedTier: proposal.suggestedTier,
+	});
 	const mismatches: string[] = [];
 	if (proposal.kind !== evaluation.kind) mismatches.push("kind");
 	if (proposal.tier !== evaluation.tier) mismatches.push("tier");
 	if (canonicalJson(proposal.changedPaths) !== canonicalJson(evaluation.changedPaths)) mismatches.push("changedPaths");
 	if (proposal.diff !== evaluation.diff) mismatches.push("diff");
-	if (proposal.l1.passed !== evaluation.l1.passed) mismatches.push("l1.passed");
+	if (proposal.diffDigest !== sha256(evaluation.diff)) mismatches.push("diffDigest");
+	if (canonicalJson(proposal.l1) !== canonicalJson(evaluation.l1)) mismatches.push("l1");
 	if (mismatches.length > 0) {
 		throw new Error(`Proposal ${proposal.id} does not match immutable bundle audit: ${mismatches.join(", ")}`);
 	}
 	return { candidate, evaluation };
 }
 
-export async function approveProposal(paths: EvoPaths, id: string, expectedApprovalDigest: string): Promise<Proposal> {
-	const proposal = await loadProposal(paths, id);
-	if (!matchesApprovalDigest(expectedApprovalDigest, proposal.approvalDigest)) {
-		throw new Error(`Proposal ${id} approval digest does not match the confirmed digest`);
+export function assertProposalApproval(proposal: Proposal, expected: ProposalApproval): void {
+	if (proposal.revision !== expected.revision) {
+		throw new Error(`Proposal ${proposal.id} revision changed from ${expected.revision} to ${proposal.revision}`);
 	}
-	if (proposal.status !== "pending") throw new Error(`Proposal ${id} is ${proposal.status}`);
-	if (proposal.kind === "code") {
-		if (!proposal.l1.passed) throw new Error(`Proposal ${id} failed L1: ${proposal.l1.errors.join("; ")}`);
-		throw new Error(`Proposal ${id} failed L1: Code proposals require the M4 isolated-worktree validation flow`);
+	if (
+		!matchesApprovalDigest(expected.diffDigest, proposal.diffDigest) ||
+		!matchesApprovalDigest(proposal.diffDigest, sha256(proposal.diff))
+	) {
+		throw new Error(`Proposal ${proposal.id} diff digest does not match the confirmed final diff`);
 	}
-	const { candidate, evaluation } = await revalidateDataProposal(paths, proposal);
-	if (evaluation.tier !== "T0") await assertApprovalArtifact(paths, proposal, "reviewFile", "review.md");
-	if (evaluation.tier === "T2") {
-		await assertApprovalArtifact(paths, proposal, "replayFile", "replay.md");
+	if (
+		expected.artifactsDigest !== undefined &&
+		!matchesApprovalDigest(expected.artifactsDigest, approvalArtifactsDigest(proposal))
+	) {
+		throw new Error(`Proposal ${proposal.id} approval artifacts changed after confirmation`);
 	}
-	const registry = new BundleRegistry(paths);
-	if ((await registry.readStableDigest()) !== proposal.parentBundleDigest) {
-		throw new Error("Proposal parent is no longer stable; regenerate or rebase it");
+	if (
+		(proposal.kind === "code" || proposal.codeWorkspace !== undefined || expected.approvalDigest !== undefined) &&
+		(proposal.kind !== "code" || proposal.tier !== "T2")
+	) {
+		throw new Error(`Proposal ${proposal.id} code approval requires kind code and tier T2`);
 	}
-	await registry.recordDecision({ proposalId: id, approved: true, reason: `Approved ${candidate.digest}` });
-	if (evaluation.tier === "T0") {
-		await registry.activateTrial({ digest: candidate.digest, proposalId: id, plan: proposal.trialPlan });
-		await registry.keepTrial("T0 deterministic change applied");
-		proposal.status = "kept";
-	} else {
-		await registry.activateTrial({ digest: candidate.digest, proposalId: id, plan: proposal.trialPlan });
-		proposal.status = "trialing";
+	if (proposal.kind === "data") {
+		if (!matchesApprovalDigest(proposal.approvalDigest, proposal.diffDigest)) {
+			throw new Error(`Proposal ${proposal.id} diff digest does not match the confirmed final diff`);
+		}
+		return;
 	}
-	await saveProposal(paths, proposal);
-	return proposal;
+	const workspace = proposal.codeWorkspace;
+	if (!workspace || !expected.approvalDigest) {
+		throw new Error(`Proposal ${proposal.id} requires confirmation of its code approval context`);
+	}
+	const computed = codeApprovalDigest({
+		repositoryRoot: workspace.repositoryRoot,
+		repositoryIdentity: workspace.repositoryId,
+		baseCommit: workspace.baseCommit,
+		parentBundleDigest: proposal.parentBundleDigest,
+		diff: proposal.diff,
+	});
+	if (
+		!matchesApprovalDigest(expected.approvalDigest, proposal.approvalDigest) ||
+		!matchesApprovalDigest(proposal.approvalDigest, workspace.integrityDigest) ||
+		!matchesApprovalDigest(proposal.approvalDigest, computed)
+	) {
+		throw new Error(`Proposal ${proposal.id} code approval context changed after confirmation`);
+	}
 }
 
-export async function rejectProposal(paths: EvoPaths, id: string, reason: string): Promise<Proposal> {
-	const proposal = await loadProposal(paths, id);
-	if (proposal.status !== "pending") throw new Error(`Proposal ${id} is ${proposal.status}`);
-	await new BundleRegistry(paths).recordDecision({ proposalId: id, approved: false, reason });
-	proposal.status = "rejected";
-	await saveProposal(paths, proposal);
-	return proposal;
+export function proposalApproval(proposal: Proposal): ProposalApproval {
+	return {
+		revision: proposal.revision,
+		diffDigest: proposal.diffDigest,
+		...(proposal.kind === "code" ? { approvalDigest: proposal.approvalDigest } : {}),
+		artifactsDigest: approvalArtifactsDigest(proposal),
+	};
+}
+
+export async function reviseProposal(options: {
+	paths: EvoPaths;
+	id: string;
+	expected: ProposalApproval;
+	draft: DraftProposal;
+	observationsMarkdown: string;
+	repositoryCwd?: string;
+	codeValidationExecutor?: CodeValidationExecutor;
+}): Promise<Proposal> {
+	assertCodeDraftReplayScenario(options.draft);
+	const stableDigest = await new BundleRegistry(options.paths).readStableDigest();
+	return withProposalLock(options.paths, options.id, async () => {
+		const current = await loadProposal(options.paths, options.id);
+		assertProposalApproval(current, options.expected);
+		if (current.status !== "pending") throw new Error(`Proposal ${options.id} is ${current.status}`);
+		if (stableDigest !== current.parentBundleDigest) {
+			throw new Error("Proposal parent is no longer stable; regenerate or rebase it");
+		}
+		const revision = current.revision + 1;
+		let proposal: Proposal;
+		if (options.draft.codePatch !== undefined || options.draft.changes === undefined) {
+			const codePatch = options.draft.codePatch ?? "";
+			const staged = await stageCodeWorktree({
+				paths: options.paths,
+				repositoryCwd: options.repositoryCwd ?? current.codeWorkspace?.repositoryRoot ?? process.cwd(),
+				proposalId: current.id,
+				revision,
+				parentBundleDigest: current.parentBundleDigest,
+				patch: codePatch,
+				...(options.codeValidationExecutor ? { validationExecutor: options.codeValidationExecutor } : {}),
+			});
+			proposal = {
+				schemaVersion: 2,
+				id: current.id,
+				createdAt: current.createdAt,
+				revision,
+				parentBundleDigest: current.parentBundleDigest,
+				kind: "code",
+				tier: "T2",
+				motivation: options.draft.motivation,
+				diff: staged.diff,
+				expectedEffect: options.draft.expectedEffect,
+				risk: options.draft.risk,
+				verifyPlan: options.draft.verifyPlan,
+				trialPlan: options.draft.trialPlan,
+				status: "pending",
+				source: options.draft.source,
+				evidence: options.draft.evidence,
+				inboxReferences: options.draft.inboxReferences,
+				replayScenarios: options.draft.replayScenarios,
+				changedPaths: staged.changedPaths,
+				diffDigest: staged.diffDigest,
+				approvalDigest: staged.approvalDigest,
+				codePatch,
+				codeWorkspace: {
+					repositoryRoot: staged.repositoryRoot,
+					repositoryId: staged.repositoryIdentity,
+					worktreePath: staged.worktreePath,
+					branch: staged.branch,
+					baseCommit: staged.baseCommit,
+					integrityDigest: staged.approvalDigest,
+				},
+				suggestedTier: options.draft.suggestedTier,
+				l1: {
+					passed: staged.l1.passed,
+					reason: staged.l1.passed ? "Sandboxed code validation passed" : "Sandboxed code validation failed",
+					errors: staged.l1.errors,
+				},
+				artifacts: {},
+			};
+			proposal.artifacts.validation = await writeEvaluationArtifact({
+				paths: options.paths,
+				proposalId: proposal.id,
+				revision,
+				diffDigest: proposal.diffDigest,
+				kind: "validation",
+				content: renderCodeValidation(staged.l1),
+			});
+		} else {
+			const temporaryDirectory = join(
+				options.paths.proposals,
+				`.tmp-${current.id}-r${revision}-${randomUUID().slice(0, 8)}`,
+			);
+			const candidateDirectory = join(temporaryDirectory, "candidate");
+			await mkdir(temporaryDirectory, { recursive: true });
+			try {
+				const parent = await loadCompiledBundle(options.paths, current.parentBundleDigest);
+				await materializeBundle(options.paths, current.parentBundleDigest, candidateDirectory);
+				await applyDraftChanges(candidateDirectory, options.draft.changes);
+				const candidate = await compileBundle({
+					paths: options.paths,
+					sourceDirectory: candidateDirectory,
+					parentDigest: current.parentBundleDigest,
+					summary: options.draft.expectedEffect.slice(0, 240),
+				});
+				const evaluation = await evaluateDataCandidate({
+					paths: options.paths,
+					parent,
+					candidate,
+					evidence: options.draft.evidence,
+					suggestedTier: options.draft.suggestedTier,
+				});
+				const diffDigest = sha256(evaluation.diff);
+				proposal = {
+					schemaVersion: 2,
+					id: current.id,
+					createdAt: current.createdAt,
+					revision,
+					parentBundleDigest: current.parentBundleDigest,
+					kind: "data",
+					tier: evaluation.tier,
+					motivation: options.draft.motivation,
+					diff: evaluation.diff,
+					expectedEffect: options.draft.expectedEffect,
+					risk: options.draft.risk,
+					verifyPlan: options.draft.verifyPlan,
+					trialPlan: options.draft.trialPlan,
+					status: "pending",
+					source: options.draft.source,
+					evidence: options.draft.evidence,
+					inboxReferences: options.draft.inboxReferences,
+					replayScenarios: options.draft.replayScenarios,
+					changedPaths: evaluation.changedPaths,
+					diffDigest,
+					approvalDigest: diffDigest,
+					candidateDigest: candidate.digest,
+					suggestedTier: options.draft.suggestedTier,
+					l1: evaluation.l1,
+					artifacts: {},
+				};
+			} finally {
+				await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {});
+			}
+		}
+		await writeFile(
+			join(options.paths.proposals, current.id, "observations.md"),
+			options.observationsMarkdown,
+			"utf8",
+		);
+		await saveProposal(options.paths, proposal);
+		await saveProposalRevisionSnapshot(options.paths, proposal);
+		return proposal;
+	});
+}
+
+export async function approveProposal(
+	paths: EvoPaths,
+	id: string,
+	expected: ProposalApproval,
+	codeValidationExecutor?: CodeValidationExecutor,
+	registry: BundleRegistry = new BundleRegistry(paths),
+	idempotencyKey?: string,
+	expectedStateDigest?: string,
+): Promise<Proposal> {
+	const prepared = await withProposalLock(paths, id, async () => {
+		const proposal = await loadProposal(paths, id);
+		assertProposalApproval(proposal, expected);
+		if (expected.artifactsDigest === undefined) {
+			throw new Error(`Proposal ${id} requires confirmation of its approval artifacts`);
+		}
+		if (proposal.kind === "code") {
+			if (proposal.status !== "pending" && proposal.status !== "approved") {
+				throw new Error(`Proposal ${id} is ${proposal.status}`);
+			}
+			if (!proposal.codeWorkspace) throw new Error(`Proposal ${id} has no isolated code workspace`);
+			if (!proposal.replayScenarios[0]) {
+				throw new Error(`Code proposal ${id} requires a replay scenario`);
+			}
+			const workspace = proposal.codeWorkspace;
+			const staged = await revalidateCodeWorktree({
+				paths,
+				proposalId: id,
+				revision: proposal.revision,
+				expectedApprovalDigest: workspace.integrityDigest,
+				expectedRepositoryRoot: workspace.repositoryRoot,
+				expectedRepositoryIdentity: workspace.repositoryId,
+				expectedBaseCommit: workspace.baseCommit,
+				expectedParentBundleDigest: proposal.parentBundleDigest,
+				...(codeValidationExecutor ? { validationExecutor: codeValidationExecutor } : {}),
+			});
+			const mismatches: string[] = [];
+			if (staged.repositoryRoot !== workspace.repositoryRoot) mismatches.push("repositoryRoot");
+			if (staged.repositoryIdentity !== workspace.repositoryId) mismatches.push("repositoryId");
+			if (staged.worktreePath !== workspace.worktreePath) mismatches.push("worktreePath");
+			if (staged.branch !== workspace.branch) mismatches.push("branch");
+			if (staged.baseCommit !== workspace.baseCommit) mismatches.push("baseCommit");
+			if (staged.diff !== proposal.diff) mismatches.push("diff");
+			if (staged.diffDigest !== proposal.diffDigest) mismatches.push("diffDigest");
+			if (canonicalJson(staged.changedPaths) !== canonicalJson(proposal.changedPaths))
+				mismatches.push("changedPaths");
+			if (mismatches.length > 0) {
+				throw new Error(`Proposal ${id} does not match its isolated worktree: ${mismatches.join(", ")}`);
+			}
+			if (!staged.l1.passed) throw new Error(`Proposal ${id} failed approval-time L1 revalidation`);
+			if (!proposal.l1.passed) throw new Error(`Proposal ${id} did not pass its staged L1 validation`);
+			await assertApprovalArtifact(paths, proposal, "validation");
+			await assertApprovalArtifact(paths, proposal, "replay");
+			await assertApprovalArtifact(paths, proposal, "review");
+			return { kind: "code" as const, proposal, workspace };
+		}
+		const { candidate, evaluation } = await revalidateDataProposal(paths, proposal);
+		const targetStatus: Proposal["status"] = evaluation.tier === "T0" ? "kept" : "trialing";
+		if (proposal.status !== "pending" && proposal.status !== targetStatus) {
+			throw new Error(`Proposal ${id} is ${proposal.status}`);
+		}
+		if (evaluation.tier !== "T0") await assertApprovalArtifact(paths, proposal, "review");
+		if (evaluation.tier === "T2") await assertApprovalArtifact(paths, proposal, "replay");
+		return { kind: "data" as const, proposal, candidate, evaluation, targetStatus };
+	});
+
+	if (prepared.kind === "code") {
+		return registry.approveCodeProposal({
+			...(idempotencyKey ? { idempotencyKey } : {}),
+			...(expectedStateDigest ? { expectedStateDigest } : {}),
+			proposalId: id,
+			parentDigest: prepared.proposal.parentBundleDigest,
+			revision: prepared.proposal.revision,
+			diffDigest: prepared.proposal.diffDigest,
+			approvalDigest: prepared.proposal.approvalDigest,
+			branch: prepared.workspace.branch,
+			reason: `Approved code context ${prepared.proposal.approvalDigest} for manual commit and merge from ${prepared.workspace.branch}`,
+			proposalBefore: prepared.proposal,
+			proposalAfter: { ...prepared.proposal, status: "approved" },
+		});
+	}
+	const result = await registry.approveDataProposal({
+		...(idempotencyKey ? { idempotencyKey } : {}),
+		...(expectedStateDigest ? { expectedStateDigest } : {}),
+		proposalId: id,
+		revision: prepared.proposal.revision,
+		diffDigest: prepared.proposal.diffDigest,
+		parentDigest: prepared.proposal.parentBundleDigest,
+		candidateDigest: prepared.candidate.digest,
+		tier: prepared.evaluation.tier,
+		plan: prepared.proposal.trialPlan,
+		reason: `Approved exact data diff ${prepared.proposal.diffDigest}`,
+		proposalBefore: prepared.proposal,
+		proposalAfter: { ...prepared.proposal, status: prepared.targetStatus },
+	});
+	return result.proposal;
+}
+
+export async function rejectProposal(
+	paths: EvoPaths,
+	id: string,
+	reason: string,
+	registry: BundleRegistry = new BundleRegistry(paths),
+	idempotencyKey?: string,
+	expectedStateDigest?: string,
+): Promise<Proposal> {
+	const prepared = await withProposalLock(paths, id, async () => {
+		const proposal = await loadProposal(paths, id);
+		if (proposal.status !== "pending" && proposal.status !== "deferred" && proposal.status !== "rejected") {
+			throw new Error(`Proposal ${id} is ${proposal.status}`);
+		}
+		const proposalAfter: Proposal = { ...proposal, status: "rejected" };
+		delete proposalAfter.defer;
+		return { proposalBefore: proposal, proposalAfter };
+	});
+	return registry.transitionProposal({
+		...(idempotencyKey ? { idempotencyKey } : {}),
+		...(expectedStateDigest ? { expectedStateDigest } : {}),
+		action: "reject-proposal",
+		...prepared,
+		reason,
+	});
+}
+
+export async function deferProposal(
+	paths: EvoPaths,
+	id: string,
+	reason: string,
+	until?: string,
+	registry: BundleRegistry = new BundleRegistry(paths),
+	idempotencyKey?: string,
+	expectedStateDigest?: string,
+): Promise<Proposal> {
+	const prepared = await withProposalLock(paths, id, async () => {
+		const proposal = await loadProposal(paths, id);
+		if (proposal.status !== "pending" && proposal.status !== "deferred") {
+			throw new Error(`Proposal ${id} is ${proposal.status}`);
+		}
+		const proposalAfter: Proposal =
+			proposal.status === "deferred"
+				? proposal
+				: {
+						...proposal,
+						status: "deferred",
+						defer: { deferredAt: new Date().toISOString(), reason, ...(until ? { until } : {}) },
+					};
+		return { proposalBefore: proposal, proposalAfter };
+	});
+	return registry.transitionProposal({
+		...(idempotencyKey ? { idempotencyKey } : {}),
+		...(expectedStateDigest ? { expectedStateDigest } : {}),
+		action: "defer-proposal",
+		...prepared,
+		reason,
+	});
+}
+
+export async function reopenProposal(
+	paths: EvoPaths,
+	id: string,
+	reason: string,
+	registry: BundleRegistry = new BundleRegistry(paths),
+	idempotencyKey?: string,
+	expectedStateDigest?: string,
+): Promise<Proposal> {
+	const prepared = await withProposalLock(paths, id, async () => {
+		const proposal = await loadProposal(paths, id);
+		if (proposal.status !== "deferred" && proposal.status !== "pending") {
+			throw new Error(`Proposal ${id} is ${proposal.status}`);
+		}
+		const proposalAfter: Proposal = { ...proposal, status: "pending" };
+		delete proposalAfter.defer;
+		return { proposalBefore: proposal, proposalAfter };
+	});
+	return registry.transitionProposal({
+		...(idempotencyKey ? { idempotencyKey } : {}),
+		...(expectedStateDigest ? { expectedStateDigest } : {}),
+		action: "reopen-proposal",
+		...prepared,
+		reason,
+	});
 }

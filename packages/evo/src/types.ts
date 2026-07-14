@@ -1,11 +1,11 @@
 export const BUNDLE_SCHEMA_VERSION = 1;
 export const POLICY_SCHEMA_VERSION = 1;
-export const PROPOSAL_SCHEMA_VERSION = 1;
+export const PROPOSAL_SCHEMA_VERSION = 2;
 export const RECORDER_SCHEMA_VERSION = 1;
 
 export type ProposalKind = "data" | "code";
 export type ProposalTier = "T0" | "T1" | "T2";
-export type ProposalStatus = "pending" | "approved" | "rejected" | "trialing" | "kept" | "rolled-back";
+export type ProposalStatus = "pending" | "deferred" | "approved" | "rejected" | "trialing" | "kept" | "rolled-back";
 
 export interface BundleFileEntry {
 	path: string;
@@ -32,10 +32,27 @@ export interface BundleModelRouting {
 	critic?: string;
 }
 
-export type DeterministicCheck = "bundle-compile" | "lint" | "typecheck" | "unit-tests";
+export type DeterministicCheck = "bundle-compile";
 
 export interface BundleValidationPolicy {
 	requiredChecks?: DeterministicCheck[];
+}
+
+export type BundleManagedSourceKind =
+	| "custom-prompt"
+	| "append-prompt"
+	| "context"
+	| "prompt"
+	| "skill"
+	| "memory"
+	| "preference";
+
+export interface BundleManagedSource {
+	kind: BundleManagedSourceKind;
+	sourceRoot: string;
+	relativePath: string;
+	targetPath: string;
+	sourceSha256: string;
 }
 
 export interface BundlePolicy {
@@ -44,10 +61,12 @@ export interface BundlePolicy {
 	stablePromptPaths?: string[];
 	dynamicPromptPaths?: string[];
 	enabledTools?: string[];
+	enabledFeatures?: string[];
 	coreAssets?: string[];
 	limits?: BundlePolicyLimits;
 	modelRouting?: BundleModelRouting;
 	validation?: BundleValidationPolicy;
+	managedSources?: BundleManagedSource[];
 }
 
 export interface CompiledBundle {
@@ -74,10 +93,56 @@ export interface ProposalL1Result {
 	errors: string[];
 }
 
+export type ProposalArtifactKind = "review" | "replay" | "validation" | "retrospective";
+
+export interface EvaluationEvidenceBinding {
+	digest: string;
+	cutoff: string;
+}
+
+export interface EvaluationArtifactRef {
+	file: string;
+	sha256: string;
+	revision: number;
+	diffDigest: string;
+	createdAt: string;
+	evidence?: EvaluationEvidenceBinding;
+}
+
+export interface ProposalArtifacts {
+	review?: EvaluationArtifactRef;
+	replay?: EvaluationArtifactRef;
+	validation?: EvaluationArtifactRef;
+	retrospective?: EvaluationArtifactRef;
+}
+
+export interface CodeWorkspace {
+	repositoryRoot: string;
+	repositoryId: string;
+	worktreePath: string;
+	branch: string;
+	baseCommit: string;
+	integrityDigest: string;
+}
+
+export interface ProposalDeferState {
+	deferredAt: string;
+	reason: string;
+	until?: string;
+}
+
+export interface ProposalApproval {
+	revision: number;
+	diffDigest: string;
+	approvalDigest?: string;
+	artifactsDigest?: string;
+}
+
 export interface Proposal {
-	schemaVersion: 1;
+	schemaVersion: 2;
 	id: string;
 	createdAt: string;
+	revision: number;
 	parentBundleDigest: string;
 	kind: ProposalKind;
 	tier: ProposalTier;
@@ -93,13 +158,15 @@ export interface Proposal {
 	inboxReferences: string[];
 	replayScenarios: ReplayScenario[];
 	changedPaths: string[];
+	diffDigest: string;
 	approvalDigest: string;
 	candidateDigest?: string;
 	codePatch?: string;
+	codeWorkspace?: CodeWorkspace;
+	suggestedTier?: ProposalTier;
+	defer?: ProposalDeferState;
 	l1: ProposalL1Result;
-	reviewFile?: string;
-	replayFile?: string;
-	retrospectiveFile?: string;
+	artifacts: ProposalArtifacts;
 }
 
 export interface TrialState {
@@ -114,6 +181,8 @@ export type HistoryAction =
 	| "initialize"
 	| "proposal-approved"
 	| "proposal-rejected"
+	| "proposal-deferred"
+	| "proposal-reopened"
 	| "trial-start"
 	| "trial-keep"
 	| "rollback"
@@ -121,12 +190,18 @@ export type HistoryAction =
 	| "resume";
 
 export interface HistoryEntry {
+	eventId?: string;
 	timestamp: string;
 	action: HistoryAction;
 	actor: "human" | "system";
 	fromDigest?: string;
 	toDigest?: string;
 	proposalId?: string;
+	revision?: number;
+	diffDigest?: string;
+	approvalDigest?: string;
+	candidateDigest?: string;
+	branch?: string;
 	reason: string;
 }
 
@@ -155,5 +230,6 @@ export interface EvoStatus {
 	stableDigest?: string;
 	trial?: TrialState;
 	pendingProposals: number;
+	deferredProposals: number;
 	paused: boolean;
 }

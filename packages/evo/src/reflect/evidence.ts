@@ -1,4 +1,4 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { lstat, readdir, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { loadCompiledBundle } from "../bundle/compile.ts";
@@ -7,17 +7,53 @@ import type { DraftProposal } from "../proposal.ts";
 import type { RecordedEvent, RecorderInboxEntry } from "../recorder/schema.ts";
 import { readSessionLog, resolveStoredPayload } from "../recorder/store.ts";
 import { BundleRegistry } from "../registry/registry.ts";
+import { atomicWriteJson, canonicalJson, readJsonIfExists, sha256, withFileLock } from "../storage.ts";
 import type { EvidenceReference, ReplayScenario } from "../types.ts";
 
 const DEFAULT_CORPUS_BYTES = 1024 * 1024;
+const REVIEW_CURSOR_SCHEMA_VERSION = 1;
+const REVIEW_CURSOR_FILE = "review-cursor.json";
+const SOURCE_SEPARATOR = "\n\n";
+const SOURCE_WEIGHTS = {
+	bundle: 30,
+	history: 15,
+	inbox: 20,
+	sessions: 35,
+} as const;
+
+export type EvidenceSource = keyof typeof SOURCE_WEIGHTS;
+
+export interface EvidenceSourceSummary {
+	bytes: number;
+	maxBytes: number;
+	truncated: boolean;
+}
+
+export interface EvidenceReviewCursor {
+	schemaVersion: 1;
+	updatedAt: string;
+	inboxFiles: string[];
+	sessionSequences: Record<string, number>;
+}
+
+export interface CollectEvidenceCorpusOptions {
+	maxBytes?: number;
+	mode?: "full" | "incremental";
+	reviewCursor?: EvidenceReviewCursor;
+	now?: () => Date;
+}
 
 export interface EvidenceCorpus {
 	text: string;
 	bytes: number;
 	maxBytes: number;
 	truncated: boolean;
+	mode: "full" | "incremental";
+	evidenceDigest: string;
+	sources: Record<EvidenceSource, EvidenceSourceSummary>;
 	sessionIds: string[];
 	inboxFiles: string[];
+	nextReviewCursor: EvidenceReviewCursor;
 	bundleDigest?: string;
 }
 
@@ -25,6 +61,7 @@ export interface LoadedReplayScenario {
 	history: AgentMessage[];
 	targetPrompt: string;
 	oldSystemPrompt: string;
+	systemPromptOptions: unknown;
 	sessionIdentity: string;
 	cwd: string;
 }
@@ -32,6 +69,12 @@ export interface LoadedReplayScenario {
 interface RecentFile {
 	name: string;
 	mtimeMs: number;
+}
+
+interface SourceCollector {
+	append(heading: string, value: unknown): boolean;
+	text(): string;
+	summary(): EvidenceSourceSummary;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -48,6 +91,130 @@ function assertSafeFileName(name: string, label: string): void {
 	}
 }
 
+function parseReviewCursor(value: unknown): EvidenceReviewCursor {
+	if (!isRecord(value)) throw new Error("Stored evidence review cursor must be an object");
+	const allowedKeys = new Set(["schemaVersion", "updatedAt", "inboxFiles", "sessionSequences"]);
+	if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
+		throw new Error("Stored evidence review cursor has unknown fields");
+	}
+	if (
+		value.schemaVersion !== REVIEW_CURSOR_SCHEMA_VERSION ||
+		typeof value.updatedAt !== "string" ||
+		!Number.isFinite(Date.parse(value.updatedAt)) ||
+		!Array.isArray(value.inboxFiles) ||
+		value.inboxFiles.some((file) => typeof file !== "string") ||
+		!isRecord(value.sessionSequences)
+	) {
+		throw new Error("Stored evidence review cursor is invalid");
+	}
+	const inboxFiles = value.inboxFiles as string[];
+	for (const file of inboxFiles) {
+		assertSafeFileName(file, "Stored evidence review cursor inbox file");
+		if (!file.endsWith(".json")) throw new Error("Stored evidence review cursor inbox file must be JSON");
+	}
+	if (new Set(inboxFiles).size !== inboxFiles.length) {
+		throw new Error("Stored evidence review cursor contains duplicate inbox files");
+	}
+	const sessionSequences: Record<string, number> = {};
+	for (const [sessionId, sequence] of Object.entries(value.sessionSequences)) {
+		if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(sessionId)) {
+			throw new Error("Stored evidence review cursor contains an invalid session id");
+		}
+		if (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence <= 0) {
+			throw new Error("Stored evidence review cursor contains an invalid session sequence");
+		}
+		sessionSequences[sessionId] = sequence;
+	}
+	return {
+		schemaVersion: 1,
+		updatedAt: value.updatedAt,
+		inboxFiles: [...inboxFiles].sort(),
+		sessionSequences: Object.fromEntries(
+			Object.entries(sessionSequences).sort(([left], [right]) => left.localeCompare(right)),
+		),
+	};
+}
+
+function reviewCursorPath(paths: EvoPaths): string {
+	return join(paths.registry, REVIEW_CURSOR_FILE);
+}
+
+export async function readEvidenceReviewCursor(paths: EvoPaths): Promise<EvidenceReviewCursor | undefined> {
+	await ensureEvoLayout(paths);
+	const cursor = await readJsonIfExists<unknown>(reviewCursorPath(paths));
+	return cursor === undefined ? undefined : parseReviewCursor(cursor);
+}
+
+function mergeReviewCursors(
+	existing: EvidenceReviewCursor | undefined,
+	candidate: EvidenceReviewCursor,
+): EvidenceReviewCursor {
+	const inboxFiles = new Set([...(existing?.inboxFiles ?? []), ...candidate.inboxFiles]);
+	const sessionSequences: Record<string, number> = { ...(existing?.sessionSequences ?? {}) };
+	for (const [sessionId, sequence] of Object.entries(candidate.sessionSequences)) {
+		sessionSequences[sessionId] = Math.max(sessionSequences[sessionId] ?? 0, sequence);
+	}
+	const updatedAt =
+		existing && Date.parse(existing.updatedAt) > Date.parse(candidate.updatedAt)
+			? existing.updatedAt
+			: candidate.updatedAt;
+	return parseReviewCursor({
+		schemaVersion: 1,
+		updatedAt,
+		inboxFiles: [...inboxFiles],
+		sessionSequences,
+	});
+}
+
+export async function advanceEvidenceReviewCursor(
+	paths: EvoPaths,
+	candidate: EvidenceReviewCursor,
+): Promise<EvidenceReviewCursor> {
+	const validatedCandidate = parseReviewCursor(candidate);
+	return withFileLock(paths, "evidence-review-cursor", async () => {
+		const existing = await readEvidenceReviewCursor(paths);
+		const merged = mergeReviewCursors(existing, validatedCandidate);
+		await atomicWriteJson(reviewCursorPath(paths), merged);
+		return merged;
+	});
+}
+
+function allocateSourceBudgets(maxBytes: number): Record<EvidenceSource, number> {
+	const sources = Object.keys(SOURCE_WEIGHTS) as EvidenceSource[];
+	const separatorBytes = Buffer.byteLength(SOURCE_SEPARATOR, "utf8") * (sources.length - 1);
+	const available = Math.max(0, maxBytes - Math.min(maxBytes, separatorBytes));
+	let allocated = 0;
+	return Object.fromEntries(
+		sources.map((source, index) => {
+			const bytes =
+				index === sources.length - 1
+					? available - allocated
+					: Math.floor((available * SOURCE_WEIGHTS[source]) / 100);
+			allocated += bytes;
+			return [source, bytes];
+		}),
+	) as Record<EvidenceSource, number>;
+}
+
+function createSourceCollector(maxBytes: number): SourceCollector {
+	let sourceText = "";
+	let truncated = false;
+	return {
+		append(heading, value) {
+			const fragment = `${heading}\n${typeof value === "string" ? value : JSON.stringify(value, undefined, "\t")}`;
+			const candidate = sourceText ? `${sourceText}${SOURCE_SEPARATOR}${fragment}` : fragment;
+			if (Buffer.byteLength(candidate, "utf8") > maxBytes) {
+				truncated = true;
+				return false;
+			}
+			sourceText = candidate;
+			return true;
+		},
+		text: () => sourceText,
+		summary: () => ({ bytes: Buffer.byteLength(sourceText, "utf8"), maxBytes, truncated }),
+	};
+}
+
 async function listRecentFiles(directory: string, suffix: string): Promise<RecentFile[]> {
 	const entries = await readdir(directory, { withFileTypes: true }).catch((error: unknown) => {
 		if (isMissingFile(error)) return [];
@@ -56,9 +223,20 @@ async function listRecentFiles(directory: string, suffix: string): Promise<Recen
 	const files = await Promise.all(
 		entries
 			.filter((entry) => entry.isFile() && entry.name.endsWith(suffix))
-			.map(async (entry) => ({ name: entry.name, mtimeMs: (await stat(join(directory, entry.name))).mtimeMs })),
+			.map(async (entry): Promise<RecentFile | undefined> => {
+				try {
+					const metadata = await lstat(join(directory, entry.name));
+					if (!metadata.isFile()) return undefined;
+					return { name: entry.name, mtimeMs: metadata.mtimeMs };
+				} catch (error) {
+					if (isMissingFile(error)) return undefined;
+					throw error;
+				}
+			}),
 	);
-	return files.sort((left, right) => right.mtimeMs - left.mtimeMs || right.name.localeCompare(left.name));
+	return files
+		.filter((file): file is RecentFile => file !== undefined)
+		.sort((left, right) => right.mtimeMs - left.mtimeMs || right.name.localeCompare(left.name));
 }
 
 async function restoreEvent(event: RecordedEvent, paths: EvoPaths): Promise<Record<string, unknown>> {
@@ -154,35 +332,48 @@ function asAgentMessage(value: unknown, label: string): AgentMessage {
 
 export async function collectEvidenceCorpus(
 	paths: EvoPaths,
-	options: { maxBytes?: number } = {},
+	options: CollectEvidenceCorpusOptions = {},
 ): Promise<EvidenceCorpus> {
 	const maxBytes = options.maxBytes ?? DEFAULT_CORPUS_BYTES;
 	if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new Error("maxBytes must be a positive safe integer");
+	const mode = options.mode ?? "full";
+	if (mode === "full" && options.reviewCursor !== undefined) {
+		throw new Error("A review cursor can only be used with incremental evidence collection");
+	}
 	await ensureEvoLayout(paths);
 
-	let text = "";
-	let truncated = false;
+	const sourceBudgets = allocateSourceBudgets(maxBytes);
+	const collectors: Record<EvidenceSource, SourceCollector> = {
+		bundle: createSourceCollector(sourceBudgets.bundle),
+		history: createSourceCollector(sourceBudgets.history),
+		inbox: createSourceCollector(sourceBudgets.inbox),
+		sessions: createSourceCollector(sourceBudgets.sessions),
+	};
+	const previousCursor =
+		mode === "incremental" && options.reviewCursor ? parseReviewCursor(options.reviewCursor) : undefined;
+	const reviewedInboxFiles = new Set(previousCursor?.inboxFiles ?? []);
+	const nextInboxFiles = new Set(previousCursor?.inboxFiles ?? []);
+	const nextSessionSequences: Record<string, number> = { ...(previousCursor?.sessionSequences ?? {}) };
 	const sessionIds = new Set<string>();
 	const inboxFiles: string[] = [];
-	const append = (heading: string, value: unknown): boolean => {
-		const fragment = `${heading}\n${typeof value === "string" ? value : JSON.stringify(value, undefined, "\t")}`;
-		const candidate = text ? `${text}\n\n${fragment}` : fragment;
-		if (Buffer.byteLength(candidate, "utf8") > maxBytes) {
-			truncated = true;
-			return false;
-		}
-		text = candidate;
-		return true;
-	};
 
 	let bundleDigest: string | undefined;
 	const registry = new BundleRegistry(paths);
 	bundleDigest = await registry.readStableDigest();
 	if (bundleDigest) {
 		const bundle = await loadCompiledBundle(paths, bundleDigest);
-		append(`## Current bundle ${bundleDigest} manifest`, bundle.manifest);
+		if (!collectors.bundle.append(`## Current bundle ${bundleDigest} manifest`, bundle.manifest)) {
+			collectors.bundle.append(`## Current bundle ${bundleDigest}`, {
+				summary: bundle.manifest.summary,
+				parentDigest: bundle.manifest.parentDigest,
+				manifestOmittedByBudget: true,
+			});
+		}
 		for (const file of bundle.manifest.files) {
-			append(`## Current bundle file ${file.path}`, await readFile(join(bundle.directory, file.path), "utf8"));
+			collectors.bundle.append(
+				`## Current bundle file ${file.path}`,
+				await readFile(join(bundle.directory, file.path), "utf8"),
+			);
 		}
 	}
 
@@ -199,19 +390,24 @@ export async function collectEvidenceCorpus(
 			} catch {
 				throw new Error(`Registry history line ${lines.length - index} is invalid JSON`);
 			}
-			append(`## Registry history entry ${lines.length - index}`, entry);
+			collectors.history.append(`## Registry history entry ${lines.length - index}`, entry);
 		}
 	} catch (error) {
 		if (!isMissingFile(error)) throw error;
 	}
 
 	for (const file of await listRecentFiles(paths.inbox, ".json")) {
+		if (reviewedInboxFiles.has(file.name)) continue;
 		const entry = await readInboxEntry(paths, file.name);
-		if (append(`## Explicit request ${file.name}`, entry)) inboxFiles.push(file.name);
+		if (collectors.inbox.append(`## Explicit request ${file.name}`, entry)) {
+			inboxFiles.push(file.name);
+			nextInboxFiles.add(file.name);
+		}
 	}
 
 	for (const file of await listRecentFiles(paths.log, ".jsonl")) {
 		const sessionId = file.name.slice(0, -".jsonl".length);
+		const reviewedSequence = previousCursor?.sessionSequences[sessionId] ?? 0;
 		let events: RecordedEvent[];
 		try {
 			events = await readSessionLog(paths, sessionId);
@@ -219,24 +415,93 @@ export async function collectEvidenceCorpus(
 			throw new Error(`Cannot collect session log ${file.name}`, { cause: error });
 		}
 		for (const event of events) {
+			if (event.sequence <= reviewedSequence) continue;
 			const restored = await restoreEvent(event, paths);
-			if (append(`## Session ${sessionId}, sequence ${event.sequence}`, restored)) {
+			if (collectors.sessions.append(`## Session ${sessionId}, sequence ${event.sequence}`, restored)) {
 				sessionIds.add(sessionId);
+				nextSessionSequences[sessionId] = event.sequence;
 				continue;
 			}
-			append(`## Session ${sessionId}, sequence ${event.sequence} (artifact omitted by budget)`, event);
+			if (
+				collectors.sessions.append(
+					`## Session ${sessionId}, sequence ${event.sequence} (artifact omitted by budget)`,
+					event,
+				)
+			) {
+				sessionIds.add(sessionId);
+				nextSessionSequences[sessionId] = event.sequence;
+				continue;
+			}
+			break;
 		}
 	}
 
+	const sourceOrder = Object.keys(SOURCE_WEIGHTS) as EvidenceSource[];
+	const sourceTexts = sourceOrder.map((source) => collectors[source].text()).filter(Boolean);
+	const text = sourceTexts.join(SOURCE_SEPARATOR);
+	const sources = Object.fromEntries(sourceOrder.map((source) => [source, collectors[source].summary()])) as Record<
+		EvidenceSource,
+		EvidenceSourceSummary
+	>;
+	const nextReviewCursor = parseReviewCursor({
+		schemaVersion: 1,
+		updatedAt: (options.now ?? (() => new Date()))().toISOString(),
+		inboxFiles: [...nextInboxFiles],
+		sessionSequences: nextSessionSequences,
+	});
+	const evidenceDigest = sha256(
+		canonicalJson({
+			bundleDigest: bundleDigest ?? null,
+			cutoff: {
+				inboxFiles: nextReviewCursor.inboxFiles,
+				sessionSequences: nextReviewCursor.sessionSequences,
+			},
+			sourceDigests: Object.fromEntries(sourceOrder.map((source) => [source, sha256(collectors[source].text())])),
+		}),
+	);
 	return {
 		text,
 		bytes: Buffer.byteLength(text, "utf8"),
 		maxBytes,
-		truncated,
+		truncated: sourceOrder.some((source) => sources[source].truncated),
+		mode,
+		evidenceDigest,
+		sources,
 		sessionIds: [...sessionIds],
 		inboxFiles,
+		nextReviewCursor,
 		...(bundleDigest ? { bundleDigest } : {}),
 	};
+}
+
+export async function validateEvidenceReferences(
+	paths: EvoPaths,
+	references: readonly EvidenceReference[],
+): Promise<EvidenceReference[]> {
+	const logs = new Map<string, Promise<RecordedEvent[]>>();
+	const verified: EvidenceReference[] = [];
+	for (const reference of references) {
+		if (!reference.sessionId || !Number.isSafeInteger(reference.sequence) || reference.sequence <= 0) {
+			throw new Error("Observation evidence must contain a sessionId and positive sequence");
+		}
+		let events = logs.get(reference.sessionId);
+		if (!events) {
+			events = readSessionLog(paths, reference.sessionId);
+			logs.set(reference.sessionId, events);
+		}
+		const event = (await events).find((candidate) => candidate.sequence === reference.sequence);
+		if (!event) throw new Error(`Observation evidence does not exist: ${reference.sessionId}:${reference.sequence}`);
+		if (reference.quote !== undefined) {
+			if (!reference.quote)
+				throw new Error(`Observation evidence quote is empty: ${reference.sessionId}:${reference.sequence}`);
+			const restored = await restoreEvent(event, paths);
+			if (!containsQuote(restored, reference.quote)) {
+				throw new Error(`Observation evidence quote was not found: ${reference.sessionId}:${reference.sequence}`);
+			}
+		}
+		verified.push({ ...reference });
+	}
+	return verified;
 }
 
 export async function validateDraftGrounding(paths: EvoPaths, draft: DraftProposal): Promise<EvidenceReference[]> {
@@ -255,7 +520,8 @@ export async function validateDraftGrounding(paths: EvoPaths, draft: DraftPropos
 		return event;
 	};
 
-	let hasExplicitUserEvidence = false;
+	let hasExplicitFeedbackEvidence = false;
+	let hasExplicitUserRequestEvidence = false;
 	const verified: EvidenceReference[] = [];
 	for (const reference of draft.evidence) {
 		const event = await findEvent(reference);
@@ -268,20 +534,39 @@ export async function validateDraftGrounding(paths: EvoPaths, draft: DraftPropos
 			}
 			quoteVerified = true;
 		}
-		hasExplicitUserEvidence ||=
-			event.type === "explicit_feedback" || (event.type === "message" && event.role === "user" && quoteVerified);
+		hasExplicitFeedbackEvidence ||= event.type === "explicit_feedback" && quoteVerified;
+		hasExplicitUserRequestEvidence ||= event.type === "message" && event.role === "user" && quoteVerified;
 		verified.push({ ...reference });
 	}
 
 	for (const scenario of draft.replayScenarios) await findEvent(scenario);
-	for (const fileName of draft.inboxReferences) await readInboxEntry(paths, fileName);
+	let hasExplicitInboxRequest = false;
+	for (const fileName of draft.inboxReferences) {
+		const entry = await readInboxEntry(paths, fileName);
+		hasExplicitInboxRequest ||= entry.text.trimStart().startsWith("REQUEST:");
+	}
 
 	if (draft.source === "pattern") {
-		const occurrences = new Set(verified.map((reference) => `${reference.sessionId}:${reference.sequence}`));
-		if (occurrences.size < 2)
-			throw new Error("Pattern proposals require at least two independent evidence references");
-	} else if (draft.inboxReferences.length === 0 && !hasExplicitUserEvidence) {
-		throw new Error("Explicit-request proposals require a valid inbox reference or explicit user evidence");
+		const unique = new Map(
+			verified.map((reference) => [`${reference.sessionId}:${reference.sequence}`, reference] as const),
+		);
+		const sessions = new Set([...unique.values()].map((reference) => reference.sessionId));
+		let independent = sessions.size >= 2;
+		if (!independent) {
+			const references = [...unique.values()].sort((left, right) => left.sequence - right.sequence);
+			independent = references.some((reference, index) => {
+				const next = references[index + 1];
+				return (
+					next !== undefined &&
+					reference.quote !== undefined &&
+					next.quote !== undefined &&
+					next.sequence - reference.sequence >= 2
+				);
+			});
+		}
+		if (!independent) throw new Error("Pattern proposals require at least two independent evidence references");
+	} else if (!hasExplicitInboxRequest && !hasExplicitFeedbackEvidence && !hasExplicitUserRequestEvidence) {
+		throw new Error("Explicit-request proposals require a REQUEST inbox entry or quoted user request");
 	}
 	return verified;
 }
@@ -304,6 +589,7 @@ export async function loadReplayScenario(paths: EvoPaths, scenario: ReplayScenar
 	}
 	const oldSystemPrompt = await resolveStoredPayload(paths, beforeStart.systemPrompt);
 	if (typeof oldSystemPrompt !== "string") throw new Error("Recorded system prompt must be a string");
+	const systemPromptOptions = await resolveStoredPayload(paths, beforeStart.systemPromptOptions);
 
 	const sessionStart = [...events]
 		.reverse()
@@ -324,6 +610,7 @@ export async function loadReplayScenario(paths: EvoPaths, scenario: ReplayScenar
 		history,
 		targetPrompt,
 		oldSystemPrompt,
+		systemPromptOptions,
 		sessionIdentity: scenario.sessionId,
 		cwd: sessionStart.cwd,
 	};

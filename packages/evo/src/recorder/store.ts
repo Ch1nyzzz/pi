@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { type FileHandle, open, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { type EvoPaths, ensureEvoLayout } from "../paths.ts";
-import { appendJsonLine, atomicWriteFile, atomicWriteJson, canonicalJson, sha256 } from "../storage.ts";
+import { appendJsonLine, atomicWriteFile, atomicWriteJson, canonicalJson, sha256, withFileLock } from "../storage.ts";
 import { RECORDER_SCHEMA_VERSION, type StoredPayload } from "../types.ts";
 import type { RecordedEvent, RecorderEvent, RecorderEventData, RecorderInboxEntry } from "./schema.ts";
 
@@ -47,6 +47,10 @@ function validateSessionId(sessionId: string): void {
 	if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(sessionId)) {
 		throw new Error(`Invalid recorder session id: ${sessionId}`);
 	}
+}
+
+function recorderLockName(sessionId: string): string {
+	return `recorder-${sha256(sessionId)}`;
 }
 
 function normalizeForStorage(value: unknown, ancestors: WeakSet<object> = new WeakSet<object>()): unknown {
@@ -167,7 +171,10 @@ export async function createRecorderStore(options: RecorderStoreOptions): Promis
 	const previewCharacters = Math.max(1, options.previewCharacters ?? DEFAULT_PREVIEW_CHARACTERS);
 	const now = options.now ?? (() => new Date());
 	const bundleDigest = options.bundleDigest ?? null;
-	let sequence = await readLastSequence(logPath);
+	const lockName = recorderLockName(options.sessionId);
+	await withFileLock(options.paths, lockName, async () => {
+		await readLastSequence(logPath);
+	});
 
 	async function storePayload(value: unknown): Promise<StoredPayload> {
 		const normalized = normalizeForStorage(value);
@@ -195,18 +202,19 @@ export async function createRecorderStore(options: RecorderStoreOptions): Promis
 	}
 
 	async function append(data: RecorderEventData): Promise<RecorderEvent> {
-		const nextSequence = sequence + 1;
-		const event = {
-			schemaVersion: RECORDER_SCHEMA_VERSION,
-			sessionId: options.sessionId,
-			sequence: nextSequence,
-			timestamp: now().toISOString(),
-			bundleDigest,
-			...data,
-		} as RecorderEvent;
-		await appendJsonLine(logPath, event);
-		sequence = nextSequence;
-		return event;
+		return withFileLock(options.paths, lockName, async () => {
+			const nextSequence = (await readLastSequence(logPath)) + 1;
+			const event = {
+				schemaVersion: RECORDER_SCHEMA_VERSION,
+				sessionId: options.sessionId,
+				sequence: nextSequence,
+				timestamp: now().toISOString(),
+				bundleDigest,
+				...data,
+			} as RecorderEvent;
+			await appendJsonLine(logPath, event);
+			return event;
+		});
 	}
 
 	async function writeInbox(text: string, source: RecorderInboxEntry["source"]): Promise<StoredInboxEntry> {
@@ -255,31 +263,35 @@ export async function resolveStoredPayload(paths: EvoPaths, payload: StoredPaylo
 
 export async function readSessionLog(paths: EvoPaths, sessionId: string): Promise<RecordedEvent[]> {
 	validateSessionId(sessionId);
-	let content: string;
-	try {
-		content = await readFile(join(paths.log, `${sessionId}.jsonl`), "utf8");
-	} catch (error) {
-		if (getErrorCode(error) === "ENOENT") return [];
-		throw error;
-	}
-
-	const events: RecordedEvent[] = [];
-	for (const [index, line] of content.split("\n").entries()) {
-		if (!line.trim()) continue;
-		const parsed = JSON.parse(line) as unknown;
-		if (
-			!isRecord(parsed) ||
-			parsed.schemaVersion !== RECORDER_SCHEMA_VERSION ||
-			typeof parsed.type !== "string" ||
-			typeof parsed.timestamp !== "string" ||
-			parsed.sessionId !== sessionId ||
-			typeof parsed.sequence !== "number" ||
-			!Number.isSafeInteger(parsed.sequence) ||
-			parsed.sequence !== events.length + 1
-		) {
-			throw new Error(`Invalid recorder event at ${sessionId}.jsonl:${index + 1}`);
+	return withFileLock(paths, recorderLockName(sessionId), async () => {
+		const logPath = join(paths.log, `${sessionId}.jsonl`);
+		await readLastSequence(logPath);
+		let content: string;
+		try {
+			content = await readFile(logPath, "utf8");
+		} catch (error) {
+			if (getErrorCode(error) === "ENOENT") return [];
+			throw error;
 		}
-		events.push(parsed as unknown as RecordedEvent);
-	}
-	return events;
+
+		const events: RecordedEvent[] = [];
+		for (const [index, line] of content.split("\n").entries()) {
+			if (!line.trim()) continue;
+			const parsed = JSON.parse(line) as unknown;
+			if (
+				!isRecord(parsed) ||
+				parsed.schemaVersion !== RECORDER_SCHEMA_VERSION ||
+				typeof parsed.type !== "string" ||
+				typeof parsed.timestamp !== "string" ||
+				parsed.sessionId !== sessionId ||
+				typeof parsed.sequence !== "number" ||
+				!Number.isSafeInteger(parsed.sequence) ||
+				parsed.sequence !== events.length + 1
+			) {
+				throw new Error(`Invalid recorder event at ${sessionId}.jsonl:${index + 1}`);
+			}
+			events.push(parsed as unknown as RecordedEvent);
+		}
+		return events;
+	});
 }

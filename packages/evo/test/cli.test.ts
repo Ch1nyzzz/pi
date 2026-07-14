@@ -4,18 +4,20 @@ import { join } from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
+	ExtensionContext,
 	ExtensionFactory,
 	RegisteredCommand,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import { compileBundle } from "../src/bundle/compile.ts";
-import { createEvoCommandExtension, runEvoCli } from "../src/cli.ts";
+import { createEvoCommandExtension, refreshEvoStatusIndicator, runEvoCli } from "../src/cli.ts";
 import { createEvoExtension } from "../src/extension.ts";
 import { getEvoPaths } from "../src/paths.ts";
 import { saveProposal, stageProposal } from "../src/proposal.ts";
 import type { RecordedEvent } from "../src/recorder/schema.ts";
-import { readSessionLog, resolveStoredPayload } from "../src/recorder/store.ts";
+import { createRecorderStore, readSessionLog, resolveStoredPayload } from "../src/recorder/store.ts";
 import type { ModelRunner } from "../src/reflect/model-runner.ts";
+import { readScheduleConfig, writeScheduleConfig } from "../src/scheduler.ts";
 import { EvoService } from "../src/service.ts";
 
 type EventHandler = (event: unknown, ctx: ExtensionCommandContext) => unknown;
@@ -25,6 +27,11 @@ interface SentMessage {
 	options: unknown;
 }
 
+interface ShortcutRegistration {
+	description?: string;
+	handler: (ctx: ExtensionContext) => Promise<void> | void;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
@@ -32,12 +39,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function createHarness(cwd: string) {
 	const commands = new Map<string, Omit<RegisteredCommand, "name" | "sourceInfo">>();
 	const handlers = new Map<string, EventHandler[]>();
+	const shortcuts = new Map<string, ShortcutRegistration>();
 	const entries: unknown[] = [];
 	const notifications: Array<{ message: string; type: string | undefined }> = [];
 	const statuses: Array<{ key: string; text: string | undefined }> = [];
 	const sentMessages: SentMessage[] = [];
+	const confirmations: Array<{ title: string; message: string }> = [];
 	let inputResponse: string | undefined;
 	let inputHandler: (() => Promise<string | undefined>) | undefined;
+	let selectResponse: string | undefined = "Approve";
 	let confirmResponse = false;
 	let sessionId = "session-cli";
 	let activeTools = ["read", "bash", "edit"];
@@ -51,6 +61,9 @@ function createHarness(cwd: string) {
 		registerCommand: (name: string, command: Omit<RegisteredCommand, "name" | "sourceInfo">) => {
 			commands.set(name, command);
 		},
+		registerShortcut: (shortcut: string, registration: ShortcutRegistration) => {
+			shortcuts.set(shortcut, registration);
+		},
 		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }),
 		sendMessage: (message: Record<string, unknown>, options: unknown) => sentMessages.push({ message, options }),
 		getActiveTools: () => [...activeTools],
@@ -62,6 +75,8 @@ function createHarness(cwd: string) {
 	const context = {
 		cwd,
 		hasUI: true,
+		mode: "tui",
+		isIdle: () => true,
 		waitForIdle: async () => {},
 		sessionManager: {
 			getSessionId: () => sessionId,
@@ -71,8 +86,12 @@ function createHarness(cwd: string) {
 		ui: {
 			notify: (message: string, type?: string) => notifications.push({ message, type }),
 			setStatus: (key: string, text: string | undefined) => statuses.push({ key, text }),
+			select: async () => selectResponse,
 			input: async () => (inputHandler ? inputHandler() : inputResponse),
-			confirm: async () => confirmResponse,
+			confirm: async (title: string, message: string) => {
+				confirmations.push({ title, message });
+				return confirmResponse;
+			},
 		},
 	} as unknown as ExtensionCommandContext;
 
@@ -80,11 +99,13 @@ function createHarness(cwd: string) {
 		api,
 		commands,
 		handlers,
+		shortcuts,
 		context,
 		entries,
 		notifications,
 		statuses,
 		sentMessages,
+		confirmations,
 		getActiveTools: () => [...activeTools],
 		setInputResponse: (value: string | undefined) => {
 			inputHandler = undefined;
@@ -95,6 +116,9 @@ function createHarness(cwd: string) {
 		},
 		setConfirmResponse: (value: boolean) => {
 			confirmResponse = value;
+		},
+		setSelectResponse: (value: string | undefined) => {
+			selectResponse = value;
 		},
 		setSessionId: (value: string) => {
 			sessionId = value;
@@ -159,16 +183,17 @@ describe("Evo CLI extension", () => {
 			parentDigest: seed.digest,
 			observationsMarkdown: "A requested code feature.",
 			draft: {
-				motivation: "Add a requested code feature",
-				expectedEffect: "The feature becomes available",
-				risk: "Code changes require human review",
-				verifyPlan: "Run focused tests",
-				trialPlan: "Merge manually only after review",
+				motivation: "Add a strictly reviewed preference",
+				expectedEffect: "The preference becomes available",
+				risk: "The preference could be over-applied",
+				verifyPlan: "Review the exact diff",
+				trialPlan: "Use for five sessions",
 				source: "explicit-request",
 				evidence: [],
 				inboxReferences: [],
 				replayScenarios: [],
-				codePatch: "diff --git a/example.ts b/example.ts",
+				suggestedTier: "T2",
+				changes: [{ path: "memory/strict.md", content: "Use strict review.\n" }],
 			},
 		});
 		harness.notifications.length = 0;
@@ -190,14 +215,62 @@ describe("Evo CLI extension", () => {
 			const changed = await fixture.service.getProposal(proposal.id);
 			changed.approvalDigest = "f".repeat(64);
 			await saveProposal(fixture.service.paths, changed);
-			return proposal.approvalDigest;
+			return proposal.diffDigest;
 		});
 		await command?.handler(`permit ${proposal.id}`, harness.context);
 		expect((await fixture.service.getProposal(proposal.id)).status).toBe("pending");
-		expect(harness.notifications.some((entry) => entry.message.includes("does not match the confirmed digest"))).toBe(
-			true,
-		);
+		expect(harness.notifications.some((entry) => entry.message.includes("confirmed final diff"))).toBe(true);
 		expect(fixture.getModelCalls()).toBe(0);
+	});
+
+	it("shows and applies a pending T0 proposal through the quick shortcut", async () => {
+		const fixture = await createFixture();
+		const seed = await fixture.service.init();
+		const store = await createRecorderStore({
+			paths: fixture.service.paths,
+			sessionId: "t0-shortcut",
+			bundleDigest: seed.digest,
+		});
+		const preference = "Keep T0 shortcut responses concise.";
+		const feedback = await store.append({
+			type: "explicit_feedback",
+			source: "interactive",
+			text: await store.storePayload(preference),
+			inboxFile: "t0-shortcut.json",
+		});
+		const proposal = await stageProposal({
+			paths: fixture.service.paths,
+			parentDigest: seed.digest,
+			observationsMarkdown: "The user explicitly requested a durable preference.",
+			draft: {
+				motivation: "Record the concise-response preference",
+				expectedEffect: "Responses remain concise",
+				risk: "The preference is applied too broadly",
+				verifyPlan: "Compare the memory entry with explicit feedback",
+				trialPlan: "No trial is required for verbatim direct recording",
+				source: "explicit-request",
+				evidence: [{ sessionId: feedback.sessionId, sequence: feedback.sequence, quote: preference }],
+				inboxReferences: [],
+				replayScenarios: [],
+				changes: [{ path: "memory/t0-shortcut.md", content: `${preference}\n` }],
+			},
+		});
+		expect(proposal.tier).toBe("T0");
+		if (!proposal.candidateDigest) throw new Error("T0 shortcut fixture has no candidate bundle");
+		const harness = createHarness(fixture.root);
+		await createEvoCommandExtension({ service: fixture.service, runner: fixture.runner })(harness.api);
+		await harness.emit("session_start", { type: "session_start", reason: "startup" });
+		const status = harness.statuses.at(-1)?.text;
+		expect(status).toContain("evo: T0 Record the concise-response preference");
+		expect(status).toContain(proposal.id);
+		const shortcut = harness.shortcuts.get("ctrl+alt+e");
+		expect(shortcut).toBeDefined();
+		await shortcut?.handler(harness.context);
+		expect((await fixture.service.status()).stableDigest).toBe(proposal.candidateDigest);
+		expect((await fixture.service.getProposal(proposal.id)).status).toBe("kept");
+		expect((await fixture.service.status()).trial).toBeUndefined();
+		expect(harness.notifications.at(-1)?.message).toContain(`Applied T0 proposal ${proposal.id}`);
+		expect(harness.statuses.at(-1)).toEqual({ key: "evo", text: undefined });
 	});
 
 	it("registers policy before recorder so recorder stores the final chained prompt", async () => {
@@ -378,7 +451,68 @@ describe("Evo CLI extension", () => {
 		expect(forkEvents.find((event) => event.type === "before_agent_start")?.bundleDigest).toBe(secondBundle.digest);
 	});
 
-	it("refuses local permit without an interactive terminal", async () => {
+	it("requires an interactive UI and live confirmation for extension control mutations", async () => {
+		const fixture = await createFixture();
+		const seed = await fixture.service.init();
+		const proposal = await stageProposal({
+			paths: fixture.service.paths,
+			parentDigest: seed.digest,
+			observationsMarkdown: "A pending candidate must not be reachable through headless rollback.",
+			draft: {
+				motivation: "Exercise extension control guards",
+				expectedEffect: "Headless commands cannot mutate decisions or pointers",
+				risk: "A subprocess could invoke a slash command",
+				verifyPlan: "Reject headless and declined commands",
+				trialPlan: "Do not activate",
+				source: "explicit-request",
+				evidence: [],
+				inboxReferences: [],
+				replayScenarios: [],
+				changes: [{ path: "memory/headless.md", content: "Require interactive control.\n" }],
+			},
+		});
+		if (!proposal.candidateDigest) throw new Error("Headless control fixture has no candidate bundle");
+		const harness = createHarness(fixture.root);
+		await createEvoCommandExtension({ service: fixture.service, runner: fixture.runner })(harness.api);
+		const command = harness.commands.get("evo");
+		expect(command).toBeDefined();
+		const mutations = [
+			`reject ${proposal.id} headless rejection`,
+			`rollback ${proposal.candidateDigest} headless rollback`,
+			"pause headless pause",
+			"resume headless resume",
+		];
+		const headlessContext = { ...harness.context, hasUI: false } as ExtensionCommandContext;
+
+		for (const mutation of mutations) {
+			harness.notifications.length = 0;
+			await command?.handler(mutation, headlessContext);
+			expect(harness.notifications.some((entry) => entry.message.includes("interactive UI"))).toBe(true);
+		}
+		expect(harness.confirmations).toHaveLength(0);
+		expect((await fixture.service.getProposal(proposal.id)).status).toBe("pending");
+		expect((await fixture.service.status()).stableDigest).toBe(seed.digest);
+		expect((await fixture.service.status()).paused).toBe(false);
+
+		for (const mutation of mutations) await command?.handler(mutation, harness.context);
+		expect(harness.confirmations.map((confirmation) => confirmation.title)).toEqual([
+			`Reject ${proposal.id}`,
+			"Roll back Evo-Pi",
+			"Pause Evo-Pi",
+			"Resume Evo-Pi",
+		]);
+		expect((await fixture.service.getProposal(proposal.id)).status).toBe("pending");
+		expect((await fixture.service.status()).stableDigest).toBe(seed.digest);
+		expect((await fixture.service.status()).paused).toBe(false);
+		const history = (await readFile(fixture.service.paths.history, "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => (JSON.parse(line) as { action: string }).action);
+		expect(history).toEqual(["initialize"]);
+		expect(fixture.getModelCalls()).toBe(0);
+	});
+
+	it("refuses every local control mutation without an interactive terminal", async () => {
 		const fixture = await createFixture();
 		const seed = await fixture.service.init();
 		const proposal = await stageProposal({
@@ -386,16 +520,17 @@ describe("Evo CLI extension", () => {
 			parentDigest: seed.digest,
 			observationsMarkdown: "A requested code feature.",
 			draft: {
-				motivation: "Add another requested code feature",
-				expectedEffect: "The feature becomes available",
-				risk: "Code changes require human review",
-				verifyPlan: "Run focused tests",
-				trialPlan: "Merge manually only after review",
+				motivation: "Add another strictly reviewed preference",
+				expectedEffect: "The preference becomes available",
+				risk: "The preference could be over-applied",
+				verifyPlan: "Review the exact diff",
+				trialPlan: "Use for five sessions",
 				source: "explicit-request",
 				evidence: [],
 				inboxReferences: [],
 				replayScenarios: [],
-				codePatch: "diff --git a/other.ts b/other.ts",
+				suggestedTier: "T2",
+				changes: [{ path: "memory/local-strict.md", content: "Use strict review locally.\n" }],
 			},
 		});
 		await expect(
@@ -410,7 +545,240 @@ describe("Evo CLI extension", () => {
 				},
 			}),
 		).rejects.toThrow("interactive terminal");
+		const nonInteractiveIo = {
+			interactive: false,
+			write: () => {},
+			writeError: () => {},
+			question: async () => "",
+		};
+		for (const commandArgs of [
+			["reject", proposal.id, "not approved"],
+			["rollback"],
+			["keep"],
+			["pause"],
+			["resume"],
+		]) {
+			await expect(
+				runEvoCli(commandArgs, {
+					service: fixture.service,
+					runner: fixture.runner,
+					io: nonInteractiveIo,
+				}),
+			).rejects.toThrow("interactive terminal");
+		}
 		expect((await fixture.service.getProposal(proposal.id)).status).toBe("pending");
 		expect(fixture.getModelCalls()).toBe(0);
+	});
+
+	it("requires live confirmation before direct local state changes", async () => {
+		const fixture = await createFixture();
+		const seed = await fixture.service.init();
+		const proposal = await stageProposal({
+			paths: fixture.service.paths,
+			parentDigest: seed.digest,
+			observationsMarkdown: "A preference awaiting review.",
+			draft: {
+				motivation: "Stage a confirmation fixture",
+				expectedEffect: "Exercise local control guards",
+				risk: "None while pending",
+				verifyPlan: "Decline each confirmation",
+				trialPlan: "Do not activate",
+				source: "explicit-request",
+				evidence: [],
+				inboxReferences: [],
+				replayScenarios: [],
+				changes: [{ path: "memory/confirm.md", content: "Confirm control changes.\n" }],
+			},
+		});
+		const prompts: string[] = [];
+		const output: string[] = [];
+		const io = {
+			interactive: true,
+			write: (message: string) => output.push(message),
+			writeError: () => {},
+			question: async (prompt: string) => {
+				prompts.push(prompt);
+				return "no";
+			},
+		};
+
+		await runEvoCli(["reject", proposal.id, "declined"], {
+			service: fixture.service,
+			runner: fixture.runner,
+			io,
+		});
+		await runEvoCli(["rollback"], { service: fixture.service, runner: fixture.runner, io });
+		await runEvoCli(["pause"], { service: fixture.service, runner: fixture.runner, io });
+		expect((await fixture.service.getProposal(proposal.id)).status).toBe("pending");
+		expect((await fixture.service.status()).paused).toBe(false);
+
+		await fixture.service.pause("Test resume confirmation");
+		await runEvoCli(["resume"], { service: fixture.service, runner: fixture.runner, io });
+		expect((await fixture.service.status()).paused).toBe(true);
+		expect(prompts).toEqual([
+			`Reject proposal ${proposal.id}? [y/N] `,
+			"Roll back the active trial or stable bundle? [y/N] ",
+			"Pause Evo-Pi reflection work? [y/N] ",
+			"Resume Evo-Pi reflection work? [y/N] ",
+		]);
+		expect(output).toEqual(["Rejection cancelled", "Rollback cancelled", "Pause cancelled", "Resume cancelled"]);
+		expect(fixture.getModelCalls()).toBe(0);
+	});
+
+	it("treats every code proposal as a strict exact-digest permit", async () => {
+		const fixture = await createFixture();
+		const seed = await fixture.service.init();
+		const proposal = await stageProposal({
+			paths: fixture.service.paths,
+			parentDigest: seed.digest,
+			observationsMarkdown: "A deliberately misclassified code proposal.",
+			draft: {
+				motivation: "Exercise code permit classification",
+				expectedEffect: "Code approval remains strict",
+				risk: "Persistent tier metadata is untrusted",
+				verifyPlan: "Require the code context digest",
+				trialPlan: "Do not activate",
+				source: "explicit-request",
+				evidence: [],
+				inboxReferences: [],
+				replayScenarios: [],
+				changes: [{ path: "memory/code-tier.md", content: "Strict code approval.\n" }],
+			},
+		});
+		proposal.kind = "code";
+		proposal.tier = "T0";
+		proposal.approvalDigest = "a".repeat(64);
+		await saveProposal(fixture.service.paths, proposal);
+
+		const prompts: string[] = [];
+		const responses = ["approve", proposal.diffDigest];
+		await expect(
+			runEvoCli(["permit", proposal.id], {
+				service: fixture.service,
+				runner: fixture.runner,
+				io: {
+					interactive: true,
+					write: () => {},
+					writeError: () => {},
+					question: async (prompt: string) => {
+						prompts.push(prompt);
+						return responses.shift() ?? "";
+					},
+				},
+			}),
+		).rejects.toThrow("Approval digest did not match");
+		expect(prompts[0]).toContain("[v] revise");
+		expect(prompts[1]).toContain(`code approval context digest ${proposal.approvalDigest}`);
+		expect((await fixture.service.getProposal(proposal.id)).status).toBe("pending");
+
+		const harness = createHarness(fixture.root);
+		await createEvoCommandExtension({ service: fixture.service, runner: fixture.runner })(harness.api);
+		harness.setSelectResponse("Approve");
+		harness.setInputResponse(proposal.diffDigest);
+		await harness.commands.get("evo")?.handler(`permit ${proposal.id}`, harness.context);
+		expect(harness.notifications.some((entry) => entry.message.includes("did not match"))).toBe(true);
+		expect((await fixture.service.getProposal(proposal.id)).status).toBe("pending");
+	});
+
+	it("shows and updates the reflection schedule from the extension command", async () => {
+		const fixture = await createFixture();
+		await fixture.service.init();
+		const harness = createHarness(fixture.root);
+		await createEvoCommandExtension({ service: fixture.service, runner: fixture.runner })(harness.api);
+		const command = harness.commands.get("evo");
+
+		await command?.handler("schedule every 7d", harness.context);
+		expect(harness.notifications.at(-1)?.message).toContain("reflect once every 7 days");
+		expect(await readScheduleConfig(fixture.service.paths)).toMatchObject({ mode: "auto", everyDays: 7 });
+
+		harness.setSelectResponse("Manual only");
+		await command?.handler("schedule", harness.context);
+		expect(harness.notifications.at(-1)?.message).toContain("manual");
+		expect(await readScheduleConfig(fixture.service.paths)).toMatchObject({ mode: "manual" });
+
+		harness.setSelectResponse("Keep current");
+		await command?.handler("schedule", harness.context);
+		expect(harness.notifications.at(-1)?.message).toContain("cadence: manual");
+		expect(await readScheduleConfig(fixture.service.paths)).toMatchObject({ mode: "manual" });
+
+		harness.notifications.length = 0;
+		await command?.handler("schedule sometimes", harness.context);
+		expect(harness.notifications.some((entry) => entry.type === "error" && entry.message.includes("Usage:"))).toBe(
+			true,
+		);
+		expect(fixture.getModelCalls()).toBe(0);
+	});
+
+	it("shows and updates the reflection schedule from the local CLI", async () => {
+		const fixture = await createFixture();
+		const output: string[] = [];
+		const io = {
+			interactive: false,
+			write: (message: string) => output.push(message),
+			writeError: () => {},
+			question: async () => "",
+		};
+
+		await runEvoCli(["schedule"], { service: fixture.service, runner: fixture.runner, io });
+		expect(output.at(-1)).toContain("cadence: auto (reflect once every 3 days)");
+		expect(output.at(-1)).toContain("last background run: never");
+
+		await runEvoCli(["schedule", "manual"], { service: fixture.service, runner: fixture.runner, io });
+		expect(output.at(-1)).toContain("manual");
+		expect(await readScheduleConfig(fixture.service.paths)).toMatchObject({ mode: "manual" });
+
+		await runEvoCli(["schedule", "every", "2d"], { service: fixture.service, runner: fixture.runner, io });
+		expect(await readScheduleConfig(fixture.service.paths)).toMatchObject({ mode: "auto", everyDays: 2 });
+		expect(fixture.getModelCalls()).toBe(0);
+	});
+
+	it("skips a manual-mode scheduled improve without calling the model", async () => {
+		const fixture = await createFixture();
+		await fixture.service.init();
+		await writeScheduleConfig(fixture.service.paths, { mode: "manual" });
+		const output: string[] = [];
+		await runEvoCli(["scheduled-improve"], {
+			service: fixture.service,
+			runner: fixture.runner,
+			io: {
+				interactive: false,
+				write: (message) => output.push(message),
+				writeError: () => {},
+				question: async () => "",
+			},
+		});
+		expect(output.at(-1)).toBe("Scheduled improve skipped: manual-mode");
+		expect(fixture.getModelCalls()).toBe(0);
+	});
+
+	it("surfaces an overdue trial in the status indicator", async () => {
+		const fixture = await createFixture();
+		const seed = await fixture.service.init();
+		const source = await mkdtemp(join(fixture.root, "trial-due-"));
+		await writeFile(join(source, "policy.json"), await readFile(join(seed.directory, "policy.json")));
+		const trialBundle = await compileBundle({
+			paths: fixture.service.paths,
+			sourceDirectory: source,
+			parentDigest: seed.digest,
+			summary: "Trial bundle for due reminder",
+		});
+		await fixture.service.registry.activateTrial({
+			digest: trialBundle.digest,
+			proposalId: "p-trial-due",
+			plan: "Watch for a week",
+		});
+		const harness = createHarness(fixture.root);
+		const dependencies = { service: fixture.service, paths: fixture.service.paths };
+
+		await refreshEvoStatusIndicator(dependencies, harness.context);
+		expect(harness.statuses.at(-1)).toEqual({ key: "evo", text: undefined });
+
+		const eightDaysLater = () => new Date(Date.now() + 8 * 24 * 60 * 60 * 1000);
+		await refreshEvoStatusIndicator(dependencies, harness.context, eightDaysLater);
+		expect(harness.statuses.at(-1)?.text).toBe("evo: trial p-trial-due due [/evo keep or /evo rollback]");
+
+		await writeScheduleConfig(fixture.service.paths, { trialDueAfterDays: 30 });
+		await refreshEvoStatusIndicator(dependencies, harness.context, eightDaysLater);
+		expect(harness.statuses.at(-1)).toEqual({ key: "evo", text: undefined });
 	});
 });

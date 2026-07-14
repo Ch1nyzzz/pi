@@ -1,11 +1,21 @@
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { createEvoAutoImproveExtension } from "./auto-improve.ts";
+import { createEvoCodeFeatureExtension, type EvoCodeFeatureDefinition } from "./bundle/code-feature.ts";
 import { createPolicyRuntimeExtension } from "./bundle/runtime.ts";
 import { createEvoCommandExtension, type EvoCommandExtensionOptions } from "./cli.ts";
 import { getEvoPaths } from "./paths.ts";
 import { createRecorderExtension } from "./recorder/extension.ts";
 import { EvoService } from "./service.ts";
 
-export type EvoExtensionOptions = EvoCommandExtensionOptions;
+export interface EvoAutoImproveTuning {
+	initialDelayMs?: number;
+	checkIntervalMs?: number;
+}
+
+export type EvoExtensionOptions = EvoCommandExtensionOptions & {
+	codeFeatures?: readonly EvoCodeFeatureDefinition[];
+	autoImprove?: EvoAutoImproveTuning | false;
+};
 
 export function createEvoExtension(options: EvoExtensionOptions = {}): ExtensionFactory {
 	const paths = options.service?.paths ?? options.paths ?? getEvoPaths(options.root);
@@ -13,13 +23,21 @@ export function createEvoExtension(options: EvoExtensionOptions = {}): Extension
 	const policyRuntime = createPolicyRuntimeExtension({ root: paths.root });
 	const recorder = createRecorderExtension({ paths });
 	const commands = createEvoCommandExtension({ ...options, paths, service });
+	const autoImprove =
+		options.autoImprove === false
+			? undefined
+			: createEvoAutoImproveExtension({ ...options, paths, service, ...options.autoImprove });
 
 	return async (pi) => {
 		// ExtensionRunner chains before_agent_start results in registration order.
 		// Policy therefore mutates the effective prompt before Recorder observes it.
 		await policyRuntime(pi);
+		for (const feature of options.codeFeatures ?? []) {
+			await createEvoCodeFeatureExtension(feature, { root: paths.root })(pi);
+		}
 		await recorder(pi);
 		await commands(pi);
+		if (autoImprove) await autoImprove(pi);
 	};
 }
 

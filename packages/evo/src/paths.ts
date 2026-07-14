@@ -1,5 +1,5 @@
-import { mkdir } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { chmod, mkdir } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export interface EvoPaths {
@@ -11,8 +11,11 @@ export interface EvoPaths {
 	registry: string;
 	stable: string;
 	trial: string;
+	transition: string;
+	receipts: string;
 	history: string;
 	paused: string;
+	intents: string;
 	proposals: string;
 	reports: string;
 	worktrees: string;
@@ -35,8 +38,11 @@ export function getEvoPaths(root: string = resolveEvoRoot()): EvoPaths {
 		registry,
 		stable: join(registry, "stable"),
 		trial: join(registry, "trial.json"),
+		transition: join(registry, "transition.json"),
+		receipts: join(registry, "receipts.jsonl"),
 		history: join(registry, "history.jsonl"),
 		paused: join(registry, "paused"),
+		intents: join(registry, "intents"),
 		proposals: join(resolvedRoot, "proposals"),
 		reports: join(resolvedRoot, "reports"),
 		worktrees: join(resolvedRoot, "worktrees"),
@@ -45,17 +51,24 @@ export function getEvoPaths(root: string = resolveEvoRoot()): EvoPaths {
 }
 
 export async function ensureEvoLayout(paths: EvoPaths): Promise<void> {
+	const directories = [
+		paths.root,
+		dirname(paths.artifacts),
+		paths.artifacts,
+		paths.log,
+		paths.inbox,
+		paths.bundles,
+		paths.registry,
+		paths.intents,
+		paths.proposals,
+		paths.reports,
+		paths.worktrees,
+		paths.locks,
+	];
 	await Promise.all(
-		[
-			paths.log,
-			paths.artifacts,
-			paths.inbox,
-			paths.bundles,
-			paths.registry,
-			paths.proposals,
-			paths.reports,
-			paths.worktrees,
-			paths.locks,
-		].map((directory) => mkdir(directory, { recursive: true })),
+		[...new Set(directories)].map(async (directory) => {
+			await mkdir(directory, { recursive: true, mode: 0o700 });
+			await chmod(directory, 0o700);
+		}),
 	);
 }

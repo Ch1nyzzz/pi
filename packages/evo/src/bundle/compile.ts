@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { type EvoPaths, ensureEvoLayout } from "../paths.ts";
 import { canonicalJson, sha256 } from "../storage.ts";
@@ -9,6 +9,43 @@ import { assertAssetPath, isDigest, parseBundleManifest, parseBundlePolicy } fro
 const DEFAULT_PROMPT_BYTES = 64 * 1024;
 const DEFAULT_SKILL_BYTES = 15 * 1024;
 const DEFAULT_TOTAL_BYTES = 1024 * 1024;
+
+async function syncFilesystemPath(path: string, directory: boolean): Promise<void> {
+	let handle: Awaited<ReturnType<typeof open>> | undefined;
+	try {
+		handle = await open(path, "r");
+		await handle.sync();
+	} catch (error) {
+		if (!directory || process.platform !== "win32") throw error;
+	} finally {
+		await handle?.close();
+	}
+}
+
+async function syncBundleDirectories(directory: string): Promise<void> {
+	for (const entry of await readdir(directory, { withFileTypes: true })) {
+		const path = join(directory, entry.name);
+		if (entry.isDirectory()) {
+			await syncBundleDirectories(path);
+			continue;
+		}
+		if (!entry.isFile()) {
+			throw new Error(`Bundle staging contains a non-regular entry: ${entry.name}`);
+		}
+	}
+	await syncFilesystemPath(directory, true);
+}
+
+async function writeDurableBundleFile(path: string, content: string | Uint8Array): Promise<void> {
+	const handle = await open(path, "wx", 0o600);
+	try {
+		await handle.writeFile(content);
+		await handle.chmod(0o444);
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+}
 
 function normalizeRelativePath(path: string): string {
 	return path.split(sep).join("/");
@@ -39,17 +76,21 @@ function sortManifestFiles(files: BundleFileEntry[]): BundleFileEntry[] {
 	});
 }
 
-function validatePolicyAssetReferences(policy: BundlePolicy, paths: Set<string>): void {
+function validatePolicyAssetReferences(policy: BundlePolicy, files: Map<string, string>): void {
 	for (const path of policy.promptOrder ?? []) {
-		if (!path.startsWith("prompts/") || !paths.has(path))
+		if (!path.startsWith("prompts/") || !files.has(path))
 			throw new Error(`policy.promptOrder references missing prompt: ${path}`);
 	}
 	for (const path of [...(policy.stablePromptPaths ?? []), ...(policy.dynamicPromptPaths ?? [])]) {
-		if (!path.startsWith("prompts/") || !paths.has(path))
+		if (!path.startsWith("prompts/") || !files.has(path))
 			throw new Error(`Prompt layout references missing prompt: ${path}`);
 	}
 	for (const path of policy.coreAssets ?? []) {
-		if (!paths.has(path)) throw new Error(`policy.coreAssets references missing asset: ${path}`);
+		if (!files.has(path)) throw new Error(`policy.coreAssets references missing asset: ${path}`);
+	}
+	for (const source of policy.managedSources ?? []) {
+		if (!files.has(source.targetPath))
+			throw new Error(`policy.managedSources references missing asset: ${source.targetPath}`);
 	}
 }
 
@@ -77,12 +118,10 @@ async function writeBundleDirectory(
 	for (const file of manifest.files) {
 		const target = join(temporaryDirectory, file.path);
 		await mkdir(dirname(target), { recursive: true });
-		await writeFile(target, await readFile(join(sourceDirectory, file.path)), { mode: 0o444 });
-		await chmod(target, 0o444);
+		await writeDurableBundleFile(target, await readFile(join(sourceDirectory, file.path)));
 	}
 	const manifestPath = join(temporaryDirectory, "bundle.json");
-	await writeFile(manifestPath, `${JSON.stringify(manifest, undefined, "\t")}\n`, { mode: 0o444 });
-	await chmod(manifestPath, 0o444);
+	await writeDurableBundleFile(manifestPath, `${JSON.stringify(manifest, undefined, "\t")}\n`);
 }
 
 export async function loadCompiledBundle(paths: EvoPaths, digest: string): Promise<CompiledBundle> {
@@ -107,7 +146,7 @@ export async function loadCompiledBundle(paths: EvoPaths, digest: string): Promi
 		}
 	}
 	const policy = parseBundlePolicy(JSON.parse(await readFile(join(directory, "policy.json"), "utf8")));
-	validatePolicyAssetReferences(policy, new Set(actualPaths));
+	validatePolicyAssetReferences(policy, new Map(manifest.files.map((file) => [file.path, file.sha256])));
 	validateSizes(manifest.files, policy);
 	return { digest, directory, manifest, policy };
 }
@@ -137,7 +176,7 @@ export async function compileBundle(options: {
 		),
 	);
 	const policy = parseBundlePolicy(JSON.parse(await readFile(join(sourceDirectory, "policy.json"), "utf8")));
-	validatePolicyAssetReferences(policy, new Set(dataPaths));
+	validatePolicyAssetReferences(policy, new Map(files.map((file) => [file.path, file.sha256])));
 	validateSizes(files, policy);
 	const manifest: BundleManifest = {
 		schemaVersion: 1,
@@ -155,6 +194,7 @@ export async function compileBundle(options: {
 	const temporaryDirectory = join(options.paths.bundles, `.tmp-${process.pid}-${randomUUID()}`);
 	try {
 		await writeBundleDirectory(sourceDirectory, temporaryDirectory, manifest);
+		await syncBundleDirectories(temporaryDirectory);
 		try {
 			await rename(temporaryDirectory, destination);
 		} catch (error) {
@@ -168,6 +208,7 @@ export async function compileBundle(options: {
 			}
 			await rm(temporaryDirectory, { recursive: true, force: true });
 		}
+		await syncFilesystemPath(options.paths.bundles, true);
 		return await loadCompiledBundle(options.paths, digest);
 	} catch (error) {
 		await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {});

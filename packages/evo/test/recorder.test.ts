@@ -70,6 +70,54 @@ describe("recorder", () => {
 		expect(recoveredLog.endsWith("\n")).toBe(true);
 		expect(recoveredLog.trimEnd().split("\n")).toHaveLength(2);
 	});
+	it("repairs a torn tail before appending through an already-open store", async () => {
+		const paths = getEvoPaths(await createRoot());
+		const store = await createRecorderStore({ paths, sessionId: "session-active-recovery" });
+		await store.append({ type: "message", role: "user", message: await store.storePayload("first") });
+		await appendFile(store.logPath, '{"schemaVersion":1,"sessionId":"session-active-recovery","sequence":2');
+
+		const event = await store.append({
+			type: "message",
+			role: "assistant",
+			message: await store.storePayload("second"),
+		});
+
+		expect(event.sequence).toBe(2);
+		expect((await readSessionLog(paths, "session-active-recovery")).map((item) => item.sequence)).toEqual([1, 2]);
+	});
+
+	it("repairs a torn tail before a corpus read", async () => {
+		const paths = getEvoPaths(await createRoot());
+		const store = await createRecorderStore({ paths, sessionId: "session-read-recovery" });
+		await store.append({ type: "message", role: "user", message: await store.storePayload("first") });
+		await appendFile(store.logPath, '{"schemaVersion":1,"sessionId":"session-read-recovery","sequence":2');
+
+		expect((await readSessionLog(paths, "session-read-recovery")).map((item) => item.sequence)).toEqual([1]);
+		expect((await readFile(store.logPath, "utf8")).endsWith("\n")).toBe(true);
+	});
+
+	it("serializes concurrent appends from independent stores", async () => {
+		const paths = getEvoPaths(await createRoot());
+		const first = await createRecorderStore({ paths, sessionId: "session-concurrent" });
+		const second = await createRecorderStore({ paths, sessionId: "session-concurrent" });
+		const events = await Promise.all(
+			Array.from({ length: 12 }, async (_, index) => {
+				const store = index % 2 === 0 ? first : second;
+				return store.append({
+					type: "message",
+					role: "user",
+					message: await store.storePayload(`message-${index}`),
+				});
+			}),
+		);
+
+		expect(events.map((event) => event.sequence).sort((left, right) => left - right)).toEqual(
+			Array.from({ length: 12 }, (_, index) => index + 1),
+		);
+		expect((await readSessionLog(paths, "session-concurrent")).map((event) => event.sequence)).toEqual(
+			Array.from({ length: 12 }, (_, index) => index + 1),
+		);
+	});
 
 	it("preserves a complete trailing event by restoring its newline", async () => {
 		const paths = getEvoPaths(await createRoot());
@@ -119,7 +167,7 @@ describe("recorder", () => {
 		await writeFile(store.logPath, corrupted);
 
 		await expect(readSessionLog(paths, "session-corrupt-sequence")).rejects.toThrow(
-			"Invalid recorder event at session-corrupt-sequence.jsonl:2",
+			`Invalid recorder sequence at ${store.logPath}:2`,
 		);
 		await expect(createRecorderStore({ paths, sessionId: "session-corrupt-sequence" })).rejects.toThrow(
 			`Invalid recorder sequence at ${store.logPath}:2`,
@@ -132,7 +180,9 @@ describe("recorder", () => {
 		const message = await store.storePayload("retry me");
 		await rm(paths.log, { recursive: true, force: true });
 
+		await writeFile(paths.log, "blocked");
 		await expect(store.append({ type: "message", role: "user", message })).rejects.toThrow();
+		await rm(paths.log);
 		await mkdir(paths.log, { recursive: true });
 		const event = await store.append({ type: "message", role: "user", message });
 

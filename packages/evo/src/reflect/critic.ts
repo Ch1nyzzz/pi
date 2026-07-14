@@ -1,13 +1,12 @@
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { EvoPaths } from "../paths.ts";
-import { saveProposal } from "../proposal.ts";
-import { atomicWriteFile } from "../storage.ts";
+import { attachProposalArtifact, proposalApproval } from "../proposal.ts";
 import type { Proposal } from "../types.ts";
 import type { EvidenceCorpus } from "./evidence.ts";
 import type { ModelRunner, ModelRunResult } from "./model-runner.ts";
 import type { CounterfactualReplayResult } from "./replay.ts";
+import { recordModelUsage } from "./usage.ts";
 
 const CRITIC_PROMPT_URL = new URL("../prompts/critic.md", import.meta.url);
 
@@ -21,6 +20,7 @@ export interface RunCriticOptions {
 	agentDir?: string;
 	model?: string;
 	thinkingLevel?: ThinkingLevel;
+	signal?: AbortSignal;
 }
 
 export interface CriticReviewResult {
@@ -32,6 +32,12 @@ export interface CriticReviewResult {
 export async function runCritic(options: RunCriticOptions): Promise<CriticReviewResult> {
 	const prompt = [
 		"Review this proposal against the supplied primary evidence.",
+		...(options.replay?.mode === "code-patch-hypothesis"
+			? [
+					"",
+					"The code replay candidate is a hypothetical model prediction conditioned on the patch. No candidate code, runtime, or tool was loaded or executed; do not report it as observed patched-agent behavior.",
+				]
+			: []),
 		"",
 		"<proposal>",
 		JSON.stringify(options.proposal, undefined, "\t"),
@@ -49,10 +55,17 @@ export async function runCritic(options: RunCriticOptions): Promise<CriticReview
 		prompt,
 		...(options.model ? { model: options.model } : {}),
 		thinkingLevel: options.thinkingLevel ?? "low",
+		...(options.signal ? { signal: options.signal } : {}),
 	});
+	await recordModelUsage(options.paths, "critic", run);
 	const reviewMarkdown = `${run.text.trim()}\n`;
-	await atomicWriteFile(join(options.paths.proposals, options.proposal.id, "review.md"), reviewMarkdown);
-	options.proposal.reviewFile = "review.md";
-	await saveProposal(options.paths, options.proposal);
-	return { proposal: options.proposal, reviewMarkdown, run };
+	const proposal = await attachProposalArtifact({
+		paths: options.paths,
+		proposalId: options.proposal.id,
+		expected: proposalApproval(options.proposal),
+		kind: "review",
+		content: reviewMarkdown,
+		allowedStatuses: ["pending", "deferred"],
+	});
+	return { proposal, reviewMarkdown, run };
 }

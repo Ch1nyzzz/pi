@@ -1,20 +1,67 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { ExtensionFactory, SessionStartEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, ExtensionFactory, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { getEvoPaths } from "../paths.ts";
 import { BundleRegistry } from "../registry/registry.ts";
 import type { CompiledBundle } from "../types.ts";
+import { filterEvoCodeFeatureTools } from "./code-feature.ts";
 import { loadCompiledBundle } from "./compile.ts";
+import { activateEvoFeatureSession } from "./feature-gate.ts";
+import {
+	type ManagedRuntimeResources,
+	prepareManagedRuntimeResources,
+	replaceManagedHostResources,
+	verifyManagedSourceSnapshots,
+} from "./managed-sources.ts";
 import { isDigest } from "./schema.ts";
+
+export { createEvoFeatureHandler, guardEvoFeature, isEvoFeatureEnabled } from "./feature-gate.ts";
 
 const BUNDLE_BEGIN = "<!-- evo-pi bundle begin -->";
 const BUNDLE_END = "<!-- evo-pi bundle end -->";
 
+export type RuntimeBundleSectionPlacement = "stable" | "regular" | "memory" | "dynamic";
+
+export interface RuntimeBundleSection {
+	path: string;
+	content: string;
+	placement: RuntimeBundleSectionPlacement;
+}
+
 export interface RuntimeBundle {
 	bundle: CompiledBundle;
 	systemPromptAppend: string;
+	sections: readonly RuntimeBundleSection[];
+	managedResources: ManagedRuntimeResources;
 	skillDirectory?: string;
 	enabledTools?: string[];
+}
+
+function renderRuntimeBundleSections(
+	bundle: CompiledBundle,
+	sections: readonly RuntimeBundleSection[],
+	excludedPaths: ReadonlySet<string>,
+): string {
+	const content = (placement: RuntimeBundleSectionPlacement): string[] =>
+		sections
+			.filter((section) => section.placement === placement && !excludedPaths.has(section.path))
+			.map((section) => section.content);
+	return [
+		BUNDLE_BEGIN,
+		...content("stable"),
+		`Bundle: ${bundle.digest}`,
+		...content("regular"),
+		...content("memory"),
+		...content("dynamic"),
+		BUNDLE_END,
+	].join("\n\n");
+}
+
+export function renderRuntimeBundlePrompt(
+	runtime: RuntimeBundle,
+	excludedPaths: ReadonlySet<string> = new Set(),
+): string {
+	return renderRuntimeBundleSections(runtime.bundle, runtime.sections, excludedPaths);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -68,35 +115,35 @@ export async function renderRuntimeBundle(bundle: CompiledBundle): Promise<Runti
 	];
 	const stablePaths = new Set(bundle.policy.stablePromptPaths ?? []);
 	const dynamicPaths = new Set(bundle.policy.dynamicPromptPaths ?? []);
-	const stableSections: string[] = [];
-	const regularSections: string[] = [];
-	const dynamicSections: string[] = [];
+	const sections: RuntimeBundleSection[] = [];
 	for (const path of orderedPaths) {
-		const section = (await readFile(join(bundle.directory, path), "utf8")).trim();
-		if (!section) continue;
-		if (stablePaths.has(path)) stableSections.push(section);
-		else if (dynamicPaths.has(path)) dynamicSections.push(section);
-		else regularSections.push(section);
+		const content = (await readFile(join(bundle.directory, path), "utf8")).trim();
+		if (!content) continue;
+		const placement: RuntimeBundleSectionPlacement = stablePaths.has(path)
+			? "stable"
+			: dynamicPaths.has(path)
+				? "dynamic"
+				: "regular";
+		sections.push({ path, content, placement });
 	}
-	const memorySections: string[] = [];
 	for (const file of await listMarkdown(join(bundle.directory, "memory"))) {
 		const content = (await readFile(join(bundle.directory, "memory", file), "utf8")).trim();
-		if (content) memorySections.push(`## Remembered user context\n\n${content}`);
+		if (!content) continue;
+		sections.push({
+			path: `memory/${file}`,
+			content: `## Remembered user context\n\n${content}`,
+			placement: "memory",
+		});
 	}
+	const skillDirectory = bundle.manifest.files.some((file) => file.path.startsWith("skills/"))
+		? join(bundle.directory, "skills")
+		: undefined;
 	return {
 		bundle,
-		systemPromptAppend: [
-			BUNDLE_BEGIN,
-			...stableSections,
-			`Bundle: ${bundle.digest}`,
-			...regularSections,
-			...memorySections,
-			...dynamicSections,
-			BUNDLE_END,
-		].join("\n\n"),
-		skillDirectory: bundle.manifest.files.some((file) => file.path.startsWith("skills/"))
-			? join(bundle.directory, "skills")
-			: undefined,
+		systemPromptAppend: renderRuntimeBundleSections(bundle, sections, new Set()),
+		sections,
+		managedResources: await prepareManagedRuntimeResources(bundle),
+		skillDirectory,
 		enabledTools: bundle.policy.enabledTools,
 	};
 }
@@ -108,12 +155,36 @@ export function replaceRuntimeBundlePrompt(systemPrompt: string, replacement: st
 	return `${systemPrompt.slice(0, start)}${replacement}${systemPrompt.slice(end + BUNDLE_END.length)}`;
 }
 
+function resolveWorkerModel(ctx: ExtensionContext, route: string): NonNullable<ExtensionContext["model"]> {
+	const separator = route.indexOf("/");
+	if (separator !== -1) {
+		const provider = route.slice(0, separator);
+		const modelId = route.slice(separator + 1);
+		const model = ctx.modelRegistry.find(provider, modelId);
+		if (!model) throw new Error(`Evo-Pi worker model does not exist: ${route}`);
+		return model;
+	}
+	const matches = ctx.modelRegistry.getAll().filter((model) => model.id === route);
+	if (matches.length === 0) throw new Error(`Evo-Pi worker model does not exist: ${route}`);
+	if (matches.length > 1) {
+		throw new Error(`Evo-Pi worker model id is ambiguous: ${route}`);
+	}
+	return matches[0];
+}
+
 export function createPolicyRuntimeExtension(options: { root?: string } = {}): ExtensionFactory {
 	const paths = getEvoPaths(options.root);
 	const registry = new BundleRegistry(paths);
 	return (pi) => {
 		let pinned: RuntimeBundle | undefined;
 		let activeToolsBeforeBundle: string[] | undefined;
+		let activeModelBeforeBundle: ExtensionContext["model"];
+		let clearFeatureSession: (() => void) | undefined;
+
+		function clearActiveFeatures(): void {
+			clearFeatureSession?.();
+			clearFeatureSession = undefined;
+		}
 
 		function restoreActiveTools(): void {
 			if (activeToolsBeforeBundle === undefined) return;
@@ -124,27 +195,89 @@ export function createPolicyRuntimeExtension(options: { root?: string } = {}): E
 			}
 		}
 
+		async function restoreActiveModel(): Promise<void> {
+			if (activeModelBeforeBundle === undefined) return;
+			const restored = await pi.setModel(activeModelBeforeBundle);
+			if (!restored) throw new Error("Evo-Pi could not restore the model active before bundle routing");
+			activeModelBeforeBundle = undefined;
+		}
+
 		pi.on("session_start", async (event, ctx) => {
 			pinned = undefined;
-			restoreActiveTools();
-			activeToolsBeforeBundle = [...pi.getActiveTools()];
+			clearActiveFeatures();
 			try {
+				restoreActiveTools();
+				await restoreActiveModel();
+				activeToolsBeforeBundle = [...pi.getActiveTools()];
 				const sessionId = ctx.sessionManager.getSessionId();
 				const recordedDigest = resolveSessionBundleDigest(ctx.sessionManager.getEntries(), sessionId, event.reason);
 				const digest = recordedDigest ?? (await registry.readStableDigest());
-				if (!digest) return;
-				const runtimeBundle = await renderRuntimeBundle(await loadCompiledBundle(paths, digest));
+				if (!digest) {
+					pi.setActiveTools(filterEvoCodeFeatureTools(activeToolsBeforeBundle, [], { root: paths.root }));
+					return;
+				}
+				const compiledBundle = await loadCompiledBundle(paths, digest);
+				await verifyManagedSourceSnapshots(compiledBundle.policy.managedSources ?? []);
+				const runtimeBundle = await renderRuntimeBundle(compiledBundle);
 				if (recordedDigest === undefined) pi.appendEntry("evo.bundle", { digest, sessionId });
-				if (runtimeBundle.enabledTools) pi.setActiveTools(runtimeBundle.enabledTools);
+				const workerRoute = runtimeBundle.bundle.policy.modelRouting?.worker;
+				if (workerRoute) {
+					const originalModel = ctx.model;
+					if (!originalModel)
+						throw new Error("Evo-Pi cannot route a worker model without a current model to restore");
+					const workerModel = resolveWorkerModel(ctx, workerRoute);
+					activeModelBeforeBundle = originalModel;
+					if (!(await pi.setModel(workerModel))) {
+						throw new Error(`Evo-Pi worker model is unavailable: ${workerRoute}`);
+					}
+				}
+				clearFeatureSession = activateEvoFeatureSession(runtimeBundle.bundle.policy.enabledFeatures ?? [], {
+					root: paths.root,
+					sessionId,
+				});
+				pi.setActiveTools(
+					filterEvoCodeFeatureTools(
+						runtimeBundle.enabledTools ?? activeToolsBeforeBundle,
+						runtimeBundle.bundle.policy.enabledFeatures ?? [],
+						{ root: paths.root },
+					),
+				);
 				pinned = runtimeBundle;
 			} catch (error) {
-				ctx.ui.notify(`Evo-Pi bundle disabled: ${error instanceof Error ? error.message : String(error)}`, "error");
+				pinned = undefined;
+				clearActiveFeatures();
+				const detail = error instanceof Error ? error.message : String(error);
+				let recoveryError: unknown;
+				try {
+					pi.setActiveTools([]);
+				} catch (disableError) {
+					recoveryError = disableError;
+				}
+				try {
+					await restoreActiveModel();
+				} catch (modelError) {
+					recoveryError ??= modelError;
+				}
+				if (recoveryError !== undefined) {
+					const recoveryDetail = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
+					ctx.ui.notify(`Evo-Pi bundle failed and recovery was incomplete: ${detail}; ${recoveryDetail}`, "error");
+					throw new Error("Evo-Pi could not fail closed after bundle activation failed", { cause: recoveryError });
+				}
+				ctx.ui.notify(`Evo-Pi bundle disabled with all tools blocked: ${detail}`, "error");
 			}
 		});
 
-		pi.on("session_shutdown", () => {
+		pi.on("session_shutdown", async () => {
 			try {
-				restoreActiveTools();
+				try {
+					restoreActiveTools();
+				} finally {
+					try {
+						await restoreActiveModel();
+					} finally {
+						clearActiveFeatures();
+					}
+				}
 			} finally {
 				pinned = undefined;
 			}
@@ -156,7 +289,20 @@ export function createPolicyRuntimeExtension(options: { root?: string } = {}): E
 
 		pi.on("before_agent_start", (event) => {
 			if (!pinned) return undefined;
-			return { systemPrompt: replaceRuntimeBundlePrompt(event.systemPrompt, pinned.systemPromptAppend) };
+			if (!pinned.bundle.policy.managedSources?.length) {
+				return { systemPrompt: replaceRuntimeBundlePrompt(event.systemPrompt, pinned.systemPromptAppend) };
+			}
+			const managed = replaceManagedHostResources({
+				event,
+				bundle: pinned.bundle,
+				resources: pinned.managedResources,
+			});
+			return {
+				systemPrompt: replaceRuntimeBundlePrompt(
+					managed.systemPrompt,
+					renderRuntimeBundlePrompt(pinned, managed.excludedTargets),
+				),
+			};
 		});
 	};
 }

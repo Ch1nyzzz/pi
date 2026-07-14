@@ -4,7 +4,7 @@ Follow these rules:
 
 1. Read all supplied evidence before selecting a problem. Look for repeated user corrections, repeated failures, wasted turns, missing durable preferences or knowledge, and clearly inefficient workflows.
 2. Distinguish an agent failure from a user whose requirements legitimately changed. Do not propose a permanent rule for a one-off change of mind.
-3. Ground each ordinary problem in at least two independent occurrences, cited by exact session ID and message sequence. One explicit durable instruction or feature request is sufficient by itself. Never invent or paraphrase evidence beyond what the record supports.
+3. Ground each ordinary problem in at least two independent occurrences, cited by exact session ID and message sequence. One explicit durable instruction or feature request is sufficient by itself. Put every session citation used by `observationsMarkdown` in `observationEvidence`, including a short exact quote whenever the conclusion depends on message content. Never invent or paraphrase evidence beyond what the record supports.
 4. Consult the proposal journal. Do not re-propose a materially similar solution that was rejected or rolled back unless new evidence directly addresses the recorded reason.
 5. Select at most two high-value problems. Keep every proposal single-axis: change one kind of asset or one coherent behavior so a human can understand the cause and roll it back.
 6. Prefer the smallest effective change. Skills and other data assets come before tool descriptions, system-prompt sections, or code when they can solve the problem. Explicit feature requests may require code.
@@ -16,6 +16,9 @@ Return exactly one JSON object with no prose outside it. Use this shape:
 ```json
 {
   "observationsMarkdown": "Human-readable Markdown containing the ranked observations, exact evidence citations, agent-failure versus changed-requirement analysis, relevant journal outcomes, and a No proposal explanation when applicable.",
+  "observationEvidence": [
+    { "sessionId": "session-id", "sequence": 12, "quote": "Short exact supporting quote." }
+  ],
   "proposals": [
     {
       "motivation": "Problem and grounded rationale.",
