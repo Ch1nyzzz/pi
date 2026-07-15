@@ -19,6 +19,7 @@ export * from "./evolve/evaluator.ts";
 export * from "./evolve/release.ts";
 export * from "./evolve/research-plan.ts";
 export * from "./evolve/research-tools.ts";
+export * from "./evolve/retry.ts";
 export * from "./evolve/run.ts";
 export * from "./extension.ts";
 export { default as evoExtension } from "./extension.ts";

@@ -12,16 +12,23 @@ import { BundleRegistry } from "../registry/registry.ts";
 import { atomicWriteJson, canonicalJson, readJsonIfExists, sha256, withFileLock } from "../storage.ts";
 import type { EvidenceReference, ReplayScenario } from "../types.ts";
 
+// Safe default for consumers that inline the corpus text into a prompt.
 const DEFAULT_CORPUS_BYTES = 1024 * 1024;
+// Budget for the materialized on-disk corpus (prompts carry only an index there);
+// raising it costs disk, never context-window tokens. Callers opt in explicitly.
+export const MATERIALIZED_CORPUS_BYTES = 8 * 1024 * 1024;
 const REVIEW_CURSOR_SCHEMA_VERSION = 1;
 const REVIEW_CURSOR_FILE = "review-cursor.json";
 const SOURCE_SEPARATOR = "\n\n";
+// Percentage caps for the fixed sources. Sessions — the behavioral evidence — has no
+// weight: it receives the entire budget the fixed sources leave unused.
 const SOURCE_WEIGHTS = {
 	bundle: 30,
 	history: 15,
 	inbox: 20,
 	sessions: 35,
 } as const;
+const FIXED_SOURCES = ["bundle", "history", "inbox"] as const;
 
 export type EvidenceSource = keyof typeof SOURCE_WEIGHTS;
 
@@ -29,6 +36,14 @@ export interface EvidenceSourceSummary {
 	bytes: number;
 	maxBytes: number;
 	truncated: boolean;
+}
+
+/** One corpus section with its structured value, used to materialize the corpus on disk. */
+export interface EvidenceFragment {
+	source: EvidenceSource;
+	heading: string;
+	value: unknown;
+	sessionId?: string;
 }
 
 export interface EvidenceReviewCursor {
@@ -54,6 +69,7 @@ export interface EvidenceCorpus {
 	mode: "full" | "incremental";
 	evidenceDigest: string;
 	sources: Record<EvidenceSource, EvidenceSourceSummary>;
+	fragments: EvidenceFragment[];
 	sessionIds: string[];
 	inboxFiles: string[];
 	nextReviewCursor: EvidenceReviewCursor;
@@ -75,9 +91,10 @@ interface EvidenceFile {
 }
 
 interface SourceCollector {
-	append(heading: string, value: unknown): boolean;
+	append(heading: string, value: unknown, sessionId?: string): boolean;
 	text(): string;
 	summary(): EvidenceSourceSummary;
+	fragments(): EvidenceFragment[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -182,28 +199,20 @@ export async function advanceEvidenceReviewCursor(
 	});
 }
 
-function allocateSourceBudgets(maxBytes: number): Record<EvidenceSource, number> {
-	const sources = Object.keys(SOURCE_WEIGHTS) as EvidenceSource[];
-	const separatorBytes = Buffer.byteLength(SOURCE_SEPARATOR, "utf8") * (sources.length - 1);
+function allocateSourceBudgets(maxBytes: number): Record<(typeof FIXED_SOURCES)[number], number> {
+	const separatorBytes = Buffer.byteLength(SOURCE_SEPARATOR, "utf8") * FIXED_SOURCES.length;
 	const available = Math.max(0, maxBytes - Math.min(maxBytes, separatorBytes));
-	let allocated = 0;
 	return Object.fromEntries(
-		sources.map((source, index) => {
-			const bytes =
-				index === sources.length - 1
-					? available - allocated
-					: Math.floor((available * SOURCE_WEIGHTS[source]) / 100);
-			allocated += bytes;
-			return [source, bytes];
-		}),
-	) as Record<EvidenceSource, number>;
+		FIXED_SOURCES.map((source) => [source, Math.floor((available * SOURCE_WEIGHTS[source]) / 100)]),
+	) as Record<(typeof FIXED_SOURCES)[number], number>;
 }
 
-function createSourceCollector(maxBytes: number): SourceCollector {
+function createSourceCollector(source: EvidenceSource, maxBytes: number): SourceCollector {
 	let sourceText = "";
 	let truncated = false;
+	const collected: EvidenceFragment[] = [];
 	return {
-		append(heading, value) {
+		append(heading, value, sessionId) {
 			const fragment = `${heading}\n${typeof value === "string" ? value : JSON.stringify(value, undefined, "\t")}`;
 			const candidate = sourceText ? `${sourceText}${SOURCE_SEPARATOR}${fragment}` : fragment;
 			if (Buffer.byteLength(candidate, "utf8") > maxBytes) {
@@ -211,10 +220,12 @@ function createSourceCollector(maxBytes: number): SourceCollector {
 				return false;
 			}
 			sourceText = candidate;
+			collected.push({ source, heading, value, ...(sessionId ? { sessionId } : {}) });
 			return true;
 		},
 		text: () => sourceText,
 		summary: () => ({ bytes: Buffer.byteLength(sourceText, "utf8"), maxBytes, truncated }),
+		fragments: () => [...collected],
 	};
 }
 
@@ -412,12 +423,11 @@ export async function collectEvidenceCorpus(
 	await ensureEvoLayout(paths);
 
 	const sourceBudgets = allocateSourceBudgets(maxBytes);
-	const collectors: Record<EvidenceSource, SourceCollector> = {
-		bundle: createSourceCollector(sourceBudgets.bundle),
-		history: createSourceCollector(sourceBudgets.history),
-		inbox: createSourceCollector(sourceBudgets.inbox),
-		sessions: createSourceCollector(sourceBudgets.sessions),
-	};
+	const collectors = {
+		bundle: createSourceCollector("bundle", sourceBudgets.bundle),
+		history: createSourceCollector("history", sourceBudgets.history),
+		inbox: createSourceCollector("inbox", sourceBudgets.inbox),
+	} as Record<EvidenceSource, SourceCollector>;
 	const previousCursor =
 		mode === "incremental" && options.reviewCursor ? parseReviewCursor(options.reviewCursor) : undefined;
 	const reviewedInboxFiles = new Set(previousCursor?.inboxFiles ?? []);
@@ -488,6 +498,12 @@ export async function collectEvidenceCorpus(
 		nextInboxFiles.add(file.name);
 	}
 
+	// Soft quota: sessions (the behavioral evidence) receive every byte the fixed
+	// sources did not use, not a fixed share.
+	const fixedBytes = FIXED_SOURCES.reduce((sum, source) => sum + collectors[source].summary().bytes, 0);
+	const separatorReserve = Buffer.byteLength(SOURCE_SEPARATOR, "utf8") * FIXED_SOURCES.length;
+	collectors.sessions = createSourceCollector("sessions", Math.max(0, maxBytes - fixedBytes - separatorReserve));
+
 	const allDigests = await listSessionDigests(paths);
 	const digests = options.completedSessionsOnly ? allDigests.filter((digest) => digest.complete) : allDigests;
 	const orderedDigests = mode === "incremental" ? digests : [...digests].reverse();
@@ -502,13 +518,27 @@ export async function collectEvidenceCorpus(
 			throw new Error(`Cannot collect session log ${digest.sessionId}.jsonl`, { cause: error });
 		}
 		if (reviewedSequence === 0) {
-			if (!collectors.sessions.append(`## Session digest ${digest.sessionId}`, compactSessionDigest(digest))) break;
+			if (
+				!collectors.sessions.append(
+					`## Session digest ${digest.sessionId}`,
+					compactSessionDigest(digest),
+					digest.sessionId,
+				)
+			) {
+				break;
+			}
 			sessionIds.add(digest.sessionId);
 		}
 		for (const event of events) {
 			if (event.sequence <= reviewedSequence) continue;
 			const restored = await restoreEvent(event, paths);
-			if (collectors.sessions.append(`## Session ${digest.sessionId}, sequence ${event.sequence}`, restored)) {
+			if (
+				collectors.sessions.append(
+					`## Session ${digest.sessionId}, sequence ${event.sequence}`,
+					restored,
+					digest.sessionId,
+				)
+			) {
 				sessionIds.add(digest.sessionId);
 				nextSessionSequences[digest.sessionId] = event.sequence;
 				continue;
@@ -517,6 +547,7 @@ export async function collectEvidenceCorpus(
 				collectors.sessions.append(
 					`## Session ${digest.sessionId}, sequence ${event.sequence} (artifact omitted by budget)`,
 					event,
+					digest.sessionId,
 				)
 			) {
 				sessionIds.add(digest.sessionId);
@@ -565,6 +596,7 @@ export async function collectEvidenceCorpus(
 		mode,
 		evidenceDigest,
 		sources,
+		fragments: sourceOrder.flatMap((source) => collectors[source].fragments()),
 		sessionIds: [...sessionIds],
 		inboxFiles,
 		nextReviewCursor,

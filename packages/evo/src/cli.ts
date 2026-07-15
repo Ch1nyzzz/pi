@@ -2,6 +2,7 @@ import { createInterface } from "node:readline/promises";
 import type { ExtensionCommandContext, ExtensionContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { loadCompiledBundle } from "./bundle/compile.ts";
 import { buildTrialComparison, renderTrialComparisonMarkdown, type TrialComparison } from "./comparison.ts";
+import { canUseEvoComponentSandbox } from "./components/process-runtime.ts";
 import {
 	formatEvolutionRuns,
 	inspectBackgroundEvolutions,
@@ -13,6 +14,9 @@ import {
 import { readEvolutionWorkflow, resetEvolutionWorkflow } from "./evolve/config.ts";
 import { runEvolutionCycle } from "./evolve/cycle.ts";
 import { EvolutionProcessInspector } from "./evolve/inspect-ui.ts";
+import { changesComponentSelection } from "./evolve/release.ts";
+import { retryEvolutionFromValidation } from "./evolve/retry.ts";
+import { listEvolutionRuns, readEvolutionRun, updateEvolutionRun } from "./evolve/run.ts";
 import { readBundlePreferenceMemory } from "./memory/preferences.ts";
 import { type EvoPaths, getEvoPaths } from "./paths.ts";
 import { proposalApproval } from "./proposal.ts";
@@ -49,6 +53,7 @@ const SUBCOMMANDS = [
 	"pause",
 	"resume",
 	"delete",
+	"retry",
 	"scheduled-improve",
 	"schedule",
 	"workflow",
@@ -74,7 +79,7 @@ const QUICK_APPROVE_SHORTCUT = "ctrl+alt+e" as const;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SCHEDULE_USAGE = "/evo schedule [daily | 3d | weekly | every <n>d | manual]";
 
-export const EVO_HELP = `Usage: /evo <command>
+const EVO_HELP = `Usage: /evo <command>
 
   help                         Show this help
   init                         Initialize and migrate Pi data into a bundle
@@ -85,6 +90,7 @@ export const EVO_HELP = `Usage: /evo <command>
   pause <run-id>               Pause a background task
   resume <run-id>              Resume a paused task
   delete <run-id>              Stop and permanently delete a task
+  retry <run-id>               Reuse a built component and continue from validation
   scheduled-improve            Run one guarded background evolution attempt
   schedule [cadence]           Show or set the evolution cadence (daily, 3d, weekly, manual)
   workflow [reset]             Show or reset the user-editable evolution workflow
@@ -166,6 +172,13 @@ function requireValue(value: string, usage: string): string {
 	return value.trim();
 }
 
+function parseRetryArgs(value: string, usage: string): string {
+	const { first: id, rest } = splitFirst(value);
+	requireValue(id, usage);
+	if (rest && rest !== "--from validating") throw new Error(`Usage: ${usage}`);
+	return id;
+}
+
 function formatStatus(status: EvoStatus): string {
 	return [
 		`initialized: ${String(status.initialized)}`,
@@ -193,6 +206,25 @@ async function formatActivePreferences(dependencies: EvoCommandDependencies): Pr
 	].join("\n");
 }
 
+function evolutionRunStatusText(status: string): string {
+	return (
+		{
+			queued: "等待执行",
+			researching: "研究中",
+			planned: "计划已冻结",
+			building: "构建候选",
+			validating: "确定性验证",
+			replaying: "历史回放",
+			evaluating: "独立评估",
+			"awaiting-evidence": "等待实验数据",
+			"awaiting-canary-approval": "等待 Canary 确认",
+			trialing: "Canary 运行中",
+			"awaiting-decision": "等待最终决定",
+			paused: "已暂停",
+		}[status] ?? status
+	);
+}
+
 function compactStatusText(value: string, maxLength = 48): string {
 	const compact = value.replace(/\s+/g, " ").trim();
 	if (compact.length <= maxLength) return compact;
@@ -205,7 +237,7 @@ async function findPendingT0Proposal(dependencies: { service: EvoService }): Pro
 	);
 }
 
-export function describeScheduleCadence(config: EvoScheduleConfig): string {
+function describeScheduleCadence(config: EvoScheduleConfig): string {
 	if (config.mode === "manual") return "manual (evolution only runs through /evo go)";
 	if (config.everyDays === 1) return "auto (reflect once a day)";
 	return `auto (reflect once every ${config.everyDays} days)`;
@@ -258,7 +290,7 @@ async function readProposalArtifact(
 	).trim();
 }
 
-export async function formatProposalCard(paths: EvoPaths, proposal: Proposal): Promise<string> {
+async function formatProposalCard(paths: EvoPaths, proposal: Proposal): Promise<string> {
 	const evidence = proposal.evidence.length
 		? proposal.evidence
 				.map(
@@ -352,9 +384,28 @@ export async function refreshEvoStatusIndicator(
 	dependencies: { service: EvoService; paths: EvoPaths },
 	ctx: ExtensionContext,
 	now: () => Date = () => new Date(),
+	includeTrialComparison = true,
 ): Promise<void> {
 	const status = await dependencies.service.status();
 	const parts: string[] = [];
+	const runs = (await listEvolutionRuns(dependencies.paths)).filter(
+		(run) => !["completed", "failed", "cancelled"].includes(run.status),
+	);
+	const awaitingCanary = runs.filter((run) => run.status === "awaiting-canary-approval");
+	if (awaitingCanary.length > 0) {
+		parts.push(`${awaitingCanary.length} waiting Canary approval [/evo inspect]`);
+	} else if (runs.length === 1) {
+		const run = runs[0];
+		if (run) {
+			const action =
+				run.status === "awaiting-evidence" && run.proposalId
+					? ` [/evo permit ${run.proposalId}]`
+					: run.status === "awaiting-decision" && run.proposalId
+						? ` [/evo show ${run.proposalId}]`
+						: "";
+			parts.push(`${run.id.slice(-8)} ${evolutionRunStatusText(run.status)}${action}`);
+		}
+	} else if (runs.length > 1) parts.push(`${runs.length} active tasks [/evo inspect]`);
 	if (status.pendingProposals > 0) {
 		const quick = await findPendingT0Proposal(dependencies);
 		parts.push(
@@ -367,7 +418,8 @@ export async function refreshEvoStatusIndicator(
 		const proposal = await dependencies.service.getProposal(status.trial.proposalId);
 		if (proposal.artifacts.retrospective) {
 			parts.push(`trial ${status.trial.proposalId} comparison ready [/evo show ${status.trial.proposalId}]`);
-		} else {
+		} else if (!includeTrialComparison) parts.push(`trial ${status.trial.proposalId} active`);
+		else {
 			const schedule = await readScheduleConfig(dependencies.paths);
 			const comparison = await buildTrialComparison(dependencies.paths, proposal, status.trial);
 			const dueAt = Date.parse(status.trial.startedAt) + schedule.trialDueAfterDays * DAY_MS;
@@ -535,6 +587,69 @@ async function runExtensionPermit(
 	}
 }
 
+export async function approveCanaryRun(
+	dependencies: { service: EvoService; paths: EvoPaths },
+	runId: string,
+): Promise<void> {
+	const run = await readEvolutionRun(dependencies.paths, runId);
+	if (run.status !== "awaiting-canary-approval" || !run.proposalId) {
+		throw new Error(`Evolution task ${runId} is not awaiting Canary approval`);
+	}
+	const proposal = await dependencies.service.getProposal(run.proposalId);
+	if (!changesComponentSelection(proposal) || !proposal.candidateDigest || !proposal.targetAbi) {
+		throw new Error("The proposal does not replace a component");
+	}
+	if (
+		run.canaryParentDigest !== proposal.parentBundleDigest ||
+		run.canaryCandidateDigest !== proposal.candidateDigest ||
+		run.canaryTargetAbi !== proposal.targetAbi
+	) {
+		throw new Error("Canary review metadata no longer matches the exact proposal");
+	}
+	const stable = await dependencies.service.registry.readStableDigest();
+	if (!stable || stable !== proposal.parentBundleDigest) {
+		throw new Error("Stable bundle changed; rebuild and review the Canary against the new baseline");
+	}
+	if (proposal.status === "trialing") {
+		const trial = await dependencies.service.registry.readTrial();
+		if (!trial || trial.proposalId !== proposal.id || trial.digest !== proposal.candidateDigest) {
+			throw new Error("Component proposal and active Canary state disagree");
+		}
+		await updateEvolutionRun(dependencies.paths, run.id, {
+			status: "trialing",
+			canaryApprovalDigest: proposal.approvalDigest,
+			canaryStableDigest: stable,
+		});
+		return;
+	}
+	if (proposal.status !== "pending") throw new Error(`Component proposal is ${proposal.status}`);
+	const approved = await dependencies.service.approve(proposal.id, proposalApproval(proposal));
+	await updateEvolutionRun(dependencies.paths, run.id, {
+		status: "trialing",
+		canaryApprovedAt: new Date().toISOString(),
+		canaryApprovalDigest: approved.approvalDigest,
+		canaryStableDigest: stable,
+	});
+}
+
+async function openEvolutionInspector(
+	dependencies: EvoCommandDependencies,
+	ctx: ExtensionContext,
+	initialRunId?: string,
+): Promise<void> {
+	await ctx.ui.custom<void>(
+		(tui, theme, _keybindings, done) =>
+			new EvolutionProcessInspector(
+				tui,
+				theme,
+				dependencies.paths,
+				initialRunId,
+				() => done(undefined),
+				(runId) => approveCanaryRun(dependencies, runId),
+			),
+	);
+}
+
 async function dispatchExtensionCommand(
 	pi: Parameters<ExtensionFactory>[0],
 	dependencies: EvoCommandDependencies,
@@ -576,10 +691,7 @@ async function dispatchExtensionCommand(
 				ctx.ui.notify(formatEvolutionRuns(runs, rest || undefined), "info");
 				return;
 			}
-			await ctx.ui.custom<void>(
-				(tui, theme, _keybindings, done) =>
-					new EvolutionProcessInspector(tui, theme, dependencies.paths, rest || undefined, () => done(undefined)),
-			);
+			await openEvolutionInspector(dependencies, ctx, rest || undefined);
 			return;
 		}
 		case "pause": {
@@ -592,6 +704,38 @@ async function dispatchExtensionCommand(
 			const id = requireValue(rest, "/evo resume <run-id>");
 			await resumeBackgroundEvolution(dependencies.paths, id);
 			ctx.ui.notify(`Evolution task ${id} resumed`, "info");
+			return;
+		}
+		case "retry": {
+			const id = parseRetryArgs(rest, "/evo retry <run-id> [--from validating]");
+			const sandboxAvailable = await canUseEvoComponentSandbox();
+			if (!sandboxAvailable && !ctx.hasUI) {
+				throw new Error(
+					"Component sandbox is unavailable and one-time direct execution requires an interactive UI",
+				);
+			}
+			const allowDirect =
+				!sandboxAvailable &&
+				(await ctx.ui.confirm(
+					"One-time component permission",
+					`The OS sandbox is unavailable. Allow the built component from ${id} to run directly once for validation with your user permissions? This grant is not saved and does not activate the Canary.`,
+				));
+			if (!sandboxAvailable && !allowDirect) {
+				ctx.ui.notify("Retry cancelled; no component permission was granted", "info");
+				return;
+			}
+			const retried = await retryEvolutionFromValidation({
+				paths: dependencies.paths,
+				sourceRunId: id,
+				cwd: dependencies.cwd ?? ctx.cwd,
+				...(allowDirect ? { sandbox: false } : {}),
+			});
+			ctx.ui.notify(
+				retried.status === "awaiting-canary-approval"
+					? `Evolution task ${retried.runId} is ready for Canary review [/evo inspect]`
+					: `Evolution task ${retried.runId} is waiting for its frozen evidence strategy`,
+				"info",
+			);
 			return;
 		}
 		case "delete": {
@@ -801,14 +945,49 @@ async function dispatchExtensionCommand(
 export function createEvoCommandExtension(options: EvoCommandExtensionOptions = {}): ExtensionFactory {
 	const dependencies = createDependencies(options);
 	return (pi) => {
+		let statusTimer: NodeJS.Timeout | undefined;
+		let refreshingStatus = false;
+		let canPromptForCanary = false;
+		let canaryInspectorOpen = false;
+		const promptedCanaryRuns = new Set<string>();
 		pi.on("session_start", async (_event, ctx) => {
-			try {
-				await refreshEvoStatusIndicator(dependencies, ctx);
-			} catch {
-				ctx.ui.setStatus("evo", undefined);
-			}
+			const refresh = async (): Promise<void> => {
+				if (refreshingStatus) return;
+				refreshingStatus = true;
+				try {
+					await refreshEvoStatusIndicator(dependencies, ctx, () => new Date(), false);
+					if (canPromptForCanary && ctx.mode === "tui" && !canaryInspectorOpen) {
+						const awaiting = (await listEvolutionRuns(dependencies.paths)).find(
+							(run) => run.status === "awaiting-canary-approval" && !promptedCanaryRuns.has(run.id),
+						);
+						if (awaiting) {
+							promptedCanaryRuns.add(awaiting.id);
+							canaryInspectorOpen = true;
+							try {
+								await openEvolutionInspector(dependencies, ctx, awaiting.id);
+							} finally {
+								canaryInspectorOpen = false;
+							}
+						}
+					}
+				} catch {
+					ctx.ui.setStatus("evo", undefined);
+				} finally {
+					refreshingStatus = false;
+				}
+			};
+			if (statusTimer) clearInterval(statusTimer);
+			await refresh();
+			canPromptForCanary = true;
+			statusTimer = setInterval(() => void refresh(), 1_000);
+			statusTimer.unref?.();
 		});
 		pi.on("session_shutdown", (_event, ctx) => {
+			if (statusTimer) clearInterval(statusTimer);
+			statusTimer = undefined;
+			canPromptForCanary = false;
+			canaryInspectorOpen = false;
+			promptedCanaryRuns.clear();
 			ctx.ui.setStatus("evo", undefined);
 		});
 		pi.registerShortcut(QUICK_APPROVE_SHORTCUT, {
@@ -1051,6 +1230,32 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 			const id = requireValue(rest, "evo-pi resume <run-id>");
 			await resumeBackgroundEvolution(dependencies.paths, id);
 			io.write(`Evolution task ${id} resumed`);
+			return;
+		}
+		case "retry": {
+			const id = parseRetryArgs(rest, "evo-pi-admin retry <run-id> [--from validating]");
+			const sandboxAvailable = await canUseEvoComponentSandbox();
+			const allowDirect =
+				!sandboxAvailable &&
+				(await confirmLocalMutation(
+					io,
+					`OS sandbox unavailable. Run the built component from ${id} directly once for validation with your user permissions?`,
+				));
+			if (!sandboxAvailable && !allowDirect) {
+				io.write("Retry cancelled; no component permission was granted");
+				return;
+			}
+			const retried = await retryEvolutionFromValidation({
+				paths: dependencies.paths,
+				sourceRunId: id,
+				cwd: dependencies.cwd ?? process.cwd(),
+				...(allowDirect ? { sandbox: false } : {}),
+			});
+			io.write(
+				retried.status === "awaiting-canary-approval"
+					? `Evolution task ${retried.runId} is ready for Canary review`
+					: `Evolution task ${retried.runId} is waiting for its frozen evidence strategy`,
+			);
 			return;
 		}
 		case "delete": {

@@ -1,6 +1,6 @@
 # Evo-Pi evolution workflow
 
-This file is trusted user configuration. The evolution engine always runs the same simple sequence: research and plan, freeze the experiment, build a candidate, evaluate it, then apply deterministic release policy.
+This file is trusted user configuration. The evolution engine uses a resumable evidence pipeline: research, freeze the experiment, build, deterministic validation, candidate-aware replay, evidence assessment, reversible trial, and only then deterministic release.
 
 ## Research and plan
 
@@ -12,12 +12,14 @@ Select at most one narrow improvement. Open durable preferences take priority as
 
 ## Experiment
 
-Freeze the baseline, hypothesis, approved check profiles, metrics, minimum meaningful effect, trial plan, and rollback conditions before implementation starts. Do not emit arbitrary shell commands. Research is a source of hypotheses, not proof of local benefit.
+Freeze the baseline, hypothesis, approved check profiles, metrics, minimum meaningful effect, trial plan, rollback conditions, and a structured evidence strategy before implementation starts. The ResearchPlanner must classify the patch and decide separately whether offline checks, historical replay, shadow execution, and Canary evidence are required. Marking a stage not applicable requires a concrete causal reason; inability to test offline must lead to shadow or Canary rather than direct release. Required stages are deterministic release gates and cannot be satisfied by a different replay type. Do not emit arbitrary shell commands. Research is a source of hypotheses, not proof of local benefit.
 
 ## Implementation
 
 Make the smallest change that tests the hypothesis. Data candidates may edit only the bundle data schema. Component candidates must implement the exact target ABI. Other code stays in an isolated worktree and cannot be activated automatically.
 
-## Evaluation
+## Evaluation and trial
 
-Use deterministic checks first, then bounded paired replay or real trial evidence where appropriate. Do not interpret generate-only replay as end-to-end execution. Recommend direct application only for deterministic dominance under the configured release policy; use a reversible trial for semantic changes; reject regressions and report insufficient evidence honestly.
+Use deterministic checks first, then bounded baseline/candidate replay and real shadow or canary evidence where the metric depends on providers, time, external systems, or live sessions. Do not interpret generate-only replay as end-to-end execution. A valid candidate missing required future evidence is `needs-evidence`, not unsupported. `unsupported` requires sufficient executed comparative evidence that misses frozen thresholds; `invalid` means the candidate or experiment is broken.
+
+When local policy enables component Canary offers, replacing a selected component stops at `awaiting-canary-approval`; otherwise it remains in normal review. Never activate it from a model verdict or standing auto-start policy alone. Show the exact diff, independent evaluation, current and candidate digests, target ABI, reversible scope, and rollback policy before an explicit Enter action starts the Canary. Stable mutation and final keep remain deterministic registry transitions with stale-parent checks.

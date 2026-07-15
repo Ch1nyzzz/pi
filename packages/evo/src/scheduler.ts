@@ -185,7 +185,7 @@ function requireScheduleDays(value: number, label: string): number {
 	return value;
 }
 
-export function resolveScheduledImproveConfig(input: ScheduledImproveConfigInput = {}): ScheduledImproveConfig {
+function resolveScheduledImproveConfig(input: ScheduledImproveConfigInput = {}): ScheduledImproveConfig {
 	return {
 		quietHours: resolveQuietHours(
 			input.quietHours === undefined ? DEFAULT_SCHEDULED_IMPROVE_CONFIG.quietHours : input.quietHours,
@@ -299,7 +299,7 @@ function countDailyRuns(events: ImproveRunEvent[], day: string): number {
 	return runIds.size;
 }
 
-export async function findLatestSessionActivity(
+async function findLatestSessionActivity(
 	paths: EvoPaths,
 	excludeSessionIds: readonly string[] = [],
 ): Promise<Date | undefined> {

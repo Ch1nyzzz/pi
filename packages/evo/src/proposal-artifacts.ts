@@ -202,11 +202,11 @@ export function getRetrospectiveArtifactFile(revision: number, evidenceDigest: s
 	return getEvidenceArtifactFile(revision, "retrospective", evidenceDigest);
 }
 
-export function getComparisonArtifactFile(revision: number, evidenceDigest: string): string {
+function getComparisonArtifactFile(revision: number, evidenceDigest: string): string {
 	return getEvidenceArtifactFile(revision, "comparison", evidenceDigest);
 }
 
-export function getComparisonMarkdownArtifactFile(revision: number, evidenceDigest: string): string {
+function getComparisonMarkdownArtifactFile(revision: number, evidenceDigest: string): string {
 	return getComparisonArtifactFile(revision, evidenceDigest).replace(/\.json$/, ".md");
 }
 

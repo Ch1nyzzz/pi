@@ -323,3 +323,91 @@ export async function storeTrialComparison(
 	await saveProposalRevisionSnapshot(paths, current);
 	return { comparison, proposal: current, reference, reused: false };
 }
+
+// ============================================================================
+// Trial contract: the measurable metric registry and its deterministic gates.
+// A plan may only promise metrics this module actually measures, and keep /
+// rollback decisions compare measured deltas against the frozen minimum effect.
+// ============================================================================
+
+export const TRIAL_METRIC_DIRECTIONS = {
+	toolErrorRate: "lower",
+	verificationPassRate: "higher",
+	assistantTurnsPerTask: "lower",
+	followUpsPerTask: "lower",
+	tokensPerTask: "lower",
+} as const satisfies Record<keyof ComparisonRates, "lower" | "higher">;
+
+export type TrialMetricName = keyof typeof TRIAL_METRIC_DIRECTIONS;
+
+export function isTrialMetricName(value: string): value is TrialMetricName {
+	return value in TRIAL_METRIC_DIRECTIONS;
+}
+
+export function parseTrialDurationDays(value: string): number | undefined {
+	const match = /^([1-9]\d*)d$/.exec(value.trim());
+	return match ? Number(match[1]) : undefined;
+}
+
+interface TrialContract {
+	primaryMetric?: string;
+	minimumEffect: Record<string, number>;
+}
+
+/** Signed improvement of a delta under the metric's direction (positive = better). */
+function improvement(metric: TrialMetricName, delta: number): number {
+	return TRIAL_METRIC_DIRECTIONS[metric] === "lower" ? -delta : delta;
+}
+
+export interface TrialContractGate {
+	allowed: boolean;
+	reasons: string[];
+}
+
+/**
+ * Deterministic keep-gate: sufficiency must hold and the primary metric must have
+ * improved by at least the frozen minimum effect. Model recommendations can veto a
+ * keep but can never substitute for this gate.
+ */
+export function evaluateTrialContractGate(
+	contract: TrialContract | undefined,
+	comparison: TrialComparison,
+): TrialContractGate {
+	const reasons: string[] = [];
+	if (comparison.sufficiency.status !== "sufficient") {
+		reasons.push(`comparison evidence is insufficient: ${comparison.sufficiency.reasons.join("; ") || "unknown"}`);
+	}
+	const primary = contract?.primaryMetric;
+	if (primary && isTrialMetricName(primary)) {
+		const delta = comparison.delta[primary];
+		const threshold = contract.minimumEffect[primary] ?? 0;
+		if (delta === null) {
+			reasons.push(`primary metric ${primary} has no measurement in either cohort`);
+		} else if (improvement(primary, delta) < threshold) {
+			reasons.push(
+				`primary metric ${primary} improved by ${improvement(primary, delta).toFixed(4)}, below the frozen minimum effect ${threshold}`,
+			);
+		}
+	}
+	return { allowed: reasons.length === 0, reasons };
+}
+
+/**
+ * Machine rollback trigger: the primary metric regressed by at least the frozen
+ * minimum effect. Returns the reason, or undefined when no trigger fires.
+ */
+export function primaryMetricRegression(
+	contract: TrialContract | undefined,
+	comparison: TrialComparison,
+): string | undefined {
+	const primary = contract?.primaryMetric;
+	if (!primary || !isTrialMetricName(primary)) return undefined;
+	const threshold = contract?.minimumEffect[primary];
+	if (!threshold || threshold <= 0) return undefined;
+	const delta = comparison.delta[primary];
+	if (delta === null) return undefined;
+	if (improvement(primary, delta) <= -threshold) {
+		return `primary metric ${primary} regressed by ${(-improvement(primary, delta)).toFixed(4)} (frozen minimum effect ${threshold})`;
+	}
+	return undefined;
+}

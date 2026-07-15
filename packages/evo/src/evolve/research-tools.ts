@@ -21,6 +21,35 @@ async function boundedText(response: Response): Promise<string> {
 	return new TextDecoder().decode(bytes);
 }
 
+/**
+ * Reduce an HTML page to its readable text so the truncation budget carries content
+ * instead of markup. Non-HTML documents pass through unchanged.
+ */
+function extractReadableText(text: string, contentType: string | null): string {
+	const looksHtml = /html/i.test(contentType ?? "") || /^\s*<(?:!doctype|html)[\s>]/i.test(text);
+	if (!looksHtml) return text;
+	const withoutBlocks = text
+		.replace(/<script[\s\S]*?<\/script\s*>/gi, " ")
+		.replace(/<style[\s\S]*?<\/style\s*>/gi, " ")
+		.replace(/<svg[\s\S]*?<\/svg\s*>/gi, " ")
+		.replace(/<head[\s\S]*?<\/head\s*>/gi, " ")
+		.replace(/<!--[\s\S]*?-->/g, " ")
+		.replace(/<br\s*\/?>/gi, "\n")
+		.replace(/<\/(?:p|div|li|tr|h[1-6]|section|article|blockquote|pre|table)\s*>/gi, "\n")
+		.replace(/<[^>]+>/g, " ");
+	return decodeXml(withoutBlocks)
+		.split("\n")
+		.map((line) => line.replace(/[ \t\r]+/g, " ").trim())
+		.join("\n")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
+}
+
+function clipSummary(value: unknown, maxChars: number): unknown {
+	if (typeof value !== "string" || value.length <= maxChars) return value;
+	return `${value.slice(0, maxChars)}… [clipped; fetch the source for the full text]`;
+}
+
 function decodeXml(value: string): string {
 	return value
 		.replaceAll("&lt;", "<")
@@ -46,7 +75,7 @@ async function searchArxiv(query: string, limit: number, signal?: AbortSignal): 
 		title: xmlField(match[1], "title"),
 		url: xmlField(match[1], "id"),
 		published: xmlField(match[1], "published"),
-		summary: xmlField(match[1], "summary"),
+		summary: clipSummary(xmlField(match[1], "summary"), 500),
 	}));
 }
 
@@ -63,7 +92,7 @@ async function searchCrossref(query: string, limit: number, signal?: AbortSignal
 		title: Array.isArray(item.title) ? item.title[0] : item.title,
 		doi: item.DOI,
 		url: item.URL,
-		abstract: item.abstract,
+		abstract: clipSummary(item.abstract, 500),
 		published: item.published,
 	}));
 }
@@ -112,11 +141,14 @@ export function createEvolutionResearchTools(): ToolDefinition[] {
 					: params.source === "crossref"
 						? await searchCrossref(params.query, limit, signal)
 						: await searchGithub(params.query, limit, signal);
+			const lines = Array.isArray(results)
+				? results.map((result) => JSON.stringify(result)).join("\n")
+				: JSON.stringify(results);
 			return {
 				content: [
 					{
 						type: "text",
-						text: `<external-untrusted source=${JSON.stringify(params.source)}>\n${JSON.stringify(results, undefined, 2)}\n</external-untrusted>`,
+						text: `<external-untrusted source=${JSON.stringify(params.source)}>\n${lines}\n</external-untrusted>`,
 					},
 				],
 				details: { source: params.source, query: params.query },
@@ -136,9 +168,13 @@ export function createEvolutionResearchTools(): ToolDefinition[] {
 			}
 			url.username = "";
 			url.password = "";
-			const text = await boundedText(
-				await fetch(url, { signal, redirect: "error", headers: { "user-agent": "Evo-Pi/0.80 research" } }),
-			);
+			const response = await fetch(url, {
+				signal,
+				redirect: "error",
+				headers: { "user-agent": "Evo-Pi/0.80 research" },
+			});
+			const contentType = response.headers.get("content-type");
+			const text = extractReadableText(await boundedText(response), contentType);
 			const truncated = truncateHead(text, { maxBytes: 50 * 1024, maxLines: 2_000 });
 			return {
 				content: [

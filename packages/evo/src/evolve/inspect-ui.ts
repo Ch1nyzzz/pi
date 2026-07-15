@@ -3,7 +3,8 @@ import { join } from "node:path";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, Key, matchesKey, type TUI, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { EvoPaths } from "../paths.ts";
-import type { EvolutionRun, EvolutionRunStatus } from "../types.ts";
+import { loadProposal } from "../proposal.ts";
+import type { EvolutionRun, EvolutionRunStatus, Proposal } from "../types.ts";
 import { evolutionRunDirectory, listEvolutionRuns, readEvolutionRun } from "./run.ts";
 
 interface TranscriptEvent {
@@ -21,11 +22,24 @@ interface TranscriptEvent {
 interface RunArtifacts {
 	plan?: string;
 	experiment?: string;
+	validation?: string;
 	evaluation?: string;
 }
 
 const TERMINAL_STATUSES = new Set<EvolutionRunStatus>(["completed", "failed", "cancelled"]);
-const PHASE_ORDER: EvolutionRunStatus[] = ["queued", "researching", "planned", "building", "evaluating", "completed"];
+const PHASE_ORDER: EvolutionRunStatus[] = [
+	"queued",
+	"researching",
+	"planned",
+	"building",
+	"validating",
+	"replaying",
+	"evaluating",
+	"awaiting-canary-approval",
+	"trialing",
+	"awaiting-decision",
+	"completed",
+];
 const SECTION_NAMES = ["当前思考", "工具调用", "阶段成果"] as const;
 
 async function readOptional(path: string, maxCharacters = 40_000): Promise<string | undefined> {
@@ -66,7 +80,13 @@ function phaseLabel(status: EvolutionRunStatus): string {
 		researching: "研究问题并制定实验计划",
 		planned: "研究计划已冻结",
 		building: "构建候选改进",
+		validating: "执行确定性验证",
+		replaying: "回放历史任务",
 		evaluating: "评估候选效果",
+		"awaiting-evidence": "等待更多实验数据",
+		"awaiting-canary-approval": "等待用户确认 Canary",
+		trialing: "Canary 试运行中",
+		"awaiting-decision": "等待最终决定",
 		paused: "已暂停",
 		completed: "已完成",
 		failed: "执行失败",
@@ -99,17 +119,20 @@ function currentActivity(events: TranscriptEvent[], status: EvolutionRunStatus):
 }
 
 function stageProgress(theme: Theme, status: EvolutionRunStatus): string {
-	const current = PHASE_ORDER.indexOf(status);
+	const current = status === "awaiting-evidence" ? 7 : PHASE_ORDER.indexOf(status);
 	const stages = [
 		{ threshold: 1, label: "研究" },
 		{ threshold: 3, label: "构建" },
-		{ threshold: 4, label: "评估" },
-		{ threshold: 5, label: "完成" },
+		{ threshold: 4, label: "验证" },
+		{ threshold: 5, label: "回放" },
+		{ threshold: 6, label: "评估" },
+		{ threshold: 8, label: "Canary" },
+		{ threshold: 10, label: "完成" },
 	];
 	return stages
 		.map((stage) => {
 			if (status === "failed" || status === "cancelled") return theme.fg("muted", `○ ${stage.label}`);
-			if (current > stage.threshold) return theme.fg("success", `● ${stage.label}`);
+			if (status === "completed" || current > stage.threshold) return theme.fg("success", `● ${stage.label}`);
 			if (current === stage.threshold || (stage.threshold === 1 && status === "planned")) {
 				return theme.fg("accent", `◆ ${stage.label}`);
 			}
@@ -154,6 +177,7 @@ export class EvolutionProcessInspector implements Component {
 	private run?: EvolutionRun;
 	private events: TranscriptEvent[] = [];
 	private artifacts: RunArtifacts = {};
+	private proposal?: Proposal;
 	private mode: "tasks" | "run";
 	private taskIndex = 0;
 	private sectionIndex = 0;
@@ -163,14 +187,25 @@ export class EvolutionProcessInspector implements Component {
 	private readonly theme: Theme;
 	private readonly paths: EvoPaths;
 	private readonly close: () => void;
+	private readonly approveCanary: (runId: string) => Promise<void>;
+	private approving = false;
+	private approvalError?: string;
 	private runId?: string;
 
-	constructor(tui: TUI, theme: Theme, paths: EvoPaths, runId: string | undefined, close: () => void) {
+	constructor(
+		tui: TUI,
+		theme: Theme,
+		paths: EvoPaths,
+		runId: string | undefined,
+		close: () => void,
+		approveCanary: (runId: string) => Promise<void>,
+	) {
 		this.tui = tui;
 		this.theme = theme;
 		this.paths = paths;
 		this.runId = runId;
 		this.close = close;
+		this.approveCanary = approveCanary;
 		this.mode = runId ? "run" : "tasks";
 		void this.refresh();
 		this.timer = setInterval(() => void this.refresh(), 250);
@@ -184,13 +219,26 @@ export class EvolutionProcessInspector implements Component {
 			if (this.mode === "run" && this.runId) {
 				this.run = await readEvolutionRun(this.paths, this.runId);
 				const directory = evolutionRunDirectory(this.paths, this.runId);
-				[this.events, this.artifacts.plan, this.artifacts.experiment, this.artifacts.evaluation] =
-					await Promise.all([
-						readTranscript(this.paths, this.runId),
-						readOptional(join(directory, "plan.md")),
-						readOptional(join(directory, "experiment.json")),
-						readOptional(join(directory, "evaluation.md")),
-					]);
+				[
+					this.events,
+					this.artifacts.plan,
+					this.artifacts.experiment,
+					this.artifacts.validation,
+					this.artifacts.evaluation,
+					this.proposal,
+				] = await Promise.all([
+					readTranscript(this.paths, this.runId),
+					readOptional(join(directory, "plan.md")),
+					readOptional(join(directory, "experiment.json")),
+					readOptional(join(directory, "validation.md")),
+					readOptional(join(directory, "evaluation.md")),
+					this.run.proposalId ? loadProposal(this.paths, this.run.proposalId) : Promise.resolve(undefined),
+				]);
+				if (!this.artifacts.evaluation && this.proposal?.artifacts.review) {
+					this.artifacts.evaluation = await readOptional(
+						join(this.paths.proposals, this.proposal.id, this.proposal.artifacts.review.file),
+					);
+				}
 			}
 			this.tui.requestRender();
 		} catch (error) {
@@ -238,9 +286,59 @@ export class EvolutionProcessInspector implements Component {
 		return `${marker} ${expanded} ${this.theme.bold(SECTION_NAMES[index] ?? "详情")}  ${this.theme.fg("muted", summary)}`;
 	}
 
+	private canaryLines(run: EvolutionRun): string[] {
+		const proposal = this.proposal;
+		const metadataMatches =
+			proposal !== undefined &&
+			proposal.status === "pending" &&
+			proposal.parentBundleDigest === run.canaryParentDigest &&
+			proposal.candidateDigest === run.canaryCandidateDigest &&
+			proposal.targetAbi === run.canaryTargetAbi;
+		const evaluation = this.artifacts.evaluation?.trim() ?? "没有评估报告";
+		const validation = this.artifacts.validation?.trim() ?? "没有可执行验证报告";
+		const diff = proposal?.diff.trim() ?? "没有可审阅 diff";
+		return [
+			this.theme.fg("accent", this.theme.bold("Evo Component Canary 审批")),
+			"",
+			`${this.theme.bold("目标")}  ${run.request ?? "定时演化"}`,
+			`${this.theme.bold("提案")}  ${proposal?.id ?? run.proposalId ?? "unknown"} · revision ${proposal?.revision ?? "?"}`,
+			`${this.theme.bold("当前 bundle")}  ${run.canaryParentDigest ?? "unknown"}`,
+			`${this.theme.bold("候选 bundle")}  ${run.canaryCandidateDigest ?? "unknown"}`,
+			`${this.theme.bold("ABI")}  ${run.canaryTargetAbi ?? "unknown"}`,
+			`${this.theme.bold("Diff digest")}  ${proposal?.diffDigest ?? "unknown"}`,
+			`${this.theme.bold("Changed paths")}  ${proposal?.changedPaths.join(", ") || "unknown"}`,
+			"",
+			this.theme.fg("warning", this.theme.bold("风险")),
+			proposal?.risk ?? "unknown",
+			"",
+			this.theme.bold("Canary 与回滚计划"),
+			proposal?.trialPlan ?? "unknown",
+			`回滚将恢复 parent bundle：${run.canaryParentDigest ?? "unknown"}`,
+			"",
+			this.theme.bold("可执行验证"),
+			...validation.split("\n"),
+			"",
+			this.theme.bold("独立评估"),
+			...evaluation.split("\n"),
+			"",
+			this.theme.bold("Exact diff"),
+			...diff.split("\n"),
+			"",
+			...(this.approvalError ? [this.theme.fg("error", this.approvalError), ""] : []),
+			metadataMatches
+				? this.theme.fg(
+						"accent",
+						this.approving ? "正在启动 Canary……" : "按 Enter 同意以上精确候选并启动可回滚 Canary",
+					)
+				: this.theme.fg("error", "审批已禁用：运行记录与当前提案不一致"),
+			this.theme.fg("dim", "↑↓ 滚动 • Home/End 跳转 • Enter 审批 • Esc 返回任务列表"),
+		];
+	}
+
 	private runLines(): string[] {
 		const run = this.run;
 		if (!run) return [this.theme.fg("warning", "正在连接后台任务……")];
+		if (run.status === "awaiting-canary-approval") return this.canaryLines(run);
 		const thinking = thinkingText(this.events);
 		const tools = toolEvents(this.events);
 		const outcomes = [
@@ -259,8 +357,8 @@ export class EvolutionProcessInspector implements Component {
 			"",
 			`${this.theme.bold("当前活动")}  ${currentActivity(this.events, run.status)}`,
 			"",
-			this.sectionHeader(0, thinking ? `${thinking.length} 字符` : "尚无输出"),
 		];
+		lines.push(this.sectionHeader(0, thinking ? `${thinking.length} 字符` : "尚无输出"));
 		if (this.expandedSection === 0) {
 			lines.push(
 				"",
@@ -358,6 +456,39 @@ export class EvolutionProcessInspector implements Component {
 				}
 			}
 		} else {
+			if (this.run?.status === "awaiting-canary-approval") {
+				if (matchesKey(data, Key.up)) this.scrollFromBottom++;
+				else if (matchesKey(data, Key.down)) this.scrollFromBottom = Math.max(0, this.scrollFromBottom - 1);
+				else if (matchesKey(data, Key.home)) this.scrollFromBottom = Number.MAX_SAFE_INTEGER;
+				else if (matchesKey(data, Key.end)) this.scrollFromBottom = 0;
+				else if (matchesKey(data, Key.enter) && !this.approving) {
+					const proposal = this.proposal;
+					if (
+						!proposal ||
+						proposal.status !== "pending" ||
+						proposal.parentBundleDigest !== this.run.canaryParentDigest ||
+						proposal.candidateDigest !== this.run.canaryCandidateDigest ||
+						proposal.targetAbi !== this.run.canaryTargetAbi
+					) {
+						this.approvalError = "运行记录与当前提案不一致";
+						this.tui.requestRender();
+						return;
+					}
+					this.approving = true;
+					this.approvalError = undefined;
+					void this.approveCanary(this.run.id)
+						.then(() => this.refresh())
+						.catch((error) => {
+							this.approvalError = error instanceof Error ? error.message : String(error);
+						})
+						.finally(() => {
+							this.approving = false;
+							this.tui.requestRender();
+						});
+				}
+				this.tui.requestRender();
+				return;
+			}
 			if (matchesKey(data, Key.up)) this.sectionIndex = Math.max(0, this.sectionIndex - 1);
 			else if (matchesKey(data, Key.down))
 				this.sectionIndex = Math.min(SECTION_NAMES.length - 1, this.sectionIndex + 1);

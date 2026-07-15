@@ -109,7 +109,7 @@ export async function readBundlePreferenceMemory(bundle: CompiledBundle): Promis
 	return parsePreferenceMemory(JSON.parse(await readFile(join(bundle.directory, PREFERENCES_PATH), "utf8")));
 }
 
-export function renderPreferenceInstructions(memory: PreferenceMemory): string {
+function renderPreferenceInstructions(memory: PreferenceMemory): string {
 	if (memory.preferences.length === 0) return "";
 	return [
 		"## Durable user preferences",

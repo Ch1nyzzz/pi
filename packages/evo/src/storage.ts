@@ -258,14 +258,20 @@ async function removeStaleLock(lockPath: string, staleAfterMs: number): Promise<
 		});
 		if (ownerStat) existingOwners.push({ ownerPath, mtimeMs: ownerStat.mtimeMs });
 	}
-	if (existingOwners.some(({ mtimeMs }) => Date.now() - mtimeMs <= staleAfterMs)) return false;
+	// An owner whose process is verifiably dead makes the lock reclaimable after a
+	// short heartbeat grace window. The full staleAfterMs window applies only to
+	// owners that still have a live process (e.g. paused with SIGSTOP), so a
+	// kill -9 never wedges the lock for the whole stale window.
+	const deadOwnerGraceMs = Math.min(staleAfterMs, 60_000);
 	for (const { ownerPath, mtimeMs } of existingOwners) {
+		// A live owner process is never reclaimed, regardless of mtime age.
 		if (await hasLiveOwnerProcess(ownerPath)) return false;
 		const current = await stat(ownerPath).catch((error: unknown) => {
 			if (getErrorCode(error) === "ENOENT") return undefined;
 			throw error;
 		});
-		if (current && (current.mtimeMs !== mtimeMs || Date.now() - current.mtimeMs <= staleAfterMs)) return false;
+		// A refreshed mtime means the heartbeat still runs despite the PID probe.
+		if (current && (current.mtimeMs !== mtimeMs || Date.now() - current.mtimeMs <= deadOwnerGraceMs)) return false;
 	}
 	for (const { ownerPath } of existingOwners) {
 		await unlink(ownerPath).catch((error: unknown) => {

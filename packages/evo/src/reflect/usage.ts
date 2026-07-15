@@ -4,7 +4,7 @@ import type { EvoPaths } from "../paths.ts";
 import { appendJsonLine, truncateIncompleteFinalLine, withFileLock } from "../storage.ts";
 import type { ModelRunResult } from "./model-runner.ts";
 
-export const MODEL_USAGE_PHASES = [
+const MODEL_USAGE_PHASES = [
 	"reflector",
 	"research-plan",
 	"builder",

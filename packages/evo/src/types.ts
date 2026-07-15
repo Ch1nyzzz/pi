@@ -1,6 +1,3 @@
-export const BUNDLE_SCHEMA_VERSION = 1;
-export const POLICY_SCHEMA_VERSION = 1;
-export const PROPOSAL_SCHEMA_VERSION = 2;
 export const RECORDER_SCHEMA_VERSION = 1;
 
 export type ProposalKind = "data" | "code";
@@ -266,16 +263,63 @@ export interface EvoStatus {
 	paused: boolean;
 }
 
-export type EvolutionRunActiveStatus = "queued" | "researching" | "planned" | "building" | "evaluating";
-export type EvolutionRunStatus = EvolutionRunActiveStatus | "paused" | "completed" | "failed" | "cancelled";
+export type EvolutionRunActiveStatus =
+	| "queued"
+	| "researching"
+	| "planned"
+	| "building"
+	| "validating"
+	| "replaying"
+	| "evaluating";
+export type EvolutionRunStatus =
+	| EvolutionRunActiveStatus
+	| "awaiting-evidence"
+	| "awaiting-canary-approval"
+	| "trialing"
+	| "awaiting-decision"
+	| "paused"
+	| "completed"
+	| "failed"
+	| "cancelled";
+
+export type EvoCheckProfile =
+	| "bundle-compile"
+	| "repo-check"
+	| "related-tests"
+	| "paired-replay"
+	| "session-comparison"
+	| "compaction-replay";
+
+export type EvoPatchClass = "pure-transform" | "component" | "routing" | "prompt" | "tool" | "infrastructure";
+
+export interface EvoEvidenceStrategy {
+	patchClass: EvoPatchClass;
+	offline:
+		| {
+				mode: "required";
+				profiles: Array<Extract<EvoCheckProfile, "bundle-compile" | "repo-check" | "related-tests">>;
+		  }
+		| { mode: "not-applicable"; reason: string };
+	historicalReplay:
+		| {
+				mode: "required";
+				profiles: Array<Extract<EvoCheckProfile, "paired-replay" | "session-comparison" | "compaction-replay">>;
+				datasets: string[];
+				minimumSamples: number;
+		  }
+		| { mode: "optional" | "not-applicable"; reason: string };
+	online: { mode: "none" } | { mode: "shadow" | "canary"; minimumSamples: number; maximumDuration: string };
+	rollout: "direct" | "shadow-first" | "canary-first";
+}
 
 export interface EvoExperimentSpec {
 	baseline: string;
 	hypothesis: string;
-	checkProfiles: Array<
-		"bundle-compile" | "repo-check" | "related-tests" | "paired-replay" | "session-comparison" | "compaction-replay"
-	>;
+	checkProfiles: EvoCheckProfile[];
+	evidenceStrategy: EvoEvidenceStrategy;
 	metrics: string[];
+	/** Pre-registered decision metric; required whenever the plan declares a trial. */
+	primaryMetric?: string;
 	minimumEffect: Record<string, number>;
 	trialPlan: string;
 	rollbackConditions: string[];
@@ -319,6 +363,15 @@ export interface EvolutionRun {
 	logFile?: string;
 	pausedAt?: string;
 	pausedFrom?: EvolutionRunActiveStatus;
+	canaryApprovedAt?: string;
+	canaryApprovalDigest?: string;
+	canaryStableDigest?: string;
+	canaryCandidateDigest?: string;
+	canaryParentDigest?: string;
+	canaryTargetAbi?: string;
+	experimentDigest?: string;
+	retryOfRunId?: string;
+	sourceProposalId?: string;
 }
 
 export interface EvoRoleModelConfig {

@@ -38,7 +38,7 @@ async function writeExclusive(path: string, content: string | Uint8Array, mode: 
 	}
 }
 
-export function componentArtifactDirectory(paths: EvoPaths, digest: string): string {
+function componentArtifactDirectory(paths: EvoPaths, digest: string): string {
 	if (!isDigest(digest)) throw new Error(`Invalid component artifact digest: ${digest}`);
 	return join(paths.components, digest);
 }

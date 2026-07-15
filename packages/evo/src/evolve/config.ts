@@ -8,7 +8,7 @@ import type { EvoControlConfig, EvoRoleModelConfig } from "../types.ts";
 const DEFAULT_WORKFLOW_URL = new URL("../prompts/evolution-workflow.md", import.meta.url);
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
-export const DEFAULT_EVO_CONTROL_CONFIG: Readonly<EvoControlConfig> = {
+const DEFAULT_EVO_CONTROL_CONFIG: Readonly<EvoControlConfig> = {
 	schemaVersion: 1,
 	models: {
 		researchPlanner: { model: "openai-codex/gpt-5.6-sol", thinkingLevel: "max" },
@@ -50,7 +50,7 @@ function parseRole(value: unknown, label: string): EvoRoleModelConfig {
 	};
 }
 
-export function parseEvoControlConfig(value: unknown): EvoControlConfig {
+function parseEvoControlConfig(value: unknown): EvoControlConfig {
 	const config = asRecord(value, "Evo control config");
 	exactKeys(config, ["schemaVersion", "models", "release"], "Evo control config");
 	if (config.schemaVersion !== 1) throw new Error("Evo control config schemaVersion must be 1");

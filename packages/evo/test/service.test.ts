@@ -43,7 +43,11 @@ class FakeRetrospectiveRunner implements ModelRunner {
 	async run(request: ModelRunRequest): Promise<ModelRunResult> {
 		this.requests.push(request);
 		return {
-			text: "# Trial retrospective\n\nThe trial should be kept.",
+			text: "",
+			submission: {
+				recommendation: "keep",
+				retrospectiveMarkdown: "# Trial retrospective\n\nThe trial should be kept.",
+			},
 			model: { provider: "fake", id: "retrospective" },
 			stats: {
 				sessionFile: undefined,

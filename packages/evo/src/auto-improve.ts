@@ -1,8 +1,14 @@
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { refreshEvoStatusIndicator } from "./cli.ts";
-import { buildTrialComparison } from "./comparison.ts";
+import {
+	buildTrialComparison,
+	evaluateTrialContractGate,
+	parseTrialDurationDays,
+	primaryMetricRegression,
+} from "./comparison.ts";
 import { readEvoControlConfig } from "./evolve/config.ts";
 import { runEvolutionCycle } from "./evolve/cycle.ts";
+import { readFrozenExperimentForProposal } from "./evolve/run.ts";
 import { type EvoPaths, getEvoPaths } from "./paths.ts";
 import { createPiModelRunner, type ModelRunner } from "./reflect/model-runner.ts";
 import { runRetrospective, type TrialRecommendation } from "./reflect/retrospective.ts";
@@ -104,16 +110,52 @@ export function createEvoAutoImproveExtension(options: EvoAutoImproveExtensionOp
 						const proposal = await service.getProposal(status.trial.proposalId);
 						const schedule = await readScheduleConfig(paths);
 						const comparison = await buildTrialComparison(paths, proposal, status.trial);
-						const dueAt = Date.parse(status.trial.startedAt) + schedule.trialDueAfterDays * 24 * 60 * 60 * 1_000;
-						const due =
-							now().getTime() >= dueAt || comparison.after.totals.sessions >= schedule.trialDueAfterSessions;
+						// The frozen experiment contract bounds the trial: its maximumDuration
+						// caps the schedule window and its minimumSamples raises the session bar.
+						const experiment = await readFrozenExperimentForProposal(paths, status.trial.proposalId);
+						const online = experiment?.evidenceStrategy.online;
+						const contractDays =
+							online && online.mode !== "none" ? parseTrialDurationDays(online.maximumDuration) : undefined;
+						const contractSamples = online && online.mode !== "none" ? online.minimumSamples : 0;
+						const dueAfterDays =
+							contractDays === undefined
+								? schedule.trialDueAfterDays
+								: Math.min(schedule.trialDueAfterDays, contractDays);
+						const dueAfterSessions = Math.max(schedule.trialDueAfterSessions, contractSamples);
+						const dueAt = Date.parse(status.trial.startedAt) + dueAfterDays * 24 * 60 * 60 * 1_000;
+						const due = now().getTime() >= dueAt || comparison.after.totals.sessions >= dueAfterSessions;
 						if (due) {
 							const result = await retrospect();
 							notifiedFailure = false;
 							const config = await readEvoControlConfig(paths);
+							// Machine rollback trigger: a measured regression of the frozen
+							// primary metric outranks any model recommendation.
+							const regression = primaryMetricRegression(experiment, comparison);
+							if (regression) {
+								await service.rollback(undefined, `Automatic rollback: ${regression}`);
+								ctx.ui.notify(
+									`Evo-Pi automatically rolled back trial ${result.proposal.id}: ${regression}`,
+									"warning",
+								);
+								await refreshEvoStatusIndicator({ service, paths }, ctx, now);
+								return;
+							}
 							if (config.release.autoKeepSuccessfulTrial && result.recommendation === "keep") {
-								await service.keep("Automatic keep after evidence-bound retrospective recommendation");
-								ctx.ui.notify(`Evo-Pi automatically kept trial ${result.proposal.id}`, "info");
+								// The model's keep is a veto-capable opinion; the deterministic
+								// contract gate decides whether an automatic keep is allowed.
+								const gate = evaluateTrialContractGate(experiment, comparison);
+								if (gate.allowed) {
+									await service.keep(
+										"Automatic keep: retrospective recommendation and frozen contract gate both passed",
+									);
+									ctx.ui.notify(`Evo-Pi automatically kept trial ${result.proposal.id}`, "info");
+									await refreshEvoStatusIndicator({ service, paths }, ctx, now);
+									return;
+								}
+								ctx.ui.notify(
+									`Evo-Pi left trial ${result.proposal.id} open for review: ${gate.reasons.join("; ")}`,
+									"info",
+								);
 								await refreshEvoStatusIndicator({ service, paths }, ctx, now);
 								return;
 							}

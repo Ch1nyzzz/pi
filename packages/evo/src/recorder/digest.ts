@@ -55,7 +55,7 @@ function emptyUsage(): UsageSummary {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 };
 }
 
-export function createSessionDigest(events: readonly RecordedEvent[]): SessionDigest | undefined {
+function createSessionDigest(events: readonly RecordedEvent[]): SessionDigest | undefined {
 	const first = events[0];
 	const last = events.at(-1);
 	if (!first || !last) return undefined;

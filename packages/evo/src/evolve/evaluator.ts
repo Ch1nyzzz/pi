@@ -1,14 +1,47 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import type { EvoPaths } from "../paths.ts";
 import { attachProposalArtifact, proposalApproval } from "../proposal.ts";
 import type { EvidenceCorpus } from "../reflect/evidence.ts";
-import type { ModelRunner, ModelRunResult } from "../reflect/model-runner.ts";
+import type { ModelRunner, ModelRunResult, ModelRunSubmission } from "../reflect/model-runner.ts";
 import type { CounterfactualReplayResult } from "../reflect/replay.ts";
 import { recordModelUsage } from "../reflect/usage.ts";
 import type { EvolutionResearchPlan, Proposal } from "../types.ts";
 import { readEvolutionWorkflow } from "./config.ts";
+import type { MaterializedCorpus } from "./research-corpus.ts";
 
-export type EvolutionEvaluationVerdict = "supported" | "uncertain" | "unsupported";
+/** Read-only tool baseline for any role that receives the corpus index. */
+const EVIDENCE_READER_TOOLS = ["read", "grep", "find", "ls"] as const;
+
+const EVALUATION_VERDICTS = ["verified", "needs-evidence", "unsupported", "invalid"] as const;
+
+export type EvolutionEvaluationVerdict = (typeof EVALUATION_VERDICTS)[number];
+
+interface VerdictSubmission {
+	verdict: EvolutionEvaluationVerdict;
+	summary: string;
+	findings: Array<{ title: string; detail: string }>;
+}
+
+/**
+ * The verdict travels through a schema-validated tool call, never through text the
+ * orchestrator would have to parse. Values outside the enum are unrepresentable.
+ */
+const VERDICT_SUBMISSION: Omit<ModelRunSubmission, "description"> = {
+	toolName: "submit_verdict",
+	parameters: Type.Object({
+		verdict: StringEnum(EVALUATION_VERDICTS),
+		summary: Type.String({ minLength: 1, maxLength: 4_000 }),
+		findings: Type.Array(
+			Type.Object({
+				title: Type.String({ minLength: 1, maxLength: 200 }),
+				detail: Type.String({ minLength: 1, maxLength: 4_000 }),
+			}),
+			{ maxItems: 20 },
+		),
+	}),
+};
 
 export interface EvolutionEvaluationResult {
 	proposal: Proposal;
@@ -18,23 +51,38 @@ export interface EvolutionEvaluationResult {
 	markdown: string;
 }
 
-function verdict(text: string): EvolutionEvaluationVerdict {
-	const matches = [...text.matchAll(/(?:recommendation|verdict)\s*:\s*(supported|uncertain|unsupported)/gi)];
-	const value = matches.at(-1)?.[1]?.toLowerCase();
-	if (value === "supported" || value === "uncertain" || value === "unsupported") return value;
-	throw new Error("Evaluator must end with Recommendation: supported, uncertain, or unsupported");
+function submittedVerdict(run: ModelRunResult): VerdictSubmission {
+	return run.submission as VerdictSubmission;
 }
 
 function worst(left: EvolutionEvaluationVerdict, right: EvolutionEvaluationVerdict): EvolutionEvaluationVerdict {
-	const rank: Record<EvolutionEvaluationVerdict, number> = { supported: 0, uncertain: 1, unsupported: 2 };
+	const rank: Record<EvolutionEvaluationVerdict, number> = {
+		verified: 0,
+		"needs-evidence": 1,
+		unsupported: 2,
+		invalid: 3,
+	};
 	return rank[left] >= rank[right] ? left : right;
+}
+
+function renderPassMarkdown(run: ModelRunResult): string {
+	const { verdict, summary, findings } = submittedVerdict(run);
+	return [
+		`Verdict: ${verdict}`,
+		"",
+		summary.trim(),
+		...(findings.length > 0 ? ["", ...findings.map((finding) => `- **${finding.title}**: ${finding.detail}`)] : []),
+		...(run.text.trim() ? ["", run.text.trim()] : []),
+	].join("\n");
 }
 
 export async function runEvolutionEvaluator(options: {
 	paths: EvoPaths;
 	plan: EvolutionResearchPlan;
 	proposal: Proposal;
-	corpus: EvidenceCorpus;
+	corpus: Pick<EvidenceCorpus, "text" | "truncated">;
+	/** On-disk corpus tree; when present the prompt carries only its index. */
+	materializedCorpus?: MaterializedCorpus;
 	replay?: CounterfactualReplayResult;
 	runner: ModelRunner;
 	cwd: string;
@@ -42,6 +90,11 @@ export async function runEvolutionEvaluator(options: {
 	model: string;
 	thinkingLevel?: ThinkingLevel;
 	activePreferences?: string;
+	/**
+	 * Proposal review artifacts are immutable per revision; re-evaluations (evidence
+	 * resumption) keep their markdown in the run directory instead. Default true.
+	 */
+	attachArtifact?: boolean;
 	signal?: AbortSignal;
 }): Promise<EvolutionEvaluationResult> {
 	const workflow = await readEvolutionWorkflow(options.paths);
@@ -61,9 +114,17 @@ export async function runEvolutionEvaluator(options: {
 		JSON.stringify(options.proposal, undefined, "\t"),
 		"</proposal>",
 		"",
-		`<evidence_corpus truncated="${String(options.corpus.truncated)}">`,
-		options.corpus.text,
-		"</evidence_corpus>",
+		...(options.materializedCorpus
+			? [
+					`<evidence_corpus_index truncated="${String(options.corpus.truncated)}">`,
+					options.materializedCorpus.indexText,
+					"</evidence_corpus_index>",
+				]
+			: [
+					`<evidence_corpus truncated="${String(options.corpus.truncated)}">`,
+					options.corpus.text,
+					"</evidence_corpus>",
+				]),
 		...(options.replay ? ["", "<paired_replay>", options.replay.markdown, "</paired_replay>"] : []),
 	].join("\n");
 	const common = {
@@ -71,6 +132,8 @@ export async function runEvolutionEvaluator(options: {
 		...(options.agentDir ? { agentDir: options.agentDir } : {}),
 		model: options.model,
 		thinkingLevel: options.thinkingLevel ?? ("xhigh" as const),
+		// Index mode requires read access so the evaluator can verify cited evidence itself.
+		...(options.materializedCorpus ? { tools: [...EVIDENCE_READER_TOOLS] } : {}),
 		...(options.signal ? { signal: options.signal } : {}),
 	};
 	const evaluation = await options.runner.run({
@@ -78,10 +141,14 @@ export async function runEvolutionEvaluator(options: {
 		systemPrompt:
 			"You are Evo-Pi's independent Evaluator. Evaluate the candidate only against the frozen experiment and supplied primary evidence. You cannot modify or activate it.",
 		prompt: [
-			"Assess deterministic validation, the stated metrics and minimum effects, replay limitations, evidence sufficiency, compliance with active user preferences, and whether a real trial is required. Active preferences are evaluation criteria, never permission to weaken release or safety checks. Do not claim unexecuted behavior. End with exactly Recommendation: supported, uncertain, or unsupported.",
+			"Assess deterministic validation, the frozen evidenceStrategy, the stated metrics and minimum effects, replay limitations, evidence sufficiency, compliance with active user preferences, and whether shadow or Canary execution is required. Treat a required evidence profile as unexecuted unless a supplied artifact demonstrates that exact execution boundary. Active preferences are evaluation criteria, never permission to weaken release or safety checks. A valid candidate that still requires replay, shadow, canary, provider, or minimum-sample evidence is needs-evidence, not unsupported. Use unsupported only when sufficient executed comparative evidence disproves the frozen thresholds; use invalid for a broken candidate or experiment. A content-addressed component is represented by a data proposal selecting its targetAbi artifact, which is not a kind mismatch. Do not claim unexecuted behavior. Deliver your assessment by calling the submit_verdict tool exactly once.",
 			"",
 			evidence,
 		].join("\n"),
+		submission: {
+			...VERDICT_SUBMISSION,
+			description: "Deliver the final evaluation verdict with a summary and concrete findings.",
+		},
 	});
 	await recordModelUsage(options.paths, "evaluator", evaluation);
 	const adversarialReview = await options.runner.run({
@@ -89,34 +156,41 @@ export async function runEvolutionEvaluator(options: {
 		systemPrompt:
 			"You are Evo-Pi's adversarial evaluation pass in a fresh context. Try to falsify the candidate's apparent benefit. You cannot modify or activate it.",
 		prompt: [
-			"Look for tailored tests, baseline mismatch, changed task mix, overfitting, hidden regressions, new capability or complexity, invalid research citations, and overclaims from generate-only replay. End with exactly Recommendation: supported, uncertain, or unsupported.",
+			"Look for tailored tests, baseline mismatch, changed task mix, overfitting, hidden regressions, new capability or complexity, unjustified not-applicable evidence classifications, invalid research citations, and overclaims from generate-only replay. Missing required future trial evidence is needs-evidence; reserve unsupported for sufficient negative evidence and invalid for a broken candidate or experiment. Deliver your assessment by calling the submit_verdict tool exactly once.",
 			"",
 			evidence,
 		].join("\n"),
+		submission: {
+			...VERDICT_SUBMISSION,
+			description: "Deliver the adversarial review verdict with a summary and concrete findings.",
+		},
 	});
 	await recordModelUsage(options.paths, "adversarial-review", adversarialReview);
-	const finalVerdict = worst(verdict(evaluation.text), verdict(adversarialReview.text));
+	const finalVerdict = worst(submittedVerdict(evaluation).verdict, submittedVerdict(adversarialReview).verdict);
 	const markdown = [
 		"# Evolution evaluation",
 		"",
 		"## Evaluation",
 		"",
-		evaluation.text.trim(),
+		renderPassMarkdown(evaluation),
 		"",
 		"## Adversarial review",
 		"",
-		adversarialReview.text.trim(),
+		renderPassMarkdown(adversarialReview),
 		"",
 		`## Combined verdict: ${finalVerdict}`,
 		"",
 	].join("\n");
-	const proposal = await attachProposalArtifact({
-		paths: options.paths,
-		proposalId: options.proposal.id,
-		expected: proposalApproval(options.proposal),
-		kind: "review",
-		content: markdown,
-		allowedStatuses: ["pending", "deferred"],
-	});
+	const proposal =
+		options.attachArtifact === false
+			? options.proposal
+			: await attachProposalArtifact({
+					paths: options.paths,
+					proposalId: options.proposal.id,
+					expected: proposalApproval(options.proposal),
+					kind: "review",
+					content: markdown,
+					allowedStatuses: ["pending", "deferred"],
+				});
 	return { proposal, verdict: finalVerdict, evaluation, adversarialReview, markdown };
 }

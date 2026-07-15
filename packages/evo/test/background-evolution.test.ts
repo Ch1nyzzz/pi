@@ -119,11 +119,42 @@ describe("background evolution tasks", () => {
 		);
 		const tui = { terminal: { rows: 30 }, requestRender: () => {} };
 		const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
-		const inspector = new EvolutionProcessInspector(tui as never, theme as never, paths, run.id, () => {});
+		const inspector = new EvolutionProcessInspector(
+			tui as never,
+			theme as never,
+			paths,
+			run.id,
+			() => {},
+			async () => {},
+		);
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		expect(inspector.render(100).join("\n")).toContain("candidate plan");
 		inspector.handleInput("\r");
 		expect(inspector.render(100).join("\n")).toContain("checking evidence");
+		inspector.dispose();
+	});
+
+	it("disables Canary approval when run metadata has no exact proposal", async () => {
+		const { paths, run } = await fixture();
+		await updateEvolutionRun(paths, run.id, { status: "awaiting-canary-approval" });
+		const tui = { terminal: { rows: 30 }, requestRender: () => {} };
+		const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+		let approvedRun: string | undefined;
+		const inspector = new EvolutionProcessInspector(
+			tui as never,
+			theme as never,
+			paths,
+			run.id,
+			() => {},
+			async (runId) => {
+				approvedRun = runId;
+			},
+		);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(inspector.render(100).join("\n")).toContain("审批已禁用");
+		inspector.handleInput("\r");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(approvedRun).toBeUndefined();
 		inspector.dispose();
 	});
 

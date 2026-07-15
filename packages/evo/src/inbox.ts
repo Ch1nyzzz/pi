@@ -66,7 +66,7 @@ function lifecycleKind(kind: RecorderInboxKind): InboxKind {
 	return kind === "candidate" ? "unclassified" : kind;
 }
 
-export function parseRecorderInboxEntry(value: unknown, file: string): RecorderInboxEntry {
+function parseRecorderInboxEntry(value: unknown, file: string): RecorderInboxEntry {
 	assertFileName(file);
 	if (!isRecord(value)) throw new Error(`Inbox entry is invalid: ${file}`);
 	if (

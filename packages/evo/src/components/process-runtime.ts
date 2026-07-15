@@ -52,6 +52,38 @@ function parseResponse(value: string): ProcessResponse {
 	return response as unknown as ProcessResponse;
 }
 
+export async function canUseEvoComponentSandbox(): Promise<boolean> {
+	if (process.platform !== "linux") return false;
+	return new Promise((resolve) => {
+		const child = spawn(
+			"bwrap",
+			[
+				"--die-with-parent",
+				"--new-session",
+				"--unshare-net",
+				"--unshare-pid",
+				"--unshare-ipc",
+				"--unshare-uts",
+				"--proc",
+				"/proc",
+				"--dev",
+				"/dev",
+				"--ro-bind",
+				"/usr",
+				"/usr",
+				"--ro-bind",
+				"/bin",
+				"/bin",
+				"--",
+				"/bin/true",
+			],
+			{ stdio: "ignore" },
+		);
+		child.once("error", () => resolve(false));
+		child.once("close", (code) => resolve(code === 0));
+	});
+}
+
 function sandboxCommand(artifact: LoadedEvoComponentArtifact): {
 	command: string;
 	args: string[];

@@ -4,6 +4,7 @@ import { access, appendFile, open, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { EvoPaths } from "../paths.ts";
+import { loadProposal } from "../proposal.ts";
 import { createPiModelRunner } from "../reflect/model-runner.ts";
 import type { EvolutionRun, EvolutionRunActiveStatus } from "../types.ts";
 import { runEvolutionCycle } from "./cycle.ts";
@@ -16,7 +17,16 @@ import {
 	updateEvolutionRun,
 } from "./run.ts";
 
-const ACTIVE_STATUSES = new Set<EvolutionRun["status"]>(["queued", "researching", "planned", "building", "evaluating"]);
+const ACTIVE_STATUSES = new Set<EvolutionRun["status"]>([
+	"queued",
+	"researching",
+	"planned",
+	"building",
+	"validating",
+	"replaying",
+	"evaluating",
+]);
+const TERMINAL_STATUSES = new Set<EvolutionRun["status"]>(["completed", "failed", "cancelled"]);
 
 function workerEntrypoint(): string {
 	return fileURLToPath(new URL("../../dist/bin.js", import.meta.url));
@@ -41,6 +51,15 @@ export async function startBackgroundEvolution(options: {
 	cwd: string;
 	request?: string;
 }): Promise<EvolutionRun> {
+	// Single-writer semantics: a second trigger fails fast instead of queueing
+	// behind the evolution-cycle lock for up to a day.
+	const existing = await inspectBackgroundEvolutions(options.paths);
+	const active = existing.find((run) => ACTIVE_STATUSES.has(run.status) || run.status === "paused");
+	if (active) {
+		throw new Error(
+			`Evolution run ${active.id} is already ${active.status}; wait for it or remove it before starting another`,
+		);
+	}
 	const run = await createEvolutionRun({
 		paths: options.paths,
 		trigger: options.request ? "request" : "scheduled",
@@ -200,6 +219,14 @@ export async function inspectBackgroundEvolutions(paths: EvoPaths): Promise<Evol
 	for (const run of runs) {
 		if ((ACTIVE_STATUSES.has(run.status) || run.status === "paused") && run.workerPid) {
 			if (!(await processMatchesRun(run.workerPid, run.id))) {
+				// A release intent means the crash happened after the release policy may
+				// already have taken effect; reconcile from the proposal instead of
+				// declaring a possibly-successful run failed.
+				const reconciled = await reconcileRunFromReleaseIntent(paths, run);
+				if (reconciled) {
+					await updateEvolutionRun(paths, run.id, { workerPid: undefined });
+					continue;
+				}
 				await updateEvolutionRun(paths, run.id, {
 					status: "failed",
 					error: "Background worker exited without completing the run",
@@ -209,6 +236,33 @@ export async function inspectBackgroundEvolutions(paths: EvoPaths): Promise<Evol
 		}
 	}
 	return listEvolutionRuns(paths);
+}
+
+async function reconcileRunFromReleaseIntent(paths: EvoPaths, run: EvolutionRun): Promise<boolean> {
+	if (!run.proposalId) return false;
+	try {
+		await access(join(evolutionRunDirectory(paths, run.id), "release-intent.json"));
+	} catch {
+		return false;
+	}
+	const proposal = await loadProposal(paths, run.proposalId).catch(() => undefined);
+	if (!proposal) return false;
+	const status =
+		proposal.status === "trialing"
+			? ("trialing" as const)
+			: proposal.status === "deferred"
+				? ("awaiting-decision" as const)
+				: proposal.status === "approved" ||
+						proposal.status === "rejected" ||
+						proposal.status === "kept" ||
+						proposal.status === "rolled-back"
+					? ("completed" as const)
+					: proposal.status === "pending"
+						? ("awaiting-decision" as const)
+						: undefined;
+	if (!status || status === run.status) return status !== undefined;
+	await updateEvolutionRun(paths, run.id, { status });
+	return true;
 }
 
 async function readRunText(path: string, maxCharacters = 20_000): Promise<string | undefined> {
@@ -244,8 +298,8 @@ export async function renderEvolutionRunInspection(
 ): Promise<{ summary: string; markdown: string }> {
 	const selected = selectedId
 		? runs.filter((run) => run.id === selectedId)
-		: runs.filter((run) => ACTIVE_STATUSES.has(run.status) || run.status === "paused");
-	const activeCount = runs.filter((run) => ACTIVE_STATUSES.has(run.status) || run.status === "paused").length;
+		: runs.filter((run) => !TERMINAL_STATUSES.has(run.status));
+	const activeCount = runs.filter((run) => !TERMINAL_STATUSES.has(run.status)).length;
 	const summary = selectedId
 		? selected[0]
 			? `${selected[0].id}  ${selected[0].status}`

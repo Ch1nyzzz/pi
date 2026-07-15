@@ -1,5 +1,7 @@
 import { readFile } from "node:fs/promises";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { loadCompiledBundle } from "../bundle/compile.ts";
 import { storeTrialComparison, type TrialComparison, trialEvidenceDigest } from "../comparison.ts";
 import type { EvoPaths } from "../paths.ts";
@@ -26,7 +28,7 @@ export interface RunRetrospectiveOptions {
 
 export type TrialRecommendation = "keep" | "rollback" | "extend";
 
-export function parseTrialRecommendation(markdown: string): TrialRecommendation | undefined {
+function parseTrialRecommendation(markdown: string): TrialRecommendation | undefined {
 	const matches = [...markdown.matchAll(/^Recommendation:\s*(keep|rollback|extend)\s*$/gim)];
 	const value = matches.at(-1)?.[1]?.toLowerCase();
 	return value === "keep" || value === "rollback" || value === "extend" ? value : undefined;
@@ -128,11 +130,24 @@ export async function runRetrospective(options: RunRetrospectiveOptions): Promis
 				prompt,
 				...(reflectorModel ? { model: reflectorModel } : {}),
 				...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
+				submission: {
+					toolName: "submit_retrospective",
+					description: "Deliver the trial retrospective and the bounded recommendation.",
+					parameters: Type.Object({
+						recommendation: StringEnum(["keep", "rollback", "extend"] as const),
+						retrospectiveMarkdown: Type.String({ minLength: 1 }),
+					}),
+				},
 			});
 			await recordModelUsage(options.paths, "retrospective", run);
+			const submitted = run.submission as { recommendation: TrialRecommendation; retrospectiveMarkdown: string };
+			// The stored artifact keeps the canonical Recommendation line so reuse reads
+			// (parseTrialRecommendation) round-trip the submitted value exactly.
 			const retrospectiveMarkdown = [
 				`<!-- evo-pi evidence-digest=${evidenceDigest} comparison-digest=${comparison.evidenceDigest} evidence-cutoff=${evidenceCutoff} -->`,
-				run.text.trim(),
+				submitted.retrospectiveMarkdown.trim(),
+				"",
+				`Recommendation: ${submitted.recommendation}`,
 				"",
 			].join("\n");
 			const storedProposal = await attachRetrospectiveArtifact({
@@ -149,9 +164,7 @@ export async function runRetrospective(options: RunRetrospectiveOptions): Promis
 				corpus,
 				comparison,
 				retrospectiveMarkdown,
-				...(parseTrialRecommendation(retrospectiveMarkdown)
-					? { recommendation: parseTrialRecommendation(retrospectiveMarkdown) }
-					: {}),
+				recommendation: submitted.recommendation,
 				reused: false,
 				run,
 			};

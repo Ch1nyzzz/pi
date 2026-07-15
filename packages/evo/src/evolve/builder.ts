@@ -1,26 +1,32 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { Type } from "typebox";
 import { loadCompiledBundle } from "../bundle/compile.ts";
 import { publishEvoComponentArtifact } from "../components/artifact.ts";
 import { createDefaultEvoAbiRegistry } from "../components/registry.ts";
 import type { EvoPaths } from "../paths.ts";
-import { type DraftProposal, parseReflectorOutput } from "../proposal.ts";
+import { type DraftProposal, parseReflectorOutputValue, type ReflectorOutput } from "../proposal.ts";
 import type { EvidenceCorpus } from "../reflect/evidence.ts";
 import type { ModelRunner, ModelRunResult } from "../reflect/model-runner.ts";
 import { recordModelUsage } from "../reflect/usage.ts";
 import type { EvolutionResearchPlan } from "../types.ts";
 import { readEvolutionWorkflow } from "./config.ts";
+import type { MaterializedCorpus } from "./research-corpus.ts";
 
 export interface RunEvolutionBuilderOptions {
 	paths: EvoPaths;
 	plan: EvolutionResearchPlan;
 	parentDigest: string;
 	corpus: EvidenceCorpus;
+	/** On-disk corpus tree; when present the prompt carries only its index. */
+	materializedCorpus?: MaterializedCorpus;
 	runner: ModelRunner;
 	cwd: string;
 	agentDir?: string;
 	model: string;
 	thinkingLevel?: ThinkingLevel;
 	activePreferences?: string;
+	/** Stable provider session identity so retries hit the provider prompt cache. */
+	sessionIdentity?: string;
 	signal?: AbortSignal;
 }
 
@@ -30,29 +36,31 @@ export interface EvolutionBuilderResult {
 	run: ModelRunResult;
 }
 
-function extractBuilderObject(text: string): Record<string, unknown> {
-	const normalized = text
-		.trim()
-		.replace(/^```(?:json)?\s*/i, "")
-		.replace(/\s*```$/, "");
-	const start = normalized.indexOf("{");
-	const end = normalized.lastIndexOf("}");
-	if (start === -1 || end < start) throw new Error("Builder did not return a JSON object");
-	const value = JSON.parse(normalized.slice(start, end + 1)) as unknown;
-	if (typeof value !== "object" || value === null || Array.isArray(value)) {
-		throw new Error("Builder output must be an object");
-	}
-	return value as Record<string, unknown>;
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+// Shape-level contract for the submission tool; kind-specific semantics live in the
+// validate hook, whose errors flow back to the model as tool errors.
+const BUILDER_PARAMETERS = Type.Object(
+	{
+		observationsMarkdown: Type.String({ minLength: 1 }),
+		observationEvidence: Type.Array(Type.Object({}, { additionalProperties: true })),
+		proposals: Type.Optional(Type.Array(Type.Object({}, { additionalProperties: true }))),
+		proposal: Type.Optional(Type.Object({}, { additionalProperties: true })),
+		component: Type.Optional(Type.Object({}, { additionalProperties: true })),
+	},
+	{ additionalProperties: true },
+);
 
 async function materializeComponentDraft(options: {
 	paths: EvoPaths;
 	parentDigest: string;
 	plan: EvolutionResearchPlan;
-	outputText: string;
+	output: Record<string, unknown>;
 }): Promise<{ draft: DraftProposal; observationsMarkdown: string }> {
 	if (!options.plan.targetAbi) throw new Error("Component plan has no target ABI");
-	const output = extractBuilderObject(options.outputText);
+	const output = options.output;
 	const component = output.component;
 	if (typeof component !== "object" || component === null || Array.isArray(component)) {
 		throw new Error("Component Builder output must contain component");
@@ -79,13 +87,11 @@ async function materializeComponentDraft(options: {
 		capabilities: record.capabilities as string[],
 		entrypointContent: record.entrypointContent,
 	});
-	const parsed = parseReflectorOutput(
-		JSON.stringify({
-			observationsMarkdown: output.observationsMarkdown,
-			observationEvidence: output.observationEvidence ?? [],
-			proposals: [output.proposal],
-		}),
-	);
+	const parsed = parseReflectorOutputValue({
+		observationsMarkdown: output.observationsMarkdown,
+		observationEvidence: output.observationEvidence ?? [],
+		proposals: [output.proposal],
+	});
 	if (parsed.proposals.length !== 1) throw new Error("Component Builder must return one proposal");
 	const parent = await loadCompiledBundle(options.paths, options.parentDigest);
 	const policy = {
@@ -122,8 +128,8 @@ export async function runEvolutionBuilder(options: RunEvolutionBuilderOptions): 
 	const workflow = await readEvolutionWorkflow(options.paths);
 	const outputInstruction =
 		options.plan.candidateKind === "component"
-			? "Return one JSON object with observationsMarkdown, observationEvidence, proposal metadata, and component { id, version, capabilities, config, entrypointContent }. The .mjs entrypoint must implement Evo-Pi's line-delimited process protocol: read {id,method,payload} from stdin and answer {id,ok,result|error}. The proposal contains motivation, expectedEffect, risk, verifyPlan, trialPlan, source, evidence, inboxReferences, and replayScenarios but no changes or codePatch."
-			: "Return exactly the Reflector JSON shape with observationsMarkdown, observationEvidence, and exactly one proposal. The proposal must include motivation, expectedEffect, risk, verifyPlan, trialPlan, source, evidence, inboxReferences, replayScenarios, and either complete data changes or a unified codePatch.";
+			? "Deliver the candidate by calling the submit_candidate tool with observationsMarkdown, observationEvidence, proposal metadata, and component { id, version, capabilities, config, entrypointContent }. The .mjs entrypoint must implement Evo-Pi's line-delimited process protocol: read {id,method,payload} from stdin and answer {id,ok,result|error}. The proposal contains motivation, expectedEffect, risk, verifyPlan, trialPlan, source, evidence, inboxReferences, and replayScenarios but no changes or codePatch."
+			: "Deliver the candidate by calling the submit_candidate tool with observationsMarkdown, observationEvidence, and exactly one entry in proposals. The proposal must include motivation, expectedEffect, risk, verifyPlan, trialPlan, source, evidence, inboxReferences, replayScenarios, and either complete data changes or a unified codePatch.";
 	const prompt = [
 		"Implement the frozen Evo-Pi plan as one narrow candidate.",
 		outputInstruction,
@@ -147,9 +153,17 @@ export async function runEvolutionBuilder(options: RunEvolutionBuilderOptions): 
 		JSON.stringify(options.plan, undefined, "\t"),
 		"</research_plan>",
 		"",
-		`<evidence_corpus truncated="${String(options.corpus.truncated)}">`,
-		options.corpus.text,
-		"</evidence_corpus>",
+		...(options.materializedCorpus
+			? [
+					`<evidence_corpus_index truncated="${String(options.corpus.truncated)}">`,
+					options.materializedCorpus.indexText,
+					"</evidence_corpus_index>",
+				]
+			: [
+					`<evidence_corpus truncated="${String(options.corpus.truncated)}">`,
+					options.corpus.text,
+					"</evidence_corpus>",
+				]),
 	].join("\n");
 	const modelRun = await options.runner.run({
 		cwd: options.cwd,
@@ -162,7 +176,30 @@ export async function runEvolutionBuilder(options: RunEvolutionBuilderOptions): 
 		// Read-only repository inspection keeps implementation generation from mutating
 		// the caller's worktree. The returned patch is staged in Evo's isolated worktree.
 		tools: ["read", "grep", "find", "ls"],
+		...(options.sessionIdentity ? { sessionIdentity: options.sessionIdentity } : {}),
 		...(options.signal ? { signal: options.signal } : {}),
+		submission: {
+			toolName: "submit_candidate",
+			description: "Deliver the implemented candidate. Validation errors are returned for correction.",
+			parameters: BUILDER_PARAMETERS,
+			validate: (params) => {
+				if (options.plan.candidateKind === "component") {
+					if (!isRecord(params.component)) throw new Error("Component Builder output must contain component");
+					if (!isRecord(params.proposal)) throw new Error("Component Builder output must contain proposal");
+					return params;
+				}
+				const output = parseReflectorOutputValue(params);
+				if (output.proposals.length !== 1) throw new Error("Builder must return exactly one candidate proposal");
+				const candidate = output.proposals[0];
+				if (options.plan.candidateKind === "data" && candidate.changes === undefined) {
+					throw new Error("Builder returned code for a data plan");
+				}
+				if (options.plan.candidateKind === "code" && candidate.codePatch === undefined) {
+					throw new Error("Builder returned data for a code plan");
+				}
+				return output;
+			},
+		},
 	});
 	await recordModelUsage(options.paths, "builder", modelRun);
 	if (options.plan.candidateKind === "component") {
@@ -170,19 +207,12 @@ export async function runEvolutionBuilder(options: RunEvolutionBuilderOptions): 
 			paths: options.paths,
 			parentDigest: options.parentDigest,
 			plan: options.plan,
-			outputText: modelRun.text,
+			output: modelRun.submission as Record<string, unknown>,
 		});
 		return { ...component, run: modelRun };
 	}
-	const output = parseReflectorOutput(modelRun.text);
-	if (output.proposals.length !== 1) throw new Error("Builder must return exactly one candidate proposal");
+	const output = modelRun.submission as ReflectorOutput;
 	const candidate = output.proposals[0];
-	if (options.plan.candidateKind === "data" && candidate.changes === undefined) {
-		throw new Error("Builder returned code for a data plan");
-	}
-	if (options.plan.candidateKind === "code" && candidate.codePatch === undefined) {
-		throw new Error("Builder returned data for a code plan");
-	}
 	const draft: DraftProposal = {
 		...candidate,
 		...(options.plan.targetAbi ? { targetAbi: options.plan.targetAbi } : {}),

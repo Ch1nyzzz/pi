@@ -1,10 +1,15 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { compileBundle } from "../src/bundle/compile.ts";
+import { approveCanaryRun } from "../src/cli.ts";
 import { runEvolutionCycle } from "../src/evolve/cycle.ts";
-import { parseEvolutionResearchPlan } from "../src/evolve/research-plan.ts";
+import { EvolutionProcessInspector } from "../src/evolve/inspect-ui.ts";
+import { applyEvolutionReleasePolicy } from "../src/evolve/release.ts";
+import { parseEvolutionResearchPlanValue } from "../src/evolve/research-plan.ts";
+import { resumeEvolutionEvidence, retryEvolutionFromValidation } from "../src/evolve/retry.ts";
+import { evolutionRunDirectory, listEvolutionRuns, readEvolutionRun, updateEvolutionRun } from "../src/evolve/run.ts";
 import { initializeInboxLifecycle, readInboxLifecycleStates } from "../src/inbox.ts";
 import { getEvoPaths } from "../src/paths.ts";
 import { createRecorderStore } from "../src/recorder/store.ts";
@@ -13,18 +18,29 @@ import { BundleRegistry } from "../src/registry/registry.ts";
 import { EvoService } from "../src/service.ts";
 import type { EvoControlConfig } from "../src/types.ts";
 
+type FakeResponse = string | { text?: string; submission?: unknown };
+
 class FakeRunner implements ModelRunner {
 	readonly requests: ModelRunRequest[] = [];
-	private readonly responses: string[];
-	constructor(responses: string[]) {
+	private readonly responses: FakeResponse[];
+	constructor(responses: FakeResponse[]) {
 		this.responses = responses;
 	}
 	async run(request: ModelRunRequest): Promise<ModelRunResult> {
 		this.requests.push(request);
-		const text = this.responses.shift();
-		if (text === undefined) throw new Error("No fake response");
+		const response = this.responses.shift();
+		if (response === undefined) throw new Error("No fake response");
+		const normalized = typeof response === "string" ? { text: response } : response;
+		if (request.submission && normalized.submission === undefined) {
+			throw new Error(`Fake response is missing a ${request.submission.toolName} submission`);
+		}
+		const submission =
+			request.submission && normalized.submission !== undefined
+				? (request.submission.validate?.(normalized.submission as Record<string, unknown>) ?? normalized.submission)
+				: undefined;
 		return {
-			text,
+			text: normalized.text ?? "",
+			...(submission !== undefined ? { submission } : {}),
 			model: { provider: "fake", id: request.model ?? "default" },
 			stats: {
 				sessionFile: undefined,
@@ -125,7 +141,18 @@ function planResponse(candidateKind: "none" | "data" = "data") {
 			baseline: "Original instruction",
 			hypothesis: "A narrow instruction reduces repetition.",
 			checkProfiles: ["bundle-compile", "session-comparison"],
+			evidenceStrategy: {
+				patchClass: "prompt",
+				offline: { mode: "required", profiles: ["bundle-compile"] },
+				historicalReplay: {
+					mode: "optional",
+					reason: "Historical sessions improve confidence but are not causal.",
+				},
+				online: { mode: "canary", minimumSamples: 10, maximumDuration: "14d" },
+				rollout: "canary-first",
+			},
 			metrics: ["followUpsPerTask"],
+			primaryMetric: "followUpsPerTask",
 			minimumEffect: { followUpsPerTask: 0.1 },
 			trialPlan: "Run ten sessions.",
 			rollbackConditions: ["More user correction"],
@@ -164,10 +191,22 @@ describe("fixed evolution cycle", () => {
 	it("runs Sol plan, Terra build, and two fresh Terra XHigh evaluation passes", async () => {
 		const f = await fixture();
 		const runner = new FakeRunner([
-			planResponse(),
-			builderResponse(),
-			"The candidate matches the frozen experiment.\nRecommendation: supported",
-			"A real trial is still needed.\nRecommendation: uncertain",
+			{ submission: JSON.parse(planResponse()) },
+			{ submission: JSON.parse(builderResponse()) },
+			{
+				submission: {
+					verdict: "verified",
+					summary: "The candidate matches the frozen experiment.",
+					findings: [],
+				},
+			},
+			{
+				submission: {
+					verdict: "needs-evidence",
+					summary: "A real trial is still needed.",
+					findings: [{ title: "Trial pending", detail: "No online samples exist yet." }],
+				},
+			},
 		]);
 		const result = await runEvolutionCycle({
 			paths: f.paths,
@@ -176,10 +215,10 @@ describe("fixed evolution cycle", () => {
 			cwd: f.root,
 			config,
 		});
-		expect(result.run.status).toBe("completed");
+		expect(result.run.status).toBe("awaiting-evidence");
 		expect(result.proposals).toHaveLength(1);
-		expect(result.evaluation?.verdict).toBe("uncertain");
-		expect(result.release?.action).toBe("review");
+		expect(result.evaluation?.verdict).toBe("needs-evidence");
+		expect(result.release?.action).toBe("needs-evidence");
 		expect(runner.requests.map((request) => request.model)).toEqual([
 			"fake/sol-ultra",
 			"fake/terra-max",
@@ -199,7 +238,18 @@ describe("fixed evolution cycle", () => {
 			"evo_research_fetch",
 		]);
 		expect(runner.requests[0].prompt).toContain("Prefer design-first implementation.");
+		expect(runner.requests[0].prompt).toContain("<evidence_corpus_index");
+		expect(runner.requests[0].prompt).not.toContain("<evidence_corpus ");
+		expect(runner.requests[0].prompt).toContain("corpus/sessions/evidence-session.md");
+		expect(runner.requests[0].prompt).not.toContain("Repeated friction happened.");
+		const corpusDirectory = join(evolutionRunDirectory(f.paths, result.run.id), "corpus");
+		const renderedSession = await readFile(join(corpusDirectory, "sessions", "evidence-session.md"), "utf8");
+		expect(renderedSession).toContain("Repeated friction happened.");
+		expect(renderedSession).toContain("## Digest");
+		const rawSession = await readFile(join(corpusDirectory, "sessions-raw", "evidence-session.json"), "utf8");
+		expect(JSON.parse(rawSession)).toHaveLength(5);
 		expect(runner.requests[1].prompt).toContain("<research_plan>");
+		expect(runner.requests[1].prompt).toContain("<evidence_corpus_index");
 		expect(runner.requests[1].prompt).toContain("Prefer design-first implementation.");
 		expect(runner.requests[2].prompt).toContain("Prefer design-first implementation.");
 		expect(runner.requests[2].thinkingLevel).toBe("xhigh");
@@ -208,7 +258,7 @@ describe("fixed evolution cycle", () => {
 		expect(result.proposals[0].artifacts.review?.file).toBe("revisions/1/review.md");
 	});
 
-	it("materializes an existing-ABI component and starts a reversible component trial", async () => {
+	it("materializes an existing-ABI component and waits for explicit Canary approval", async () => {
 		const f = await fixture();
 		const componentPlan = JSON.stringify({
 			...JSON.parse(planResponse()),
@@ -218,6 +268,16 @@ describe("fixed evolution cycle", () => {
 			experiment: {
 				...JSON.parse(planResponse()).experiment,
 				checkProfiles: ["bundle-compile", "compaction-replay"],
+				evidenceStrategy: {
+					patchClass: "component",
+					offline: { mode: "required", profiles: ["bundle-compile"] },
+					historicalReplay: {
+						mode: "not-applicable",
+						reason: "This fixture has no recorded compaction boundary; runtime effects require Canary evidence.",
+					},
+					online: { mode: "canary", minimumSamples: 2, maximumDuration: "1d" },
+					rollout: "canary-first",
+				},
 			},
 		});
 		const entrypointContent = `
@@ -226,7 +286,9 @@ const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 lines.on("line", line => {
   const request = JSON.parse(line);
   const result = request.method === "invoke" ? {
-    summary: request.payload.conversation,
+    summary: request.payload.previousSummary
+      ? request.payload.previousSummary + "\\n" + request.payload.conversation
+      : request.payload.conversation,
     firstKeptEntryId: request.payload.firstKeptEntryId
   } : {};
   process.stdout.write(JSON.stringify({ id: request.id, ok: true, result }) + "\\n");
@@ -257,12 +319,24 @@ lines.on("line", line => {
 			},
 		});
 		const runner = new FakeRunner([
-			componentPlan,
-			componentBuilder,
+			{ submission: JSON.parse(componentPlan) },
+			{ submission: JSON.parse(componentBuilder) },
 			"Baseline first action",
 			"Candidate first action",
-			"The ABI and bundle checks pass; use a trial.\nRecommendation: supported",
-			"A semantic trial remains necessary.\nRecommendation: uncertain",
+			{
+				submission: {
+					verdict: "verified",
+					summary: "The ABI and bundle checks pass; use a trial.",
+					findings: [],
+				},
+			},
+			{
+				submission: {
+					verdict: "needs-evidence",
+					summary: "A semantic trial remains necessary.",
+					findings: [],
+				},
+			},
 		]);
 		const componentConfig: EvoControlConfig = {
 			...config,
@@ -274,20 +348,193 @@ lines.on("line", line => {
 			runner,
 			cwd: f.root,
 			config: componentConfig,
+			componentSandbox: false,
 		});
-		expect(result.release?.action).toBe("trial");
+		expect(result.release?.action).toBe("awaiting-canary-approval");
+		expect(result.run.status).toBe("awaiting-canary-approval");
 		expect(result.proposals[0]).toMatchObject({
 			kind: "data",
 			tier: "T2",
 			targetAbi: "compaction/v1",
-			status: "trialing",
+			status: "pending",
 		});
-		expect(await f.service.registry.readTrial()).toMatchObject({ proposalId: result.proposals[0].id });
+		expect(await f.service.registry.readTrial()).toBeUndefined();
+		const componentStrategy = JSON.parse(componentPlan).experiment.evidenceStrategy;
+		expect(
+			await applyEvolutionReleasePolicy({
+				service: f.service,
+				config: { ...componentConfig, release: { ...componentConfig.release, autoStartComponentTrial: false } },
+				proposal: result.proposals[0],
+				verdict: "needs-evidence",
+				evidenceStrategy: componentStrategy,
+				receipts: new Map([
+					[
+						"bundle-compile" as const,
+						{
+							schemaVersion: 1 as const,
+							profile: "bundle-compile" as const,
+							passed: true,
+							executedAt: new Date(0).toISOString(),
+							summary: "compiled",
+						},
+					],
+				]),
+			}),
+		).toMatchObject({ action: "review", reason: "Component Canary is disabled by local release policy" });
+		expect(
+			await applyEvolutionReleasePolicy({
+				service: f.service,
+				config: componentConfig,
+				proposal: result.proposals[0],
+				verdict: "needs-evidence",
+				evidenceStrategy: {
+					...componentStrategy,
+					historicalReplay: {
+						mode: "required",
+						profiles: ["paired-replay"],
+						datasets: ["recorded-long-sessions"],
+						minimumSamples: 2,
+					},
+				},
+				receipts: new Map(),
+			}),
+		).toMatchObject({
+			action: "needs-evidence",
+			reason: "Required evidence profiles have no passing execution receipt: bundle-compile, paired-replay",
+		});
+
+		await f.service.reject(result.proposals[0].id, "Legacy evaluator rejected before executable validation");
+		await updateEvolutionRun(f.paths, result.run.id, { status: "completed", experimentDigest: undefined });
+		const retried = await retryEvolutionFromValidation({
+			paths: f.paths,
+			sourceRunId: result.run.id,
+			cwd: f.root,
+			sandbox: false,
+		});
+		expect((await readEvolutionRun(f.paths, result.run.id)).experimentDigest).toMatch(/^[a-f0-9]{64}$/);
+		const sourceExperimentPath = join(evolutionRunDirectory(f.paths, result.run.id), "experiment.json");
+		const sourceExperiment = await readFile(sourceExperimentPath, "utf8");
+		await writeFile(sourceExperimentPath, JSON.stringify({ tampered: true }));
+		await expect(
+			retryEvolutionFromValidation({
+				paths: f.paths,
+				sourceRunId: result.run.id,
+				cwd: f.root,
+				sandbox: false,
+			}),
+		).rejects.toThrow("frozen experiment changed");
+		await writeFile(sourceExperimentPath, sourceExperiment);
+		const retryRun = await readEvolutionRun(f.paths, retried.runId);
+		expect(retryRun).toMatchObject({
+			status: "awaiting-canary-approval",
+			retryOfRunId: result.run.id,
+			sourceProposalId: result.proposals[0].id,
+		});
+		expect(await readFile(join(evolutionRunDirectory(f.paths, retried.runId), "validation.md"), "utf8")).toContain(
+			"exact append-prefix preservation: passed",
+		);
+		expect(retried.proposal.artifacts).toMatchObject({
+			replay: { diffDigest: retried.proposal.diffDigest },
+			validation: { diffDigest: retried.proposal.diffDigest },
+			review: { diffDigest: retried.proposal.diffDigest },
+		});
+		const tui = { terminal: { rows: 200 }, requestRender: () => {} };
+		const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+		let reviewedRun: string | undefined;
+		const inspector = new EvolutionProcessInspector(
+			tui as never,
+			theme as never,
+			f.paths,
+			retried.runId,
+			() => {},
+			async (runId) => {
+				reviewedRun = runId;
+			},
+		);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		const canaryCard = inspector.render(160).join("\n");
+		expect(canaryCard).toContain("Exact diff");
+		expect(canaryCard).toContain(retried.proposal.diffDigest);
+		expect(canaryCard).toContain("按 Enter 同意以上精确候选");
+		inspector.handleInput("\r");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(reviewedRun).toBe(retried.runId);
+		inspector.dispose();
+
+		await updateEvolutionRun(f.paths, retried.runId, { canaryCandidateDigest: "0".repeat(64) });
+		await expect(approveCanaryRun({ service: f.service, paths: f.paths }, retried.runId)).rejects.toThrow(
+			"Canary review metadata no longer matches",
+		);
+		await updateEvolutionRun(f.paths, retried.runId, { canaryCandidateDigest: retried.proposal.candidateDigest });
+		await approveCanaryRun({ service: f.service, paths: f.paths }, retried.runId);
+		expect(await f.service.registry.readTrial()).toMatchObject({ proposalId: retried.proposal.id });
+		expect(await readEvolutionRun(f.paths, retried.runId)).toMatchObject({
+			status: "trialing",
+			canaryApprovalDigest: retried.proposal.approvalDigest,
+			canaryStableDigest: retried.proposal.parentBundleDigest,
+		});
+		await f.service.rollback(undefined, "Finish Canary lifecycle test");
+		expect((await listEvolutionRuns(f.paths)).find((run) => run.id === retried.runId)?.status).toBe("completed");
+	});
+
+	it("resumes an awaiting-evidence run by executing the missing replay receipt", async () => {
+		const f = await fixture();
+		const plan = {
+			...JSON.parse(planResponse()),
+		};
+		plan.experiment.checkProfiles = ["bundle-compile", "paired-replay"];
+		plan.experiment.evidenceStrategy.historicalReplay = {
+			mode: "required",
+			profiles: ["paired-replay"],
+			datasets: ["evidence-session"],
+			minimumSamples: 1,
+		};
+		const builder = JSON.parse(builderResponse());
+		builder.proposals[0].replayScenarios = [{ sessionId: "evidence-session", sequence: 3 }];
+		const cycleRunner = new FakeRunner([
+			{ submission: plan },
+			{ submission: builder },
+			{ submission: { verdict: "verified", summary: "Deterministic checks pass.", findings: [] } },
+			{ submission: { verdict: "verified", summary: "No falsification found.", findings: [] } },
+		]);
+		const result = await runEvolutionCycle({
+			paths: f.paths,
+			service: f.service,
+			runner: cycleRunner,
+			cwd: f.root,
+			config,
+		});
+		// The required paired-replay receipt is missing, so the deterministic gate holds.
+		expect(result.run.status).toBe("awaiting-evidence");
+		expect(result.release?.reason).toContain("paired-replay");
+
+		const resumeRunner = new FakeRunner([
+			"old bundle answer",
+			"candidate bundle answer",
+			{ submission: { verdict: "verified", summary: "Replay evidence supports the change.", findings: [] } },
+			{ submission: { verdict: "verified", summary: "No falsification found after replay.", findings: [] } },
+		]);
+		const resumed = await resumeEvolutionEvidence({
+			paths: f.paths,
+			runner: resumeRunner,
+			runId: result.run.id,
+			cwd: f.root,
+			config,
+		});
+		expect(resumed.executedProfilesNow).toEqual(["paired-replay"]);
+		// All receipts now pass; the data proposal moves to human review because
+		// automatic data trials are disabled in this test config.
+		expect(resumed.release.action).toBe("review");
+		expect(resumed.run.status).toBe("awaiting-decision");
+		const receipt = JSON.parse(
+			await readFile(join(evolutionRunDirectory(f.paths, result.run.id), "receipts", "paired-replay.json"), "utf8"),
+		);
+		expect(receipt).toMatchObject({ profile: "paired-replay", passed: true });
 	});
 
 	it("can finish after research without forcing a candidate", async () => {
 		const f = await fixture();
-		const runner = new FakeRunner([planResponse("none")]);
+		const runner = new FakeRunner([{ submission: JSON.parse(planResponse("none")) }]);
 		const result = await runEvolutionCycle({ paths: f.paths, service: f.service, runner, cwd: f.root, config });
 		expect(result.proposals).toEqual([]);
 		expect(result.run.status).toBe("completed");
@@ -299,7 +546,7 @@ lines.on("line", line => {
 		const store = await createRecorderStore({ paths: f.paths, sessionId: "request-session" });
 		const inbox = await store.writeInbox("希望每次对话显示实时计时", "interactive", "candidate");
 		await initializeInboxLifecycle(f.paths, inbox.fileName);
-		const response = JSON.stringify({
+		const response = {
 			...JSON.parse(planResponse("none")),
 			inboxDecisions: [
 				{
@@ -308,11 +555,11 @@ lines.on("line", line => {
 					reason: "This asks for a new UI capability rather than a cross-task behavior default.",
 				},
 			],
-		});
+		};
 		await runEvolutionCycle({
 			paths: f.paths,
 			service: f.service,
-			runner: new FakeRunner([response]),
+			runner: new FakeRunner([{ submission: response }]),
 			cwd: f.root,
 			config,
 		});
@@ -324,13 +571,11 @@ lines.on("line", line => {
 
 	it("rejects a component plan for an ABI the host did not predefine", () => {
 		expect(() =>
-			parseEvolutionResearchPlan(
-				JSON.stringify({
-					...JSON.parse(planResponse()),
-					candidateKind: "component",
-					targetAbi: "invented/v1",
-				}),
-			),
+			parseEvolutionResearchPlanValue({
+				...JSON.parse(planResponse()),
+				candidateKind: "component",
+				targetAbi: "invented/v1",
+			}),
 		).toThrow("Unknown Evo component ABI");
 	});
 });

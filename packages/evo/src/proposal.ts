@@ -142,7 +142,11 @@ function extractJsonObject(text: string): unknown {
 }
 
 export function parseReflectorOutput(text: string): ReflectorOutput {
-	const root = asRecord(extractJsonObject(text), "reflector output");
+	return parseReflectorOutputValue(extractJsonObject(text));
+}
+
+export function parseReflectorOutputValue(value: unknown): ReflectorOutput {
+	const root = asRecord(value, "reflector output");
 	const observationsMarkdown = requiredString(root, "observationsMarkdown", "reflector output");
 	const observationEvidence = parseEvidence(root.observationEvidence ?? [], "reflector output.observationEvidence");
 	if (!Array.isArray(root.proposals)) throw new Error("reflector output.proposals must be an array");

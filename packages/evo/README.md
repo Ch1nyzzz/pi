@@ -47,6 +47,7 @@ Pending proposals appear in the Pi status bar; startup never opens an approval d
 | `/evo pause <run-id>` | `evo-pi-admin pause <run-id>` | Suspend a live task without deleting its process or artifacts. |
 | `/evo resume <run-id>` | `evo-pi-admin resume <run-id>` | Continue a suspended task. |
 | `/evo delete <run-id>` | `evo-pi-admin delete <run-id>` | Stop a live worker and permanently delete the task directory. |
+| `/evo retry <run-id>` | `evo-pi-admin retry <run-id>` | Preserve the old audit record, clone its built component candidate, verify the unchanged stable parent, and continue with executable ABI/determinism validation. |
 | `/evo scheduled-improve` | `evo-pi-admin scheduled-improve` | Make one guarded scheduled-evolution attempt at the configured cadence, then exit. |
 | `/evo schedule [cadence]` | `evo-pi-admin schedule [cadence]` | Show or set the evolution cadence: `daily`, `3d`, `weekly`, `every <n>d`, or `manual`. |
 | `/evo workflow [reset]` | `evo-pi-admin workflow [reset]` | Show the trusted user-editable `workflow.md`, or restore its packaged default. |
@@ -69,7 +70,7 @@ Pending proposals appear in the Pi status bar; startup never opens an approval d
 
 The local `permit`, `reject`, `rollback`, `keep`, and `delete` commands require both stdin and stdout to be interactive terminals when they require confirmation. Task `pause`, `resume`, and `inspect` are direct lifecycle operations keyed by run ID.
 
-`go` persists the run before spawning a detached worker, writes worker output to the run's `worker.log`, and never occupies the current Pi conversation. `pause` suspends that worker and `resume` continues the same process; `delete` is a separate irreversible operation that kills the worker before removing its run directory.
+`go` persists the run before spawning a detached worker, writes worker output to the run's `worker.log`, and never occupies the current Pi conversation. When the OS component sandbox is unavailable, Evo never silently falls back: retry validation and each session-bound component activation ask for an explicit one-time direct-execution permission, scoped to that validation process or session and never persisted. `pause` suspends that worker and `resume` continues the same process; `delete` is a separate irreversible operation that kills the worker before removing its run directory. Every run phase is reflected in Pi's lower-left Evo status. Missing future evidence produces `awaiting-evidence`, not rejection. When component Canary trials are enabled, a component-selection candidate stops at `awaiting-canary-approval`; `/evo inspect` shows the exact diff, evaluation, current/candidate digests, ABI, and rollback plan, and only Enter in that focused view may start the reversible Canary. When disabled, the candidate remains pending for normal review.
 
 ## Initial resource migration
 
@@ -105,7 +106,7 @@ Each migrated asset records its canonical source root, relative source path, bun
 3. Sol Ultra writes immutable `runs/<id>/plan.md` and `experiment.json`. The experiment is frozen before implementation and may reference only fixed check profiles, never model-selected shell commands.
 4. Terra Max returns one exact data change or code patch after read-only repository inspection. Data compiles to an immutable bundle; code is staged and validated in an isolated worktree.
 5. Terra XHigh evaluates the frozen experiment, then runs a second adversarial pass in a fresh context. Existing T2 generate-only replay retains its stated limitations.
-6. Deterministic release policy may apply supported T0 data directly or start a reversible data/component trial when standing policy allows. New ABI, arbitrary code, capability-expanding, and control-boundary changes remain pending for explicit review.
+6. Deterministic release policy may apply verified T0 data directly or start a reversible data trial when standing policy allows. A pre-defined component ABI may be offered as a Canary but still requires focused Enter approval. New ABI, arbitrary code, capability-expanding, and control-boundary changes remain pending for explicit review.
 7. Kept preference candidates become structured `memory/preferences.json`; kept requests become fulfilled. Rollback reopens linked inputs. Terminal inbox payloads are garbage-collected after a digest-bearing tombstone is written, while active preferences remain in the bundle.
 8. The evidence cursor advances only after the complete cycle succeeds. For a private project, create `.pi/evo-private` to suppress recording entirely.
 
@@ -115,7 +116,7 @@ The proposal card is the approval boundary. A revision produces a new diff and n
 
 ## Human and standing approval tiers
 
-Evo-Pi derives `kind` and tier from candidate contents rather than trusting a model. `evo/config.json` controls standing automatic T0 application and reversible data/component trials. Disable those booleans to require an explicit decision for every activation. A model may only make review stricter.
+Evo-Pi derives `kind` and tier from candidate contents rather than trusting a model. `evo/config.json` controls standing automatic T0 application, reversible data trials, and whether validated component candidates may be offered for explicit Canary approval. Disable those booleans to require the normal review path for every activation. A model may only make review stricter.
 
 | Tier | Behavior |
 |---|---|
@@ -209,7 +210,7 @@ A bundle may select a content-addressed implementation only for an ABI registere
 }
 ```
 
-Component artifacts contain an immutable `manifest.json` and `.mjs` JSONL process entrypoint. Loading verifies the complete artifact identity, ABI activation boundary, configuration schema, and requested capabilities against the ABI ceiling. Generated components run out-of-process with no inherited credentials and, on Linux, a networkless bubblewrap launcher. The runtime validates every invocation input and output. A failed compaction component falls back to Pi's default compaction and is visible to the Recorder.
+Component artifacts contain an immutable `manifest.json` and `.mjs` JSONL process entrypoint. Loading verifies the complete artifact identity, ABI activation boundary, configuration schema, and requested capabilities against the ABI ceiling. Generated components run out-of-process with no inherited credentials and, when available, a networkless Linux bubblewrap launcher. Without that sandbox, execution remains blocked until the user grants a one-time validation- or session-scoped direct-execution permission. The runtime validates every invocation input and output. A failed compaction component falls back to Pi's default compaction and is visible to the Recorder.
 
 The host predefines slots, not implementations. Evo may research and prepare a T2 patch for a new ABI, but an unknown ABI cannot declare itself and activate in the same cycle.
 
@@ -294,7 +295,7 @@ Evaluation artifacts are write-once, content-digested, and bound to the proposal
 - Automatic `init` migration covers only conventional agent-global `SYSTEM.md`, `APPEND_SYSTEM.md`, the first `AGENTS.md`/`CLAUDE.md` context, and data-only skills, plus explicitly declared library sources. It does not infer arbitrary settings, project-local instructions, dependencies, or executable skill support files.
 - Replay is generate-only. Data replay compares a first response or intended first action; code replay uses the patch as quoted hypothesis data and predicts a speculative first response or action. Neither restores a workspace, loads candidate code or tool schemas, executes tools, or establishes end-to-end behavior.
 - Ordinary source-patch approval is not deployment. Evo-Pi never automatically commits, merges, cherry-picks, installs dependencies, or changes the main worktree. Only artifacts implementing a pre-defined ABI may enter the isolated component trial path.
-- Low-level registry and service APIs are trusted host-integration surfaces and are not model tools. ResearchPlanner receives read-only local tools plus allowlisted public research tools; Builder receives read-only repository tools and returns a patch or component artifact. Generated components run through validated JSONL RPC and, on supported Linux hosts, a no-network `bwrap` sandbox. A process already running as the same Unix user can still edit Evo-Pi files or automate a pseudo-terminal, so this is not a hard security boundary against a malicious same-user process.
+- Low-level registry and service APIs are trusted host-integration surfaces and are not model tools. ResearchPlanner receives read-only local tools plus allowlisted public research tools; Builder receives read-only repository tools and returns a patch or component artifact. Generated components run through validated JSONL RPC and, on supported Linux hosts, a no-network `bwrap` sandbox; explicit one-time direct execution has ordinary user permissions when that sandbox is unavailable. A process already running as the same Unix user can still edit Evo-Pi files or automate a pseudo-terminal, so this is not a hard security boundary against a malicious same-user process.
 - The local CLI's TTY check prevents ordinary non-interactive mutation but cannot prove that a real human controls the terminal. Protect the host account and Evo-Pi directory accordingly.
 - Protected-path checks guard the current judge prompts and registry implementation; path checks cannot prove the semantics of arbitrary code, so human review must reject patches that introduce alternate approval or registry-write paths.
 - In-session background evolution only runs while a Pi session is open; a machine that never runs Pi needs cron, systemd, launchd, or another external trigger for `evo-pi-admin scheduled-improve`. Both paths honor the persisted `/evo schedule` cadence.

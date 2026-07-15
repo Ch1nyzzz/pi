@@ -160,7 +160,7 @@ describe("managed-source counterfactual replay", () => {
 		expect(candidateSystemPrompt).not.toContain(HOST_PROMPT.trim());
 		expect(candidateSystemPrompt).toContain("OTHER_EXTENSION_PREFIX");
 		expect(candidateSystemPrompt).toContain("OTHER_EXTENSION_SUFFIX");
-		expect(candidateSystemPrompt).toContain("Current date: 2020-01-02");
+		expect(candidateSystemPrompt).toContain(`Current working directory: ${root}`);
 		expect(countOccurrences(candidateSystemPrompt, "evo-pi bundle begin")).toBe(1);
 	});
 });

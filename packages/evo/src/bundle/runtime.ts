@@ -8,7 +8,7 @@ import {
 	serializeConversation,
 } from "@earendil-works/pi-coding-agent";
 import { validateEvoComponentSelection } from "../components/artifact.ts";
-import { EvoComponentProcess } from "../components/process-runtime.ts";
+import { canUseEvoComponentSandbox, EvoComponentProcess } from "../components/process-runtime.ts";
 import {
 	COMPACTION_V1_ABI,
 	type CompactionV1Config,
@@ -261,7 +261,24 @@ export function createPolicyRuntimeExtension(options: { root?: string } = {}): E
 						abiRegistry,
 					);
 					const config = COMPACTION_V1_ABI.validateConfig(compactionSelection.config ?? {});
-					compactionProcess = new EvoComponentProcess(artifact, COMPACTION_V1_ABI, config);
+					const sandboxAvailable = await canUseEvoComponentSandbox();
+					if (!sandboxAvailable && !ctx.hasUI) {
+						throw new Error(
+							"Component sandbox is unavailable and direct execution requires one-time user permission",
+						);
+					}
+					const allowDirect =
+						!sandboxAvailable &&
+						(await ctx.ui.confirm(
+							"One-time component permission",
+							`The OS sandbox is unavailable. Allow ${compactionSelection.id} (${compactionSelection.artifactDigest.slice(0, 12)}) to run directly with your user permissions for this session only?`,
+						));
+					if (!sandboxAvailable && !allowDirect) {
+						throw new Error("User declined one-time direct component execution");
+					}
+					compactionProcess = new EvoComponentProcess(artifact, COMPACTION_V1_ABI, config, {
+						...(allowDirect ? { sandbox: false } : {}),
+					});
 					await compactionProcess.start();
 				}
 				if (recordedDigest === undefined) pi.appendEntry("evo.bundle", { digest, sessionId });

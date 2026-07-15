@@ -28,7 +28,7 @@ export interface EvoPaths {
 	locks: string;
 }
 
-export function resolveEvoRoot(agentDir: string = getAgentDir()): string {
+function resolveEvoRoot(agentDir: string = getAgentDir()): string {
 	return resolve(agentDir, "evo");
 }
 

@@ -10,10 +10,10 @@ import { loadReplayScenario } from "./evidence.ts";
 import type { ModelRunner, ModelRunResult } from "./model-runner.ts";
 import { recordModelUsage } from "./usage.ts";
 
-export const REPLAY_LIMITATION =
+const REPLAY_LIMITATION =
 	"This is a generate-only counterfactual replay. It does not restore a workspace snapshot, does not provide tool schemas, and does not execute tools, so it evaluates only the first response or intended first action, not end-to-end task completion.";
 
-export const CODE_REPLAY_LIMITATION =
+const CODE_REPLAY_LIMITATION =
 	"This is a generate-only hypothetical code replay. The candidate code was not loaded or executed, no candidate runtime or tool schemas were installed, no workspace snapshot was restored, and no tools were executed. The candidate output is a model prediction conditioned on the proposed patch, not observed behavior of the patched agent; it can assess only a speculative first response or intended first action, not implementation correctness or end-to-end task completion.";
 
 export type CounterfactualReplayMode = "bundle-candidate" | "code-patch-hypothesis";
@@ -121,10 +121,14 @@ const RECORDED_DATE_LINE = /\nCurrent date: \d{4}-\d{2}-\d{2}(?=\nCurrent workin
 
 function alignGeneratedPromptDate(generated: string, recorded: string): string {
 	const recordedDate = recorded.match(RECORDED_DATE_LINE)?.[0];
-	if (!recordedDate || !RECORDED_DATE_LINE.test(generated)) {
-		throw new Error("Recorded system prompt cannot be reconstructed for managed bundle replay");
-	}
-	return generated.replace(RECORDED_DATE_LINE, recordedDate);
+	const generatedHasDate = RECORDED_DATE_LINE.test(generated);
+	if (!recordedDate && !generatedHasDate) return generated;
+	if (!recordedDate) return generated.replace(RECORDED_DATE_LINE, "");
+	if (generatedHasDate) return generated.replace(RECORDED_DATE_LINE, recordedDate);
+	const cwdMarker = "\nCurrent working directory:";
+	const cwdIndex = generated.indexOf(cwdMarker);
+	if (cwdIndex === -1) throw new Error("Generated system prompt has no replayable cwd metadata");
+	return `${generated.slice(0, cwdIndex)}${recordedDate}${generated.slice(cwdIndex)}`;
 }
 
 function replaceRecordedManagedBase(recorded: string, parentBase: string, candidateBase: string): string {

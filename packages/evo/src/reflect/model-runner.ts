@@ -14,7 +14,37 @@ export type ModelRunStreamEvent =
 	| { type: "text" | "thinking" | "tool-arguments"; delta: string }
 	| { type: "tool-call"; name: string; arguments: Record<string, unknown> }
 	| { type: "tool-result"; name: string; text: string; isError: boolean }
+	| { type: "length-recovery"; attempt: number; maxAttempts: number }
+	| { type: "submission-retry"; attempt: number; maxAttempts: number }
+	| {
+			type: "usage";
+			stopReason: string;
+			input: number;
+			output: number;
+			cacheRead: number;
+			cacheWrite: number;
+	  }
 	| { type: "complete"; stopReason: string };
+
+/**
+ * Typed result channel: the model delivers its result by calling a schema-validated
+ * tool instead of emitting text for the orchestrator to parse. Schema violations and
+ * `validate` rejections flow back to the model as tool errors, so retries happen
+ * inside the session — free text is never a control signal.
+ */
+export interface ModelRunSubmission {
+	toolName: string;
+	description: string;
+	parameters: ToolDefinition["parameters"];
+	/**
+	 * Optional semantic validation beyond the schema. Throw to reject the submission
+	 * (the model sees the message and can retry). A non-undefined return value
+	 * replaces the stored submission.
+	 */
+	validate?: (params: Record<string, unknown>) => unknown;
+	/** Reprompts when a run ends without a submission. Default 2; 0 disables reprompting. */
+	maxAttempts?: number;
+}
 
 export interface ModelRunRequest {
 	cwd: string;
@@ -27,15 +57,32 @@ export interface ModelRunRequest {
 	/** Explicit built-in/custom tool allowlist. Omit to run with no tools. */
 	tools?: string[];
 	customTools?: ToolDefinition[];
+	/** Structured result channel; when set, the run's result is the submitted object. */
+	submission?: ModelRunSubmission;
 	/** Stable provider session identity used to reuse replay prompt caches. */
 	sessionIdentity?: string;
+	/**
+	 * Prompt sent to the same session when a run stops with "length" (output space or
+	 * context window exhausted). The session compacts before this prompt is submitted,
+	 * so the retry runs against a freed window. Defaults to a generic finish-now prompt.
+	 */
+	recoveryPrompt?: string;
+	/** Maximum recovery prompts after "length" stops. Defaults to 2; 0 disables recovery. */
+	maxLengthRecoveries?: number;
 	signal?: AbortSignal;
 	/** Receives the live headless-agent stream without retaining it in the model context. */
 	onStreamEvent?: (event: ModelRunStreamEvent) => void;
+	/**
+	 * Receives the session stats (and active model, when known) exactly once, even when
+	 * the run fails — callers can persist usage for failed runs.
+	 */
+	onSessionStats?: (stats: SessionStats, model: { provider: string; id: string } | undefined) => void;
 }
 
 export interface ModelRunResult {
 	text: string;
+	/** Validated object delivered through the submission tool, when one was requested. */
+	submission?: unknown;
 	stats: SessionStats;
 	model: {
 		provider: string;
@@ -46,6 +93,11 @@ export interface ModelRunResult {
 export interface ModelRunner {
 	run(request: ModelRunRequest): Promise<ModelRunResult>;
 }
+
+const DEFAULT_RECOVERY_PROMPT =
+	"Your previous response was cut off because it exhausted the available output space. " +
+	"Produce your complete final answer now. Do not call tools. " +
+	"Keep deliberation brief and output the final deliverable directly.";
 
 export interface PiModelRunnerOptions {
 	/** Optional shared auth backend, primarily for embedded runtimes and tests. */
@@ -90,17 +142,48 @@ export function createPiModelRunner(options: PiModelRunnerOptions = {}): ModelRu
 				throw new Error(resolvedModel.error);
 			}
 
+			let submitted: { value: unknown } | undefined;
+			const submissionTool: ToolDefinition | undefined = request.submission
+				? {
+						name: request.submission.toolName,
+						label: request.submission.toolName,
+						description: request.submission.description,
+						parameters: request.submission.parameters,
+						async execute(_toolCallId, params) {
+							const validated = request.submission?.validate?.(params as Record<string, unknown>);
+							submitted = { value: validated === undefined ? params : validated };
+							return { content: [{ type: "text", text: "Submission accepted." }], details: {} };
+						},
+					}
+				: undefined;
+			const toolNames = [...(request.tools ?? []), ...(submissionTool ? [submissionTool.name] : [])];
+			const customTools = [...(request.customTools ?? []), ...(submissionTool ? [submissionTool] : [])];
+
 			const sessionManager = SessionManager.inMemory(request.cwd, { id: request.sessionIdentity });
 			const { session, modelFallbackMessage } = await createAgentSessionFromServices({
 				services,
 				sessionManager,
 				model: resolvedModel?.model,
 				thinkingLevel: request.thinkingLevel ?? resolvedModel?.thinkingLevel,
-				...(request.tools ? { tools: request.tools } : { noTools: "all" as const }),
-				...(request.customTools ? { customTools: request.customTools } : {}),
+				...(toolNames.length > 0 ? { tools: toolNames } : { noTools: "all" as const }),
+				...(customTools.length > 0 ? { customTools } : {}),
 			});
 			const unsubscribe = request.onStreamEvent
 				? session.subscribe((event) => {
+						if (event.type === "message_end") {
+							const message = event.message;
+							if (message.role === "assistant" && message.usage) {
+								request.onStreamEvent?.({
+									type: "usage",
+									stopReason: message.stopReason,
+									input: message.usage.input,
+									output: message.usage.output,
+									cacheRead: message.usage.cacheRead,
+									cacheWrite: message.usage.cacheWrite,
+								});
+							}
+							return;
+						}
 						if (event.type === "tool_execution_end") {
 							const text = Array.isArray(event.result?.content)
 								? event.result.content
@@ -151,14 +234,68 @@ export function createPiModelRunner(options: PiModelRunnerOptions = {}): ModelRu
 
 				await session.prompt(request.prompt, { expandPromptTemplates: false });
 
-				const finalMessage = session.messages.at(-1);
+				let finalMessage = session.messages.at(-1);
 				if (!finalMessage || finalMessage.role !== "assistant") {
 					throw new Error("Model run completed without a final assistant message");
 				}
+
+				// A "length" stop means the output space or context window ran out. The session
+				// survives, so recover in place: the pre-prompt compaction check frees the window
+				// (overflow-shaped usage triggers it) and a fresh turn gets a fresh output budget.
+				const maxRecoveries = request.maxLengthRecoveries ?? 2;
+				let recoveryAttempt = 0;
+				while (
+					finalMessage.stopReason === "length" &&
+					recoveryAttempt < maxRecoveries &&
+					!request.signal?.aborted
+				) {
+					recoveryAttempt += 1;
+					request.onStreamEvent?.({
+						type: "length-recovery",
+						attempt: recoveryAttempt,
+						maxAttempts: maxRecoveries,
+					});
+					await session.prompt(request.recoveryPrompt ?? DEFAULT_RECOVERY_PROMPT, {
+						expandPromptTemplates: false,
+					});
+					const recovered = session.messages.at(-1);
+					if (!recovered || recovered.role !== "assistant") {
+						throw new Error("Model run recovery completed without a final assistant message");
+					}
+					finalMessage = recovered;
+				}
+
+				// The submission is the result; a run that ends without one gets bounded,
+				// explicit reprompts inside the same session.
+				if (request.submission) {
+					const maxAttempts = request.submission.maxAttempts ?? 2;
+					let submissionAttempt = 0;
+					while (!submitted && submissionAttempt < maxAttempts && !request.signal?.aborted) {
+						submissionAttempt += 1;
+						request.onStreamEvent?.({ type: "submission-retry", attempt: submissionAttempt, maxAttempts });
+						await session.prompt(
+							`You have not delivered your result yet. Call the ${request.submission.toolName} tool now with your complete final result. Do not output anything else.`,
+							{ expandPromptTemplates: false },
+						);
+						const reprompted = session.messages.at(-1);
+						if (!reprompted || reprompted.role !== "assistant") {
+							throw new Error("Submission reprompt completed without a final assistant message");
+						}
+						finalMessage = reprompted;
+					}
+					if (!submitted) {
+						throw new Error(`Model run ended without a ${request.submission.toolName} submission`);
+					}
+				}
+
 				request.onStreamEvent?.({ type: "complete", stopReason: finalMessage.stopReason });
 				if (finalMessage.stopReason !== "stop") {
 					const detail = finalMessage.errorMessage ? `: ${finalMessage.errorMessage}` : "";
-					throw new Error(`Model run ended with stop reason "${finalMessage.stopReason}"${detail}`);
+					const recoveryNote =
+						recoveryAttempt > 0
+							? ` after ${recoveryAttempt} length ${recoveryAttempt === 1 ? "recovery" : "recoveries"}`
+							: "";
+					throw new Error(`Model run ended with stop reason "${finalMessage.stopReason}"${recoveryNote}${detail}`);
 				}
 
 				const text = finalMessage.content
@@ -166,17 +303,27 @@ export function createPiModelRunner(options: PiModelRunnerOptions = {}): ModelRu
 					.map((block) => block.text)
 					.join("")
 					.trim();
-				if (!text) {
+				if (!text && !submitted) {
 					throw new Error("Model run completed without text output");
 				}
 
 				return {
 					text,
+					...(submitted ? { submission: submitted.value } : {}),
 					stats: session.getSessionStats(),
 					model: { provider: activeModel.provider, id: activeModel.id },
 				};
 			} finally {
 				request.signal?.removeEventListener("abort", abortSession);
+				try {
+					const activeModel = session.model;
+					request.onSessionStats?.(
+						session.getSessionStats(),
+						activeModel ? { provider: activeModel.provider, id: activeModel.id } : undefined,
+					);
+				} catch {
+					// Stats reporting must never mask the primary result or error.
+				}
 				unsubscribe?.();
 				session.dispose();
 			}
