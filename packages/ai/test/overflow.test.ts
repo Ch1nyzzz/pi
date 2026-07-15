@@ -136,4 +136,25 @@ describe("isContextOverflow", () => {
 		const message = createLengthStopMessage(100, 0, 0);
 		expect(isContextOverflow(message, 200000)).toBe(false);
 	});
+
+	it("detects window-exhaustion length stops with partial output (Codex incomplete style)", () => {
+		// 340k input + 30k reasoning output against a 372k window: generation filled the
+		// remaining headroom and the provider stopped mid-response.
+		const message = createLengthStopMessage(140000, 200000, 30000);
+		expect(isContextOverflow(message, 372000)).toBe(true);
+	});
+
+	it("does not treat max-output-tokens truncation of a small prompt as overflow", () => {
+		// 10k prompt + 128k output on a 128k-output/372k-window model: the model hit its
+		// output cap, not the context window. Compaction would not help here.
+		const message = createLengthStopMessage(10000, 0, 128000);
+		expect(isContextOverflow(message, 372000)).toBe(false);
+	});
+
+	it("does not treat large-input length stops with ample remaining headroom as overflow", () => {
+		// Input over half the window but generation stopped with plenty of window left:
+		// an explicit max_tokens cap, not window exhaustion.
+		const message = createLengthStopMessage(200000, 0, 8000);
+		expect(isContextOverflow(message, 372000)).toBe(false);
+	});
 });

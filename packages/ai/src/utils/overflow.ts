@@ -154,6 +154,21 @@ export function isContextOverflow(message: AssistantMessage, contextWindow?: num
 		}
 	}
 
+	// Case 4: Length-stop overflow with partial output - a large prompt left so little
+	// window headroom that generation (often reasoning tokens) filled the remainder and
+	// the provider stopped mid-response. Seen with providers that send no explicit output
+	// cap (e.g. OpenAI Codex Responses returns status "incomplete", surfaced as "length").
+	// Requires the input alone to consume most of the window so that legitimate long
+	// responses to small prompts (output reaching the model's max output tokens) are
+	// never misclassified.
+	if (contextWindow && message.stopReason === "length" && message.usage.output > 0) {
+		const inputTokens = message.usage.input + message.usage.cacheRead;
+		const totalTokens = inputTokens + message.usage.output;
+		if (inputTokens >= contextWindow * 0.5 && totalTokens >= contextWindow * 0.95) {
+			return true;
+		}
+	}
+
 	return false;
 }
 
