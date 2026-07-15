@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed OpenAI Codex session IDs to stay within the backend's 64-character limit ([#6653](https://github.com/earendil-works/pi/pull/6653) by [@davidbrai](https://github.com/davidbrai)).
 - Fixed Anthropic OAuth login teardown to wait until its localhost callback server has released the port.
 
 ## [0.80.7] - 2026-07-14

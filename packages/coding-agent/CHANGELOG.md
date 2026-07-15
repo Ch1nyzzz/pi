@@ -13,6 +13,10 @@
 
 - Added entrypoint package metadata so standalone distributions can brand the CLI, select local config paths, and control update, changelog, and telemetry behavior without changing the shared coding-agent package.
 
+### Fixed
+
+- Fixed inherited OpenAI Codex session IDs to stay within the backend's 64-character limit ([#6653](https://github.com/earendil-works/pi/pull/6653) by [@davidbrai](https://github.com/davidbrai)).
+
 ## [0.80.7] - 2026-07-14
 
 ### Breaking Changes
