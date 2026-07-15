@@ -100,6 +100,52 @@ describe("evidence", () => {
 		expect((await collectEvidenceCorpus(paths, { maxBytes: 2 * 1024 })).text).toMatch(/^## Current bundle/);
 	});
 
+	it("processes unreviewed sessions oldest-first", async () => {
+		const { paths } = await createPaths();
+		const older = await createRecorderStore({
+			paths,
+			sessionId: "older-session",
+			now: () => new Date("2026-07-01T00:00:00.000Z"),
+		});
+		const newer = await createRecorderStore({
+			paths,
+			sessionId: "newer-session",
+			now: () => new Date("2026-07-02T00:00:00.000Z"),
+		});
+		await older.append({ type: "session_start", reason: "startup", cwd: "/older" });
+		for (let index = 0; index < 8; index += 1) {
+			await appendMessage(older, "user", `oldest-unreviewed-${index}-${"x".repeat(500)}`);
+		}
+		await newer.append({ type: "session_start", reason: "startup", cwd: "/newer" });
+		await appendMessage(newer, "user", "newer-unreviewed-signal");
+
+		let corpus = await collectEvidenceCorpus(paths, { mode: "incremental", maxBytes: 4 * 1024 });
+		let iterations = 0;
+		while ((corpus.nextReviewCursor.sessionSequences["older-session"] ?? 0) < 9) {
+			expect(corpus.nextReviewCursor.sessionSequences["newer-session"]).toBeUndefined();
+			corpus = await collectEvidenceCorpus(paths, {
+				mode: "incremental",
+				maxBytes: 4 * 1024,
+				reviewCursor: corpus.nextReviewCursor,
+			});
+			iterations += 1;
+			if (iterations > 20) throw new Error("FIFO evidence cursor made no progress");
+		}
+		while ((corpus.nextReviewCursor.sessionSequences["newer-session"] ?? 0) < 2) {
+			corpus = await collectEvidenceCorpus(paths, {
+				mode: "incremental",
+				maxBytes: 4 * 1024,
+				reviewCursor: corpus.nextReviewCursor,
+			});
+			iterations += 1;
+			if (iterations > 20) throw new Error("FIFO evidence cursor made no progress");
+		}
+		expect(corpus.nextReviewCursor.sessionSequences).toMatchObject({
+			"newer-session": 2,
+			"older-session": 9,
+		});
+	});
+
 	it("reserves independent byte budgets for bundle, history, inbox, and session evidence", async () => {
 		const { root, paths } = await createPaths();
 		const source = join(root, "quota-bundle-source");

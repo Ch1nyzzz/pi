@@ -12,6 +12,13 @@ describe("shouldRunFirstTimeSetup", () => {
 	let tempDir: string;
 	let settingsPath: string;
 
+	const shouldRunForOfficialDistribution = () =>
+		shouldRunFirstTimeSetup(settingsPath, {
+			packageName: "@earendil-works/pi-coding-agent",
+			appName: "pi",
+			configDirName: ".pi",
+		});
+
 	beforeEach(() => {
 		tempDir = mkdtempSync(join(tmpdir(), "pi-first-time-setup-"));
 		settingsPath = join(tempDir, "settings.json");
@@ -34,25 +41,25 @@ describe("shouldRunFirstTimeSetup", () => {
 	});
 
 	it("returns true when experimental, default agent dir, and no settings.json", () => {
-		expect(shouldRunFirstTimeSetup(settingsPath)).toBe(true);
+		expect(shouldRunForOfficialDistribution()).toBe(true);
 	});
 
 	it("returns false when experimental features are disabled", () => {
 		delete process.env.PI_EXPERIMENTAL;
 
-		expect(shouldRunFirstTimeSetup(settingsPath)).toBe(false);
+		expect(shouldRunForOfficialDistribution()).toBe(false);
 	});
 
 	it("returns false when a custom agent dir is set", () => {
 		process.env[ENV_AGENT_DIR] = tempDir;
 
-		expect(shouldRunFirstTimeSetup(settingsPath)).toBe(false);
+		expect(shouldRunForOfficialDistribution()).toBe(false);
 	});
 
 	it("returns false when settings.json already exists", () => {
 		writeFileSync(settingsPath, "{}", "utf-8");
 
-		expect(shouldRunFirstTimeSetup(settingsPath)).toBe(false);
+		expect(shouldRunForOfficialDistribution()).toBe(false);
 	});
 });
 

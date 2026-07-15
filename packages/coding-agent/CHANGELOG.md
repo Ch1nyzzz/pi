@@ -13,7 +13,14 @@
 - Added cache-friendly dynamic tool loading for extension tools activated by tool results. Supported Anthropic and OpenAI Responses models load definitions where they become available, preserving the cached prompt prefix. See [Dynamic Tool Loading](docs/extensions.md#dynamic-tool-loading) ([#6474](https://github.com/earendil-works/pi-mono/pull/6474)).
 - Added inherited native `xhigh` and `max` thinking levels for Claude Fable 5 across all generated provider catalogs ([#6490](https://github.com/earendil-works/pi-mono/pull/6490) by [@davidbrai](https://github.com/davidbrai)).
 - Added `Ctrl+X` to copy the last assistant message, or the selected message in `/tree`.
+- Added `maxCollapsedToolsPerTurn` to limit visible tool calls per user turn until tool output is expanded.
+- Added `userMessagePaddingY` to configure vertical spacing inside sent user-message backgrounds.
+- Added a background-free `minimal` tool display style and a collapsed summary showing the hidden tool count and expansion shortcut.
 - Added the public `buildSystemPrompt` export for integrations that need to reconstruct a base prompt from `BuildSystemPromptOptions`.
+
+### Changed
+
+- Added entrypoint package metadata so standalone distributions can brand the CLI, select local config paths, and control update, changelog, and telemetry behavior without changing the shared coding-agent package.
 
 ### Fixed
 

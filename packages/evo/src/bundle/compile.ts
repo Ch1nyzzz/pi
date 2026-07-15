@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { validateEvoComponentSelection } from "../components/artifact.ts";
+import { createDefaultEvoAbiRegistry } from "../components/registry.ts";
+import { PREFERENCES_PATH, parsePreferenceMemory } from "../memory/preferences.ts";
 import { type EvoPaths, ensureEvoLayout } from "../paths.ts";
 import { canonicalJson, sha256 } from "../storage.ts";
 import type { BundleFileEntry, BundleManifest, BundlePolicy, CompiledBundle } from "../types.ts";
@@ -94,6 +97,18 @@ function validatePolicyAssetReferences(policy: BundlePolicy, files: Map<string, 
 	}
 }
 
+async function validateComponents(paths: EvoPaths, policy: BundlePolicy): Promise<void> {
+	const registry = createDefaultEvoAbiRegistry();
+	for (const [surface, selection] of Object.entries(policy.components ?? {})) {
+		await validateEvoComponentSelection(paths, surface, selection, registry);
+	}
+}
+
+async function validateStructuredMemory(directory: string, files: ReadonlySet<string>): Promise<void> {
+	if (!files.has(PREFERENCES_PATH)) return;
+	parsePreferenceMemory(JSON.parse(await readFile(join(directory, PREFERENCES_PATH), "utf8")));
+}
+
 function validateSizes(files: BundleFileEntry[], policy: BundlePolicy): void {
 	const promptLimit = Math.min(policy.limits?.promptBytes ?? DEFAULT_PROMPT_BYTES, DEFAULT_PROMPT_BYTES);
 	const skillLimit = Math.min(policy.limits?.skillBytes ?? DEFAULT_SKILL_BYTES, DEFAULT_SKILL_BYTES);
@@ -147,6 +162,8 @@ export async function loadCompiledBundle(paths: EvoPaths, digest: string): Promi
 	}
 	const policy = parseBundlePolicy(JSON.parse(await readFile(join(directory, "policy.json"), "utf8")));
 	validatePolicyAssetReferences(policy, new Map(manifest.files.map((file) => [file.path, file.sha256])));
+	await validateComponents(paths, policy);
+	await validateStructuredMemory(directory, new Set(manifest.files.map((file) => file.path)));
 	validateSizes(manifest.files, policy);
 	return { digest, directory, manifest, policy };
 }
@@ -177,6 +194,8 @@ export async function compileBundle(options: {
 	);
 	const policy = parseBundlePolicy(JSON.parse(await readFile(join(sourceDirectory, "policy.json"), "utf8")));
 	validatePolicyAssetReferences(policy, new Map(files.map((file) => [file.path, file.sha256])));
+	await validateComponents(options.paths, policy);
+	await validateStructuredMemory(sourceDirectory, new Set(files.map((file) => file.path)));
 	validateSizes(files, policy);
 	const manifest: BundleManifest = {
 		schemaVersion: 1,

@@ -1,9 +1,10 @@
 import { join, resolve } from "node:path";
-import { Text, type TUI } from "@earendil-works/pi-tui";
+import { setKeybindings, Text, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { beforeAll, describe, expect, test } from "vitest";
 import { getReadmePath } from "../src/config.ts";
 import type { ToolDefinition } from "../src/core/extensions/types.ts";
+import { KeybindingsManager } from "../src/core/keybindings.ts";
 import { type BashOperations, createBashToolDefinition } from "../src/core/tools/bash.ts";
 import { createReadTool, createReadToolDefinition } from "../src/core/tools/read.ts";
 import { createWriteToolDefinition } from "../src/core/tools/write.ts";
@@ -33,6 +34,7 @@ function createFakeTui(): TUI {
 describe("ToolExecutionComponent parity", () => {
 	beforeAll(() => {
 		initTheme("dark");
+		setKeybindings(KeybindingsManager.create());
 	});
 
 	test("stacks custom call and result renderers like the old implementation", () => {
@@ -96,6 +98,62 @@ describe("ToolExecutionComponent parity", () => {
 		);
 
 		expect(component.render(120)).toEqual([]);
+	});
+
+	test("hides configured tool rows only while output is collapsed", () => {
+		const component = new ToolExecutionComponent(
+			"custom_tool",
+			"tool-hidden-collapsed",
+			{},
+			{ hiddenWhenCollapsed: true },
+			createBaseToolDefinition(),
+			createFakeTui(),
+			process.cwd(),
+		);
+
+		expect(component.render(120)).toEqual([]);
+
+		component.setExpanded(true);
+		expect(stripAnsi(component.render(120).join("\n"))).toContain("custom_tool");
+
+		component.setExpanded(false);
+		expect(component.render(120)).toEqual([]);
+	});
+
+	test("renders minimal tool rows without boxed vertical padding", () => {
+		const component = new ToolExecutionComponent(
+			"custom_tool",
+			"tool-minimal",
+			{},
+			{ displayStyle: "minimal" },
+			createBaseToolDefinition(),
+			createFakeTui(),
+			process.cwd(),
+		);
+
+		const rendered = component.render(120);
+		expect(rendered).toHaveLength(2);
+		expect(stripAnsi(rendered.join("\n"))).toContain("custom_tool");
+	});
+
+	test("summarizes hidden tool rows with the configured expand shortcut", () => {
+		const collapsedSummary = { count: 3 };
+		const component = new ToolExecutionComponent(
+			"custom_tool",
+			"tool-hidden-summary",
+			{},
+			{ hiddenWhenCollapsed: true, collapsedSummary },
+			createBaseToolDefinition(),
+			createFakeTui(),
+			process.cwd(),
+		);
+
+		const collapsed = stripAnsi(component.render(120).join("\n"));
+		expect(collapsed).toContain("… 3 tools hidden");
+		expect(collapsed).toContain("ctrl+o to expand");
+
+		component.setExpanded(true);
+		expect(stripAnsi(component.render(120).join("\n"))).toContain("custom_tool");
 	});
 
 	test("uses built-in rendering for built-in overrides without custom renderers", () => {

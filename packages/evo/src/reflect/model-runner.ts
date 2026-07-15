@@ -7,7 +7,14 @@ import {
 	resolveCliModel,
 	SessionManager,
 	type SessionStats,
+	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+
+export type ModelRunStreamEvent =
+	| { type: "text" | "thinking" | "tool-arguments"; delta: string }
+	| { type: "tool-call"; name: string; arguments: Record<string, unknown> }
+	| { type: "tool-result"; name: string; text: string; isError: boolean }
+	| { type: "complete"; stopReason: string };
 
 export interface ModelRunRequest {
 	cwd: string;
@@ -17,9 +24,14 @@ export interface ModelRunRequest {
 	model?: string;
 	thinkingLevel?: ThinkingLevel;
 	history?: readonly AgentMessage[];
+	/** Explicit built-in/custom tool allowlist. Omit to run with no tools. */
+	tools?: string[];
+	customTools?: ToolDefinition[];
 	/** Stable provider session identity used to reuse replay prompt caches. */
 	sessionIdentity?: string;
 	signal?: AbortSignal;
+	/** Receives the live headless-agent stream without retaining it in the model context. */
+	onStreamEvent?: (event: ModelRunStreamEvent) => void;
 }
 
 export interface ModelRunResult {
@@ -84,8 +96,42 @@ export function createPiModelRunner(options: PiModelRunnerOptions = {}): ModelRu
 				sessionManager,
 				model: resolvedModel?.model,
 				thinkingLevel: request.thinkingLevel ?? resolvedModel?.thinkingLevel,
-				noTools: "all",
+				...(request.tools ? { tools: request.tools } : { noTools: "all" as const }),
+				...(request.customTools ? { customTools: request.customTools } : {}),
 			});
+			const unsubscribe = request.onStreamEvent
+				? session.subscribe((event) => {
+						if (event.type === "tool_execution_end") {
+							const text = Array.isArray(event.result?.content)
+								? event.result.content
+										.filter((item: { type?: string }) => item.type === "text")
+										.map((item: { text?: string }) => item.text ?? "")
+										.join("\n")
+								: String(event.result ?? "");
+							request.onStreamEvent?.({
+								type: "tool-result",
+								name: event.toolName,
+								text: text.slice(0, 8_000),
+								isError: event.isError,
+							});
+							return;
+						}
+						if (event.type !== "message_update") return;
+						const update = event.assistantMessageEvent;
+						if (update.type === "text_delta") request.onStreamEvent?.({ type: "text", delta: update.delta });
+						else if (update.type === "thinking_delta") {
+							request.onStreamEvent?.({ type: "thinking", delta: update.delta });
+						} else if (update.type === "toolcall_delta") {
+							request.onStreamEvent?.({ type: "tool-arguments", delta: update.delta });
+						} else if (update.type === "toolcall_end") {
+							request.onStreamEvent?.({
+								type: "tool-call",
+								name: update.toolCall.name,
+								arguments: update.toolCall.arguments,
+							});
+						}
+					})
+				: undefined;
 			const abortSession = () => {
 				void session.abort();
 			};
@@ -109,6 +155,7 @@ export function createPiModelRunner(options: PiModelRunnerOptions = {}): ModelRu
 				if (!finalMessage || finalMessage.role !== "assistant") {
 					throw new Error("Model run completed without a final assistant message");
 				}
+				request.onStreamEvent?.({ type: "complete", stopReason: finalMessage.stopReason });
 				if (finalMessage.stopReason !== "stop") {
 					const detail = finalMessage.errorMessage ? `: ${finalMessage.errorMessage}` : "";
 					throw new Error(`Model run ended with stop reason "${finalMessage.stopReason}"${detail}`);
@@ -130,6 +177,7 @@ export function createPiModelRunner(options: PiModelRunnerOptions = {}): ModelRu
 				};
 			} finally {
 				request.signal?.removeEventListener("abort", abortSession);
+				unsubscribe?.();
 				session.dispose();
 			}
 		},

@@ -2848,6 +2848,7 @@ All examples in [examples/extensions/](../examples/extensions/).
 | `auto-commit-on-exit.ts` | Commit on shutdown | `on("session_shutdown")`, `exec` |
 | **UI Components** |||
 | `status-line.ts` | Footer status indicator | `setStatus`, session events |
+| `turn-timer.ts` | Live elapsed time beside `Working...`, with durable transcript rows | `before_agent_start`, `agent_settled`, `setWorkingMessage`, `appendEntry` |
 | `working-indicator.ts` | Customize the streaming working indicator | `setWorkingIndicator`, `registerCommand` |
 | `github-issue-autocomplete.ts` | Add `#1234` issue completions on top of built-in autocomplete by preloading recent open issues from `gh issue list` | `addAutocompleteProvider`, `on("session_start")`, `exec` |
 | `custom-footer.ts` | Replace footer entirely | `registerCommand`, `setFooter` |

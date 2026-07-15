@@ -4,7 +4,13 @@ import { basename, join } from "node:path";
 import { type EvoPaths, ensureEvoLayout } from "../paths.ts";
 import { appendJsonLine, atomicWriteFile, atomicWriteJson, canonicalJson, sha256, withFileLock } from "../storage.ts";
 import { RECORDER_SCHEMA_VERSION, type StoredPayload } from "../types.ts";
-import type { RecordedEvent, RecorderEvent, RecorderEventData, RecorderInboxEntry } from "./schema.ts";
+import type {
+	RecordedEvent,
+	RecorderEvent,
+	RecorderEventData,
+	RecorderInboxEntry,
+	RecorderInboxKind,
+} from "./schema.ts";
 
 const DEFAULT_ARTIFACT_THRESHOLD_BYTES = 16 * 1024;
 const DEFAULT_PREVIEW_CHARACTERS = 1_024;
@@ -31,7 +37,7 @@ export interface RecorderStore {
 	logPath: string;
 	append(data: RecorderEventData): Promise<RecorderEvent>;
 	storePayload(value: unknown): Promise<StoredPayload>;
-	writeInbox(text: string, source: RecorderInboxEntry["source"]): Promise<StoredInboxEntry>;
+	writeInbox(text: string, source: RecorderInboxEntry["source"], kind?: RecorderInboxKind): Promise<StoredInboxEntry>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -217,7 +223,11 @@ export async function createRecorderStore(options: RecorderStoreOptions): Promis
 		});
 	}
 
-	async function writeInbox(text: string, source: RecorderInboxEntry["source"]): Promise<StoredInboxEntry> {
+	async function writeInbox(
+		text: string,
+		source: RecorderInboxEntry["source"],
+		kind?: RecorderInboxKind,
+	): Promise<StoredInboxEntry> {
 		const id = randomUUID();
 		const timestamp = now().toISOString();
 		const entry: RecorderInboxEntry = {
@@ -227,6 +237,7 @@ export async function createRecorderStore(options: RecorderStoreOptions): Promis
 			sessionId: options.sessionId,
 			source,
 			text,
+			...(kind ? { kind } : {}),
 		};
 		const fileName = `${timestamp.replaceAll(":", "-")}-${id}.json`;
 		const path = join(options.paths.inbox, fileName);

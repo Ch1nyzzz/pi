@@ -1,5 +1,19 @@
 import { createInterface } from "node:readline/promises";
 import type { ExtensionCommandContext, ExtensionContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { loadCompiledBundle } from "./bundle/compile.ts";
+import { buildTrialComparison, renderTrialComparisonMarkdown, type TrialComparison } from "./comparison.ts";
+import {
+	formatEvolutionRuns,
+	inspectBackgroundEvolutions,
+	pauseBackgroundEvolution,
+	removeBackgroundEvolution,
+	resumeBackgroundEvolution,
+	startBackgroundEvolution,
+} from "./evolve/background.ts";
+import { readEvolutionWorkflow, resetEvolutionWorkflow } from "./evolve/config.ts";
+import { runEvolutionCycle } from "./evolve/cycle.ts";
+import { EvolutionProcessInspector } from "./evolve/inspect-ui.ts";
+import { readBundlePreferenceMemory } from "./memory/preferences.ts";
 import { type EvoPaths, getEvoPaths } from "./paths.ts";
 import { proposalApproval } from "./proposal.ts";
 import { readEvaluationArtifact } from "./proposal-artifacts.ts";
@@ -10,7 +24,7 @@ import {
 	recordPermitReopen,
 	reviseProposalFromInstruction,
 } from "./reflect/permit.ts";
-import { runReflector, runReport } from "./reflect/reflector.ts";
+import { runReport } from "./reflect/reflector.ts";
 import { runRetrospective } from "./reflect/retrospective.ts";
 import {
 	type EvoScheduleConfig,
@@ -30,13 +44,23 @@ const SUBCOMMANDS = [
 	"init",
 	"status",
 	"report",
-	"improve",
+	"go",
+	"inspect",
+	"pause",
+	"resume",
+	"delete",
 	"scheduled-improve",
 	"schedule",
+	"workflow",
 	"list",
 	"show",
 	"note",
 	"request",
+	"preference",
+	"preferences",
+	"forget",
+	"resolve",
+	"gc",
 	"permit",
 	"reject",
 	"rollback",
@@ -56,24 +80,34 @@ export const EVO_HELP = `Usage: /evo <command>
   init                         Initialize and migrate Pi data into a bundle
   status                       Show registry and trial status
   report                       Generate a read-only evidence report
-  improve                      Run reflection and stage proposals
-  scheduled-improve            Run one guarded background reflection attempt
-  schedule [cadence]           Show or set the reflection cadence (daily, 3d, weekly, manual)
+  go [request]                 Start a background research-plan/build/evaluate task
+  inspect [run-id]             Inspect background and completed tasks
+  pause <run-id>               Pause a background task
+  resume <run-id>              Resume a paused task
+  delete <run-id>              Stop and permanently delete a task
+  scheduled-improve            Run one guarded background evolution attempt
+  schedule [cadence]           Show or set the evolution cadence (daily, 3d, weekly, manual)
+  workflow [reset]             Show or reset the user-editable evolution workflow
   list                         List proposals
   show <proposal-id>           Show a proposal card
   note <text>                  Record an explicit note
-  request <text>               Record an explicit feature request
+  request <text>               Prioritize a research/evolution direction
+  preference <text>            Record an explicit durable preference
+  preferences                  Show active stable preferences
+  forget <preference-id>        Request removal of an active preference
+  resolve <inbox-file> [why]    Mark an externally completed input fulfilled
+  gc [--dry-run]               Collect terminal inbox payloads
   permit <proposal-id>         Review and approve a proposal
   reject <proposal-id> <why>   Reject a pending proposal
   rollback [digest] [why]      Roll back the active trial or stable bundle
   keep [why]                   Run retrospective, then keep the active trial
-  retrospect                   Run and show the active-trial retrospective
-  pause [why]                  Pause reflection work
-  resume [why]                 Resume reflection work`;
+  retrospect                   Run and show the active-trial retrospective`;
 
 const EVO_CLI_HELP = EVO_HELP.replaceAll("/evo", "evo-pi")
 	.replace("note <text>", "note <session-id> <text>")
-	.replace("request <text>", "request <session-id> <text>");
+	.replace("request <text>", "request <session-id> <text>")
+	.replace("preference <text>", "preference <session-id> <text>")
+	.replace("forget <preference-id>", "forget <session-id> <preference-id>");
 
 interface EvoCommandDependencies {
 	paths: EvoPaths;
@@ -147,6 +181,18 @@ function formatProposalSummary(proposal: Proposal): string {
 	return `${proposal.id}  r${proposal.revision}  ${proposal.status}  ${proposal.tier}/${proposal.kind}  ${proposal.motivation}`;
 }
 
+async function formatActivePreferences(dependencies: EvoCommandDependencies): Promise<string> {
+	const digest = await dependencies.service.registry.readStableDigest();
+	if (!digest) return "No active Evo-Pi preferences";
+	const memory = await readBundlePreferenceMemory(await loadCompiledBundle(dependencies.paths, digest));
+	if (memory.preferences.length === 0) return "No active Evo-Pi preferences";
+	return [
+		"# Active Evo-Pi preferences",
+		"",
+		...memory.preferences.map((preference) => `- ${preference.id}: ${preference.instruction}`),
+	].join("\n");
+}
+
 function compactStatusText(value: string, maxLength = 48): string {
 	const compact = value.replace(/\s+/g, " ").trim();
 	if (compact.length <= maxLength) return compact;
@@ -160,7 +206,7 @@ async function findPendingT0Proposal(dependencies: { service: EvoService }): Pro
 }
 
 export function describeScheduleCadence(config: EvoScheduleConfig): string {
-	if (config.mode === "manual") return "manual (reflection only runs through /evo improve)";
+	if (config.mode === "manual") return "manual (evolution only runs through /evo go)";
 	if (config.everyDays === 1) return "auto (reflect once a day)";
 	return `auto (reflect once every ${config.everyDays} days)`;
 }
@@ -172,7 +218,7 @@ function formatScheduleStatus(status: EvoScheduleStatus): string {
 		`last background run: ${status.lastCompletedAt ?? "never"}`,
 		`next eligible day: ${status.config.mode === "manual" ? "n/a" : (status.nextEligibleDay ?? "today")}`,
 		`runs today: ${status.runsToday}/${status.config.dailyRunLimit}`,
-		`trial reminder after: ${status.config.trialDueAfterDays} days`,
+		`trial comparison after: ${status.config.trialDueAfterDays} days or ${status.config.trialDueAfterSessions} sessions`,
 	].join("\n");
 }
 
@@ -224,6 +270,10 @@ export async function formatProposalCard(paths: EvoPaths, proposal: Proposal): P
 	const review = await readProposalArtifact(paths, proposal, "review");
 	const replay = await readProposalArtifact(paths, proposal, "replay");
 	const validation = await readProposalArtifact(paths, proposal, "validation");
+	const comparisonJson = await readProposalArtifact(paths, proposal, "comparison");
+	const comparison = comparisonJson
+		? renderTrialComparisonMarkdown(JSON.parse(comparisonJson) as TrialComparison)
+		: undefined;
 	const retrospective = await readProposalArtifact(paths, proposal, "retrospective");
 	return [
 		`# Evo proposal ${proposal.id}`,
@@ -270,6 +320,7 @@ export async function formatProposalCard(paths: EvoPaths, proposal: Proposal): P
 		...(validation ? ["", "## L1 validation", validation] : []),
 		...(review ? ["", "## Critic review", review] : []),
 		...(replay ? ["", "## Counterfactual replay", replay] : []),
+		...(comparison ? ["", comparison] : []),
 		...(retrospective ? ["", "## Retrospective", retrospective] : []),
 	].join("\n");
 }
@@ -313,10 +364,19 @@ export async function refreshEvoStatusIndicator(
 		);
 	}
 	if (status.trial) {
-		const schedule = await readScheduleConfig(dependencies.paths);
-		const dueAt = Date.parse(status.trial.startedAt) + schedule.trialDueAfterDays * DAY_MS;
-		if (Number.isFinite(dueAt) && now().getTime() >= dueAt) {
-			parts.push(`trial ${status.trial.proposalId} due [/evo keep or /evo rollback]`);
+		const proposal = await dependencies.service.getProposal(status.trial.proposalId);
+		if (proposal.artifacts.retrospective) {
+			parts.push(`trial ${status.trial.proposalId} comparison ready [/evo show ${status.trial.proposalId}]`);
+		} else {
+			const schedule = await readScheduleConfig(dependencies.paths);
+			const comparison = await buildTrialComparison(dependencies.paths, proposal, status.trial);
+			const dueAt = Date.parse(status.trial.startedAt) + schedule.trialDueAfterDays * DAY_MS;
+			if (
+				(Number.isFinite(dueAt) && now().getTime() >= dueAt) ||
+				comparison.after.totals.sessions >= schedule.trialDueAfterSessions
+			) {
+				parts.push(`trial ${status.trial.proposalId} due [automatic comparison pending]`);
+			}
 		}
 	}
 	ctx.ui.setStatus("evo", parts.length > 0 ? `evo: ${parts.join("; ")}` : undefined);
@@ -501,30 +561,69 @@ async function dispatchExtensionCommand(
 			sendCustomCard(pi, "evo.report", report.observationsMarkdown, { file: report.file });
 			return;
 		}
-		case "improve": {
-			const result = await runReflector(modelOptions(dependencies));
-			sendCustomCard(pi, "evo.observations", result.observationsMarkdown, {
-				proposalIds: result.proposals.map((proposal) => proposal.id),
+		case "go": {
+			const run = await startBackgroundEvolution({
+				paths: dependencies.paths,
+				cwd: dependencies.cwd ?? ctx.cwd,
+				...(rest ? { request: rest } : {}),
 			});
-			for (const proposal of result.proposals) await showProposal(pi, dependencies, proposal);
-			if (result.proposals.length === 0) ctx.ui.notify("No grounded proposal was produced", "info");
+			ctx.ui.notify(`Evolution task ${run.id} started in the background`, "info");
+			return;
+		}
+		case "inspect": {
+			const runs = await inspectBackgroundEvolutions(dependencies.paths);
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify(formatEvolutionRuns(runs, rest || undefined), "info");
+				return;
+			}
+			await ctx.ui.custom<void>(
+				(tui, theme, _keybindings, done) =>
+					new EvolutionProcessInspector(tui, theme, dependencies.paths, rest || undefined, () => done(undefined)),
+			);
+			return;
+		}
+		case "pause": {
+			const id = requireValue(rest, "/evo pause <run-id>");
+			await pauseBackgroundEvolution(dependencies.paths, id);
+			ctx.ui.notify(`Evolution task ${id} paused`, "info");
+			return;
+		}
+		case "resume": {
+			const id = requireValue(rest, "/evo resume <run-id>");
+			await resumeBackgroundEvolution(dependencies.paths, id);
+			ctx.ui.notify(`Evolution task ${id} resumed`, "info");
+			return;
+		}
+		case "delete": {
+			const id = requireValue(rest, "/evo delete <run-id>");
+			if (!(await confirmExtensionMutation(ctx, "Delete evolution task", `Permanently delete ${id}?`))) {
+				ctx.ui.notify("Delete cancelled", "info");
+				return;
+			}
+			await removeBackgroundEvolution(dependencies.paths, id);
+			ctx.ui.notify(`Evolution task ${id} deleted`, "info");
 			return;
 		}
 		case "scheduled-improve": {
 			const scheduled = await runConfiguredImprove({
 				paths: dependencies.paths,
-				improve: (signal) => runReflector(modelOptions(dependencies, signal)),
+				improve: (signal) =>
+					runEvolutionCycle({
+						paths: dependencies.paths,
+						service: dependencies.service,
+						runner: dependencies.runner,
+						cwd: dependencies.cwd,
+						agentDir: dependencies.agentDir,
+						trigger: "scheduled",
+						signal,
+					}),
 			});
 			if (scheduled.status === "skipped") {
 				ctx.ui.notify(describeImproveSkip(scheduled), "info");
 				return;
 			}
-			const result = scheduled.value;
-			sendCustomCard(pi, "evo.observations", result.observationsMarkdown, {
-				proposalIds: result.proposals.map((proposal) => proposal.id),
-				runId: scheduled.runId,
-			});
-			for (const proposal of result.proposals) await showProposal(pi, dependencies, proposal);
+			for (const proposal of scheduled.value.proposals) await showProposal(pi, dependencies, proposal);
+			ctx.ui.notify(`Evolution run ${scheduled.value.run.id} completed`, "info");
 			return;
 		}
 		case "schedule": {
@@ -551,6 +650,13 @@ async function dispatchExtensionCommand(
 			}
 			const updated = await writeScheduleConfig(dependencies.paths, selected.input);
 			ctx.ui.notify(`Evo-Pi schedule updated — ${describeScheduleCadence(updated)}`, "info");
+			return;
+		}
+		case "workflow": {
+			if (rest === "reset") await resetEvolutionWorkflow(dependencies.paths);
+			else if (rest) throw new Error("Usage: /evo workflow [reset]");
+			const workflow = await readEvolutionWorkflow(dependencies.paths);
+			sendCustomCard(pi, "evo.workflow", workflow, { path: dependencies.paths.workflow });
 			return;
 		}
 		case "list": {
@@ -583,6 +689,50 @@ async function dispatchExtensionCommand(
 				requireValue(rest, "/evo request <text>"),
 			);
 			ctx.ui.notify(`Saved ${request.fileName}`, "info");
+			return;
+		}
+		case "preference": {
+			const preference = await dependencies.service.preference(
+				ctx.sessionManager.getSessionId(),
+				requireValue(rest, "/evo preference <text>"),
+			);
+			ctx.ui.notify(`Activated durable preference from ${preference.fileName}`, "info");
+			return;
+		}
+		case "preferences": {
+			if (rest) throw new Error("Usage: /evo preferences");
+			sendCustomCard(pi, "evo.preferences", await formatActivePreferences(dependencies), {});
+			return;
+		}
+		case "forget": {
+			const preferenceId = requireValue(rest, "/evo forget <preference-id>");
+			const request = await dependencies.service.forgetPreference(ctx.sessionManager.getSessionId(), preferenceId);
+			ctx.ui.notify(`Saved removal request ${request.fileName}`, "info");
+			return;
+		}
+		case "resolve": {
+			const { first: file, rest: reason } = splitFirst(rest);
+			requireValue(file, "/evo resolve <inbox-file> [reason]");
+			if (!(await confirmExtensionMutation(ctx, "Resolve Evo-Pi input", `Mark ${file} fulfilled and collect it?`))) {
+				ctx.ui.notify("Resolve cancelled", "info");
+				return;
+			}
+			await dependencies.service.resolveInbox(file, reason || "User confirmed the input was fulfilled externally");
+			ctx.ui.notify(`Resolved ${file}`, "info");
+			return;
+		}
+		case "gc": {
+			if (rest && rest !== "--dry-run") throw new Error("Usage: /evo gc [--dry-run]");
+			const dryRun = rest === "--dry-run";
+			if (
+				!dryRun &&
+				!(await confirmExtensionMutation(ctx, "Collect Evo-Pi inbox", "Delete terminal inbox payloads?"))
+			) {
+				ctx.ui.notify("GC cancelled", "info");
+				return;
+			}
+			const result = await dependencies.service.gcInbox(dryRun);
+			ctx.ui.notify(`${dryRun ? "GC would collect" : "GC collected"} ${result.files.length} inbox payloads`, "info");
 			return;
 		}
 		case "permit": {
@@ -641,24 +791,6 @@ async function dispatchExtensionCommand(
 			sendCustomCard(pi, "evo.retrospective", retrospective.retrospectiveMarkdown, {
 				proposalId: retrospective.proposal.id,
 			});
-			return;
-		}
-		case "pause": {
-			if (!(await confirmExtensionMutation(ctx, "Pause Evo-Pi", "Pause reflection work?"))) {
-				ctx.ui.notify("Pause cancelled", "info");
-				return;
-			}
-			await dependencies.service.pause(rest || "User paused Evo-Pi");
-			ctx.ui.notify("Evo-Pi paused", "info");
-			return;
-		}
-		case "resume": {
-			if (!(await confirmExtensionMutation(ctx, "Resume Evo-Pi", "Resume reflection work?"))) {
-				ctx.ui.notify("Resume cancelled", "info");
-				return;
-			}
-			await dependencies.service.resume(rest || "User resumed Evo-Pi");
-			ctx.ui.notify("Evo-Pi resumed", "info");
 			return;
 		}
 		default:
@@ -897,22 +1029,59 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 			io.write(`${report.observationsMarkdown}\n\nSaved: ${report.file}`);
 			return;
 		}
-		case "improve": {
-			const result = await runReflector(modelOptions(dependencies));
-			io.write(result.observationsMarkdown);
-			for (const proposal of result.proposals) io.write(await formatProposalCard(dependencies.paths, proposal));
+		case "go": {
+			const run = await startBackgroundEvolution({
+				paths: dependencies.paths,
+				cwd: dependencies.cwd ?? process.cwd(),
+				...(rest ? { request: rest } : {}),
+			});
+			io.write(`Evolution task ${run.id} started in the background`);
+			return;
+		}
+		case "inspect":
+			io.write(formatEvolutionRuns(await inspectBackgroundEvolutions(dependencies.paths), rest || undefined));
+			return;
+		case "pause": {
+			const id = requireValue(rest, "evo-pi pause <run-id>");
+			await pauseBackgroundEvolution(dependencies.paths, id);
+			io.write(`Evolution task ${id} paused`);
+			return;
+		}
+		case "resume": {
+			const id = requireValue(rest, "evo-pi resume <run-id>");
+			await resumeBackgroundEvolution(dependencies.paths, id);
+			io.write(`Evolution task ${id} resumed`);
+			return;
+		}
+		case "delete": {
+			const id = requireValue(rest, "evo-pi delete <run-id>");
+			if (!(await confirmLocalMutation(io, `Permanently delete ${id}?`))) {
+				io.write("Delete cancelled");
+				return;
+			}
+			await removeBackgroundEvolution(dependencies.paths, id);
+			io.write(`Evolution task ${id} deleted`);
 			return;
 		}
 		case "scheduled-improve": {
 			const scheduled = await runConfiguredImprove({
 				paths: dependencies.paths,
-				improve: (signal) => runReflector(modelOptions(dependencies, signal)),
+				improve: (signal) =>
+					runEvolutionCycle({
+						paths: dependencies.paths,
+						service: dependencies.service,
+						runner: dependencies.runner,
+						cwd: dependencies.cwd,
+						agentDir: dependencies.agentDir,
+						trigger: "scheduled",
+						signal,
+					}),
 			});
 			if (scheduled.status === "skipped") {
 				io.write(describeImproveSkip(scheduled));
 				return;
 			}
-			io.write(scheduled.value.observationsMarkdown);
+			io.write(`Evolution run ${scheduled.value.run.id} completed`);
 			for (const proposal of scheduled.value.proposals)
 				io.write(await formatProposalCard(dependencies.paths, proposal));
 			return;
@@ -926,6 +1095,12 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 			if (!cadence) throw new Error(`Usage: ${SCHEDULE_USAGE.replace("/evo", "evo-pi")}`);
 			const updated = await writeScheduleConfig(dependencies.paths, cadence);
 			io.write(`Evo-Pi schedule updated — ${describeScheduleCadence(updated)}`);
+			return;
+		}
+		case "workflow": {
+			if (rest === "reset") await resetEvolutionWorkflow(dependencies.paths);
+			else if (rest) throw new Error("Usage: evo-pi workflow [reset]");
+			io.write(`${dependencies.paths.workflow}\n\n${await readEvolutionWorkflow(dependencies.paths)}`);
 			return;
 		}
 		case "list": {
@@ -949,6 +1124,44 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 		case "request": {
 			const value = parseSessionText(rest, "evo-pi request <session-id> <text>");
 			io.write((await dependencies.service.request(value.sessionId, value.text)).path);
+			return;
+		}
+		case "preference": {
+			const value = parseSessionText(rest, "evo-pi preference <session-id> <text>");
+			io.write(
+				`Activated durable preference from ${(await dependencies.service.preference(value.sessionId, value.text)).fileName}`,
+			);
+			return;
+		}
+		case "preferences":
+			if (rest) throw new Error("Usage: evo-pi preferences");
+			io.write(await formatActivePreferences(dependencies));
+			return;
+		case "forget": {
+			const value = parseSessionText(rest, "evo-pi forget <session-id> <preference-id>");
+			io.write((await dependencies.service.forgetPreference(value.sessionId, value.text)).path);
+			return;
+		}
+		case "resolve": {
+			const { first: file, rest: reason } = splitFirst(rest);
+			requireValue(file, "evo-pi resolve <inbox-file> [reason]");
+			if (!(await confirmLocalMutation(io, `Mark ${file} fulfilled and collect it?`))) {
+				io.write("Resolve cancelled");
+				return;
+			}
+			await dependencies.service.resolveInbox(file, reason || "User confirmed the input was fulfilled externally");
+			io.write(`Resolved ${file}`);
+			return;
+		}
+		case "gc": {
+			if (rest && rest !== "--dry-run") throw new Error("Usage: evo-pi gc [--dry-run]");
+			const dryRun = rest === "--dry-run";
+			if (!dryRun && !(await confirmLocalMutation(io, "Delete terminal inbox payloads?"))) {
+				io.write("GC cancelled");
+				return;
+			}
+			const result = await dependencies.service.gcInbox(dryRun);
+			io.write(`${dryRun ? "GC would collect" : "GC collected"} ${result.files.length} inbox payloads`);
 			return;
 		}
 		case "permit": {
@@ -1001,22 +1214,6 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 			io.write(retrospective.retrospectiveMarkdown);
 			return;
 		}
-		case "pause":
-			if (!(await confirmLocalMutation(io, "Pause Evo-Pi reflection work?"))) {
-				io.write("Pause cancelled");
-				return;
-			}
-			await dependencies.service.pause(rest || "User paused Evo-Pi");
-			io.write("Evo-Pi paused");
-			return;
-		case "resume":
-			if (!(await confirmLocalMutation(io, "Resume Evo-Pi reflection work?"))) {
-				io.write("Resume cancelled");
-				return;
-			}
-			await dependencies.service.resume(rest || "User resumed Evo-Pi");
-			io.write("Evo-Pi resumed");
-			return;
 		default:
 			io.writeError(`Unknown command: ${command}`);
 			throw new Error(`Unknown command: ${command}`);

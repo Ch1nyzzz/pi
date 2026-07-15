@@ -1,0 +1,61 @@
+{
+	"name": "@earendil-works/evo-pi",
+	"version": "0.80.6",
+	"description": "Local-first, self-evolving coding agent based on Pi",
+	"type": "module",
+	"piConfig": {
+		"product": true,
+		"name": "evo-pi",
+		"displayName": "Evo-Pi",
+		"envPrefix": "PI",
+		"configDir": ".pi",
+		"upstreamName": "Pi",
+		"onboardingMessage": "Evo-Pi learns from local session evidence. Use /evo init once, then /evo help to inspect or control evolution.",
+		"selfUpdate": true,
+		"versionCheckUrl": "https://registry.npmjs.org/@earendil-works%2fevo-pi/latest",
+		"changelogUrl": null,
+		"changelogEnabled": false,
+		"installTelemetryUrl": null
+	},
+	"bin": {
+		"evo-pi": "./dist/cli.js",
+		"evo-pi-admin": "./dist/admin.js"
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"CHANGELOG.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json && shx chmod +x dist/cli.js dist/admin.js",
+		"test": "vitest --run",
+		"prepublishOnly": "npm run clean && npm run build"
+	},
+	"keywords": [
+		"coding-agent",
+		"ai",
+		"cli",
+		"pi",
+		"self-evolution",
+		"local-first"
+	],
+	"author": "Earendil Works",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/earendil-works/pi.git",
+		"directory": "packages/evo-pi"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"dependencies": {
+		"@earendil-works/pi-coding-agent": "^0.80.6",
+		"@earendil-works/pi-evo": "^0.80.6"
+	},
+	"devDependencies": {
+		"shx": "0.4.0",
+		"vitest": "4.1.9"
+	}
+}

@@ -1,6 +1,22 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { ExtensionContext, ExtensionFactory, SessionStartEvent } from "@earendil-works/pi-coding-agent";
+import {
+	convertToLlm,
+	type ExtensionContext,
+	type ExtensionFactory,
+	type SessionStartEvent,
+	serializeConversation,
+} from "@earendil-works/pi-coding-agent";
+import { validateEvoComponentSelection } from "../components/artifact.ts";
+import { EvoComponentProcess } from "../components/process-runtime.ts";
+import {
+	COMPACTION_V1_ABI,
+	type CompactionV1Config,
+	type CompactionV1Input,
+	type CompactionV1Output,
+	createDefaultEvoAbiRegistry,
+} from "../components/registry.ts";
+import { renderBundlePreferenceInstructions } from "../memory/preferences.ts";
 import { getEvoPaths } from "../paths.ts";
 import { BundleRegistry } from "../registry/registry.ts";
 import type { CompiledBundle } from "../types.ts";
@@ -126,6 +142,14 @@ export async function renderRuntimeBundle(bundle: CompiledBundle): Promise<Runti
 				: "regular";
 		sections.push({ path, content, placement });
 	}
+	const preferenceInstructions = await renderBundlePreferenceInstructions(bundle);
+	if (preferenceInstructions) {
+		sections.push({
+			path: "memory/preferences.json",
+			content: preferenceInstructions,
+			placement: "memory",
+		});
+	}
 	for (const file of await listMarkdown(join(bundle.directory, "memory"))) {
 		const content = (await readFile(join(bundle.directory, "memory", file), "utf8")).trim();
 		if (!content) continue;
@@ -180,6 +204,13 @@ export function createPolicyRuntimeExtension(options: { root?: string } = {}): E
 		let activeToolsBeforeBundle: string[] | undefined;
 		let activeModelBeforeBundle: ExtensionContext["model"];
 		let clearFeatureSession: (() => void) | undefined;
+		let compactionProcess: EvoComponentProcess<CompactionV1Input, CompactionV1Output, CompactionV1Config> | undefined;
+
+		async function stopComponentProcesses(): Promise<void> {
+			const process = compactionProcess;
+			compactionProcess = undefined;
+			await process?.shutdown();
+		}
 
 		function clearActiveFeatures(): void {
 			clearFeatureSession?.();
@@ -205,6 +236,7 @@ export function createPolicyRuntimeExtension(options: { root?: string } = {}): E
 		pi.on("session_start", async (event, ctx) => {
 			pinned = undefined;
 			clearActiveFeatures();
+			await stopComponentProcesses();
 			try {
 				restoreActiveTools();
 				await restoreActiveModel();
@@ -219,6 +251,19 @@ export function createPolicyRuntimeExtension(options: { root?: string } = {}): E
 				const compiledBundle = await loadCompiledBundle(paths, digest);
 				await verifyManagedSourceSnapshots(compiledBundle.policy.managedSources ?? []);
 				const runtimeBundle = await renderRuntimeBundle(compiledBundle);
+				const compactionSelection = compiledBundle.policy.components?.compaction;
+				if (compactionSelection) {
+					const abiRegistry = createDefaultEvoAbiRegistry();
+					const artifact = await validateEvoComponentSelection(
+						paths,
+						"compaction",
+						compactionSelection,
+						abiRegistry,
+					);
+					const config = COMPACTION_V1_ABI.validateConfig(compactionSelection.config ?? {});
+					compactionProcess = new EvoComponentProcess(artifact, COMPACTION_V1_ABI, config);
+					await compactionProcess.start();
+				}
 				if (recordedDigest === undefined) pi.appendEntry("evo.bundle", { digest, sessionId });
 				const workerRoute = runtimeBundle.bundle.policy.modelRouting?.worker;
 				if (workerRoute) {
@@ -275,11 +320,56 @@ export function createPolicyRuntimeExtension(options: { root?: string } = {}): E
 					try {
 						await restoreActiveModel();
 					} finally {
-						clearActiveFeatures();
+						try {
+							clearActiveFeatures();
+						} finally {
+							await stopComponentProcesses();
+						}
 					}
 				}
 			} finally {
 				pinned = undefined;
+			}
+		});
+
+		pi.on("session_before_compact", async (event, ctx) => {
+			const process = compactionProcess;
+			if (!process || !pinned) return undefined;
+			try {
+				const { preparation } = event;
+				const conversation = serializeConversation(
+					convertToLlm([...preparation.messagesToSummarize, ...preparation.turnPrefixMessages]),
+				);
+				const result = await process.invoke({
+					conversation,
+					...(preparation.previousSummary ? { previousSummary: preparation.previousSummary } : {}),
+					firstKeptEntryId: preparation.firstKeptEntryId,
+					tokensBefore: preparation.tokensBefore,
+					reason: event.reason,
+					...(event.customInstructions ? { customInstructions: event.customInstructions } : {}),
+				});
+				if (result.firstKeptEntryId !== preparation.firstKeptEntryId) {
+					throw new Error("compaction/v1 component changed the prepared kept-message boundary");
+				}
+				return {
+					compaction: {
+						summary: result.summary,
+						firstKeptEntryId: result.firstKeptEntryId,
+						tokensBefore: preparation.tokensBefore,
+						details: {
+							abi: COMPACTION_V1_ABI.id,
+							componentId: pinned.bundle.policy.components?.compaction?.id,
+							artifactDigest: pinned.bundle.policy.components?.compaction?.artifactDigest,
+							...(result.metrics ? { metrics: result.metrics } : {}),
+							...(result.details === undefined ? {} : { componentDetails: result.details }),
+						},
+					},
+				};
+			} catch (error) {
+				const detail = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`Evo-Pi compaction component failed; using default compaction: ${detail}`, "warning");
+				await stopComponentProcesses();
+				return undefined;
 			}
 		});
 

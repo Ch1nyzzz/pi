@@ -16,9 +16,6 @@
 		},
 		"./package.json": "./package.json"
 	},
-	"bin": {
-		"evo-pi": "./dist/bin.js"
-	},
 	"pi": {
 		"extensions": [
 			"./dist/extension.js"
@@ -54,6 +51,7 @@
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-ai": "*",
 		"@earendil-works/pi-coding-agent": "*"
 	},
 	"devDependencies": {

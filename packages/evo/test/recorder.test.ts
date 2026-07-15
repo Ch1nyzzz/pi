@@ -4,7 +4,8 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import { getEvoPaths } from "../src/paths.ts";
-import { createRecorderExtension } from "../src/recorder/extension.ts";
+import { readSessionDigest } from "../src/recorder/digest.ts";
+import { createRecorderExtension, isDurablePreferenceInstruction } from "../src/recorder/extension.ts";
 import type { RecordedEvent } from "../src/recorder/schema.ts";
 import { createRecorderStore, readSessionLog, resolveStoredPayload } from "../src/recorder/store.ts";
 
@@ -24,6 +25,13 @@ describe("recorder", () => {
 		temporaryDirectories.push(root);
 		return root;
 	}
+
+	it("recognizes durable preferences without requiring a command", () => {
+		expect(isDurablePreferenceInstruction("以后都这样处理")).toBe(true);
+		expect(isDurablePreferenceInstruction("按照第一性原理完整修改，不要过度防御")).toBe(true);
+		expect(isDurablePreferenceInstruction("Always prefer the complete design over a local patch.")).toBe(true);
+		expect(isDurablePreferenceInstruction("Fix this one typo")).toBe(false);
+	});
 
 	it("stores large payloads in CAS and restores session logs", async () => {
 		const paths = getEvoPaths(await createRoot());
@@ -190,6 +198,79 @@ describe("recorder", () => {
 		expect((await readSessionLog(paths, "session-append-retry")).map((item) => item.sequence)).toEqual([1]);
 	});
 
+	it("backfills user messages missed before a resumed recorder was loaded without duplicating them", async () => {
+		const root = await createRoot();
+		const paths = getEvoPaths(root);
+		const handlers = new Map<string, EventHandler>();
+		const entries: unknown[] = [
+			{
+				type: "message",
+				id: "historical-user-entry",
+				parentId: null,
+				timestamp: "2026-07-13T00:00:00.000Z",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "按照第一性原理完整修改，不要过度防御" }],
+					timestamp: Date.parse("2026-07-13T00:00:00.000Z"),
+				},
+			},
+		];
+		const api = {
+			on: (name: string, handler: EventHandler) => handlers.set(name, handler),
+			appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }),
+		} as unknown as ExtensionAPI;
+		const context = {
+			cwd: root,
+			sessionManager: {
+				getSessionId: () => "resumed-session",
+				getSessionFile: () => join(root, "session.jsonl"),
+				getEntries: () => entries,
+			},
+		} as unknown as ExtensionContext;
+		await createRecorderExtension({ paths })(api);
+		await handlers.get("session_start")?.({ type: "session_start", reason: "resume" }, context);
+		await handlers.get("session_start")?.({ type: "session_start", reason: "reload" }, context);
+
+		const messages = (await readSessionLog(paths, "resumed-session")).filter((event) => event.type === "message");
+		expect(messages).toHaveLength(1);
+		expect(messages[0]).toMatchObject({ role: "user", sourceEntryId: "historical-user-entry" });
+	});
+
+	it("honors the explicit project privacy marker", async () => {
+		const root = await createRoot();
+		await mkdir(join(root, ".pi"), { recursive: true });
+		await writeFile(join(root, ".pi", "evo-private"), "private\n");
+		const paths = getEvoPaths(join(root, "evo-data"));
+		const handlers = new Map<string, EventHandler>();
+		const entries: unknown[] = [];
+		const api = {
+			on: (name: string, handler: EventHandler) => handlers.set(name, handler),
+			appendEntry: (customType: string, data: unknown) => entries.push({ customType, data }),
+		} as unknown as ExtensionAPI;
+		const context = {
+			cwd: root,
+			sessionManager: {
+				getSessionId: () => "private-session",
+				getSessionFile: () => join(root, "session.jsonl"),
+				getEntries: () => entries,
+			},
+		} as unknown as ExtensionContext;
+		await createRecorderExtension({ paths })(api);
+		for (const [name, event] of [
+			["session_start", { type: "session_start", reason: "startup" }],
+			["before_agent_start", { type: "before_agent_start", prompt: "private", systemPrompt: "system" }],
+			["input", { type: "input", text: "以后都这样", source: "interactive" }],
+			["session_shutdown", { type: "session_shutdown", reason: "quit" }],
+		] as const) {
+			await handlers.get(name)?.(event, context);
+		}
+
+		expect(entries).toEqual([]);
+		await expect(readFile(join(paths.log, "private-session.jsonl"), "utf8")).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+	});
+
 	it("records lifecycle, prompts, messages, verification, feedback, usage, and diff", async () => {
 		const root = await createRoot();
 		const paths = getEvoPaths(root);
@@ -272,6 +353,23 @@ describe("recorder", () => {
 			text: "以后都这样处理",
 			source: "interactive",
 		});
+		await emit("session_before_compact", {
+			type: "session_before_compact",
+			reason: "threshold",
+			willRetry: false,
+		});
+		await emit("session_compact", {
+			type: "session_compact",
+			reason: "threshold",
+			willRetry: false,
+			fromExtension: true,
+			compactionEntry: {
+				summary: "summary",
+				firstKeptEntryId: "kept-1",
+				tokensBefore: 120_000,
+				details: { abi: "compaction/v1" },
+			},
+		});
 		await emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
 
 		const events = await readSessionLog(paths, "session-2");
@@ -282,10 +380,11 @@ describe("recorder", () => {
 			"usage",
 			"tool",
 			"explicit_feedback",
+			"compaction",
 			"git_diff",
 			"session_end",
 		]);
-		expect(events.map((event) => event.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+		expect(events.map((event) => event.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
 		const tool = events.find((event): event is Extract<RecordedEvent, { type: "tool" }> => event.type === "tool");
 		expect(tool?.verification).toEqual({ kind: "test", command: "npm test", exitCode: 2 });
 		const beforeStart = events.find(
@@ -295,7 +394,27 @@ describe("recorder", () => {
 		expect(await resolveStoredPayload(paths, beforeStart?.systemPrompt ?? { preview: "" })).toBe(
 			"system prompt that is deliberately long enough for CAS",
 		);
-		expect(await readdir(paths.inbox)).toHaveLength(1);
+		const inboxFiles = await readdir(paths.inbox);
+		expect(inboxFiles).toHaveLength(1);
+		expect(JSON.parse(await readFile(join(paths.inbox, inboxFiles[0] ?? "missing"), "utf8"))).toMatchObject({
+			kind: "candidate",
+			text: "以后都这样处理",
+		});
+		expect(await readSessionDigest(paths, "session-2")).toMatchObject({
+			bundleDigest: "bundle-1",
+			complete: true,
+			metrics: {
+				tasks: 1,
+				assistantMessages: 1,
+				toolCalls: 1,
+				toolErrors: 1,
+				verificationRuns: 1,
+				verificationFailed: 1,
+				preferenceSignals: 1,
+				compactions: 1,
+				compactionTokensBefore: 120_000,
+			},
+		});
 		expect(entries).toHaveLength(1);
 	});
 });

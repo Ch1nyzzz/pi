@@ -118,6 +118,9 @@ export interface Settings {
 	thinkingBudgets?: ThinkingBudgetsSettings; // Custom token budgets for thinking levels
 	editorPaddingX?: number; // Horizontal padding for input editor (default: 0)
 	outputPad?: 0 | 1; // Horizontal padding for chat message output (default: 1)
+	userMessagePaddingY?: number; // Vertical padding for sent user messages (default: 1)
+	toolDisplayStyle?: "boxed" | "minimal"; // Tool rendering style (default: "boxed")
+	maxCollapsedToolsPerTurn?: number; // Max tool calls shown per user turn while collapsed (default: unlimited)
 	autocompleteMaxVisible?: number; // Max visible items in autocomplete dropdown (default: 5)
 	showHardwareCursor?: boolean; // Show terminal cursor while still positioning it for IME
 	markdown?: MarkdownSettings;
@@ -845,6 +848,26 @@ export class SettingsManager {
 
 	getHideThinkingBlock(): boolean {
 		return this.settings.hideThinkingBlock ?? false;
+	}
+
+	getUserMessagePaddingY(): number {
+		const padding = this.settings.userMessagePaddingY;
+		if (typeof padding !== "number" || !Number.isFinite(padding)) {
+			return 1;
+		}
+		return Math.max(0, Math.min(3, Math.floor(padding)));
+	}
+
+	getToolDisplayStyle(): "boxed" | "minimal" {
+		return this.settings.toolDisplayStyle === "minimal" ? "minimal" : "boxed";
+	}
+
+	getMaxCollapsedToolsPerTurn(): number | undefined {
+		const limit = this.settings.maxCollapsedToolsPerTurn;
+		if (typeof limit !== "number" || !Number.isFinite(limit) || !Number.isInteger(limit) || limit < 0) {
+			return undefined;
+		}
+		return limit;
 	}
 
 	getShowCacheMissNotices(): boolean {

@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { loadCompiledBundle } from "../bundle/compile.ts";
+import { storeTrialComparison, type TrialComparison, trialEvidenceDigest } from "../comparison.ts";
 import type { EvoPaths } from "../paths.ts";
 import { attachRetrospectiveArtifact, loadProposal, proposalApproval } from "../proposal.ts";
 import { readEvaluationArtifact } from "../proposal-artifacts.ts";
@@ -23,11 +24,21 @@ export interface RunRetrospectiveOptions {
 	maxCorpusBytes?: number;
 }
 
+export type TrialRecommendation = "keep" | "rollback" | "extend";
+
+export function parseTrialRecommendation(markdown: string): TrialRecommendation | undefined {
+	const matches = [...markdown.matchAll(/^Recommendation:\s*(keep|rollback|extend)\s*$/gim)];
+	const value = matches.at(-1)?.[1]?.toLowerCase();
+	return value === "keep" || value === "rollback" || value === "extend" ? value : undefined;
+}
+
 export interface RetrospectiveRunResult {
 	proposal: Proposal;
 	trial: TrialState;
 	corpus: EvidenceCorpus;
+	comparison: TrialComparison;
 	retrospectiveMarkdown: string;
+	recommendation?: TrialRecommendation;
 	reused: boolean;
 	run?: ModelRunResult;
 }
@@ -50,7 +61,11 @@ export async function runRetrospective(options: RunRetrospectiveOptions): Promis
 			const corpus = await collectEvidenceCorpus(options.paths, {
 				maxBytes: options.maxCorpusBytes,
 				mode: "full",
+				completedSessionsOnly: true,
 			});
+			const storedComparison = await storeTrialComparison(options.paths, proposal, trial);
+			const comparison = storedComparison.comparison;
+			const evidenceDigest = trialEvidenceDigest(corpus.evidenceDigest, comparison.evidenceDigest);
 			if (
 				proposal.status !== "trialing" ||
 				proposal.candidateDigest !== trial.digest ||
@@ -68,17 +83,31 @@ export async function runRetrospective(options: RunRetrospectiveOptions): Promis
 					kind: "retrospective",
 					reference: retrospective,
 				});
-				if (retrospective.evidence?.digest === corpus.evidenceDigest) {
-					return { proposal, trial, corpus, retrospectiveMarkdown, reused: true };
+				if (retrospective.evidence?.digest === evidenceDigest) {
+					return {
+						proposal: storedComparison.proposal,
+						trial,
+						corpus,
+						comparison,
+						retrospectiveMarkdown,
+						...(parseTrialRecommendation(retrospectiveMarkdown)
+							? { recommendation: parseTrialRecommendation(retrospectiveMarkdown) }
+							: {}),
+						reused: true,
+					};
 				}
 			}
 
-			const evidenceCutoff = corpus.nextReviewCursor.updatedAt;
+			const evidenceCutoff = comparison.generatedAt;
 			const prompt = [
-				"Prepare the trial retrospective from the proposal and recorded corpus.",
+				"Prepare the trial retrospective from the proposal, automatic comparison, and recorded corpus.",
 				`Treat records with bundleDigest ${trial.parent} as the pre-trial baseline and records with bundleDigest ${trial.digest} at or after ${trial.startedAt} as trial/post evidence.`,
 				"Do not treat records from other bundle digests as candidate effects.",
-				`Evidence snapshot digest: ${corpus.evidenceDigest}; cutoff: ${evidenceCutoff}.`,
+				`Evidence snapshot digest: ${evidenceDigest}; cutoff: ${evidenceCutoff}.`,
+				"",
+				"<automatic_comparison>",
+				JSON.stringify(comparison, undefined, "\t"),
+				"</automatic_comparison>",
 				"",
 				"<trial>",
 				JSON.stringify(trial, undefined, "\t"),
@@ -102,7 +131,7 @@ export async function runRetrospective(options: RunRetrospectiveOptions): Promis
 			});
 			await recordModelUsage(options.paths, "retrospective", run);
 			const retrospectiveMarkdown = [
-				`<!-- evo-pi evidence-digest=${corpus.evidenceDigest} evidence-cutoff=${evidenceCutoff} -->`,
+				`<!-- evo-pi evidence-digest=${evidenceDigest} comparison-digest=${comparison.evidenceDigest} evidence-cutoff=${evidenceCutoff} -->`,
 				run.text.trim(),
 				"",
 			].join("\n");
@@ -111,10 +140,21 @@ export async function runRetrospective(options: RunRetrospectiveOptions): Promis
 				proposalId: proposal.id,
 				expected: proposalApproval(proposal),
 				content: retrospectiveMarkdown,
-				evidenceDigest: corpus.evidenceDigest,
+				evidenceDigest,
 				evidenceCutoff,
 			});
-			return { proposal: storedProposal, trial, corpus, retrospectiveMarkdown, reused: false, run };
+			return {
+				proposal: storedProposal,
+				trial,
+				corpus,
+				comparison,
+				retrospectiveMarkdown,
+				...(parseTrialRecommendation(retrospectiveMarkdown)
+					? { recommendation: parseTrialRecommendation(retrospectiveMarkdown) }
+					: {}),
+				reused: false,
+				run,
+			};
 		},
 		{ timeoutMs: 5 * 60_000, staleAfterMs: 4 * 60 * 60_000 },
 	);

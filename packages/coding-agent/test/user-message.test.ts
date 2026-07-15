@@ -22,4 +22,18 @@ describe("UserMessageComponent", () => {
 		expect(lines[2].startsWith(OSC133_ZONE_END + OSC133_ZONE_FINAL)).toBe(true);
 		expect(lines[2].endsWith(BG_RESET)).toBe(true);
 	});
+
+	test("removes vertical space inside compact user message backgrounds", () => {
+		initTheme("dark");
+
+		const component = new UserMessageComponent("hello", undefined, 1, 0);
+		const lines = component.render(20);
+
+		expect(lines).toHaveLength(2);
+		expect(lines[0]).toContain(OSC133_ZONE_START);
+		expect(lines[0]).toContain("hello");
+		expect(lines[0].endsWith(BG_RESET)).toBe(true);
+		expect(lines[1].startsWith(OSC133_ZONE_END + OSC133_ZONE_FINAL)).toBe(true);
+		expect(lines[1]).not.toContain("hello");
+	});
 });

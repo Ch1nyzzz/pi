@@ -1,99 +1,127 @@
 <p align="center">
-  <a href="https://pi.dev">
-    <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
-  </a>
+  <h1 align="center">Evo-Pi</h1>
+  <p align="center">A local-first coding agent that learns from your own work.</p>
 </p>
+
 <p align="center">
-  <a href="https://discord.com/invite/3cU7Bz4UPx"><img alt="Discord" src="https://img.shields.io/badge/discord-community-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
-  <a href="https://www.npmjs.com/package/@earendil-works/pi-coding-agent"><img alt="npm" src="https://img.shields.io/npm/v/@earendil-works/pi-coding-agent?style=flat-square" /></a>
+  <a href="https://www.npmjs.com/package/@earendil-works/evo-pi"><img alt="npm" src="https://img.shields.io/npm/v/@earendil-works/evo-pi?style=flat-square" /></a>
+  <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
 </p>
 
-> New issues and PRs from new contributors are auto-closed by default. Maintainers review auto-closed issues daily. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Evo-Pi combines the Pi terminal coding agent with a built-in evolution engine. It records local session evidence, proposes narrow improvements, evaluates them independently, and activates them through deterministic policy or explicit review. Every active personal configuration is an immutable local bundle with rollback history.
 
-# Pi Agent Harness
+## Install
 
-This is the home of the Pi agent harness project including our self extensible coding agent.
+Requires Node.js 22.19 or newer.
 
-* **[@earendil-works/pi-coding-agent](packages/coding-agent)**: Interactive coding agent CLI
-* **[@earendil-works/pi-agent-core](packages/agent)**: Agent runtime with tool calling and state management
-* **[@earendil-works/pi-ai](packages/ai)**: Unified multi-provider LLM API (OpenAI, Anthropic, Google, …)
+```bash
+npm install -g --ignore-scripts @earendil-works/evo-pi
+evo-pi
+```
 
-To learn more about Pi:
+Authenticate and initialize once:
 
-* [Visit pi.dev](https://pi.dev), the project website with demos
-* [Read the documentation](https://pi.dev/docs/latest), but you can also ask the agent to explain itself
+```text
+/login
+/evo init
+/evo status
+```
 
-## All Packages
+The `evo-pi` executable includes the coding agent and loads Evo automatically. There is no separate Pi installation or `pi install` step. Upgrade later with `evo-pi update --self`.
 
-| Package | Description |
-|---------|-------------|
-| **[@earendil-works/pi-ai](packages/ai)** | Unified multi-provider LLM API (OpenAI, Anthropic, Google, etc.) |
-| **[@earendil-works/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
-| **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
-| **[@earendil-works/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
+## Product and personal-data boundary
 
-For Slack/chat automation and workflows see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).
+The published npm packages contain shared product code only:
 
-## Permissions & Containerization
+- terminal UI, model providers, authentication, sessions, and coding tools
+- Recorder, immutable bundle runtime, proposal workflow, evaluation, approval, trials, and rollback
+- default workflow templates, schemas, and host-defined component ABIs
 
-Pi does not include a built-in permission system for restricting filesystem, process, network, or credential access. By default, it runs with the permissions of the user and process that launched it.
+Personal evolution state is created at runtime and remains outside the installed package:
 
-If you need stronger boundaries, containerize or sandbox Pi. See [packages/coding-agent/docs/containerization.md](packages/coding-agent/docs/containerization.md) for three patterns:
+```text
+${PI_CODING_AGENT_DIR:-~/.pi/agent}/evo/
+├── log/                 session evidence
+├── session-digests/     derived local metrics
+├── inbox/               preference, request, and note candidates
+├── bundles/             immutable personal prompts, skills, memory, and preferences
+├── proposals/           candidate changes and approval records
+├── reports/             local reports and model-usage journal
+├── runs/                background evolution runs
+├── worktrees/           isolated code candidates
+└── registry/            active digest, trials, history, and rollback state
+```
 
-- **Gondolin extension**: keep `pi` and provider auth on the host while routing built-in tools and `!` commands into a local Linux micro-VM.
-- **Plain Docker**: run the whole `pi` process in a local container for simple isolation.
-- **OpenShell**: run the whole `pi` process in a policy-controlled sandbox.
+Durable preferences are stored in the active local bundle at `bundles/<digest>/memory/preferences.json`. User sessions, preferences, memory, bundles, reports, and generated candidates are never included in npm releases or committed back to this repository by Evo-Pi.
 
-## Contributing
+Project-owned instructions such as `AGENTS.md` are separate from personal evolution state and may be shared through the project's own Git repository. Add `.pi/evo-private` to a project root to disable recording for that project.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [AGENTS.md](AGENTS.md) for project-specific rules (for both humans and agents).  Longer term plans for Pi can also be found in [RFCs](https://rfc.earendil.com/keyword/pi/).
+### Privacy statement
+
+Evo-Pi has no hosted synchronization database; personal evolution state is persisted locally. Model execution still sends the current conversation and selected evidence required for a requested evolution run to the model provider chosen by the user. "Local-first" describes storage and ownership, not offline-only inference.
+
+## Evolution loop
+
+```text
+local evidence
+  → ResearchPlanner: grounded research plan and frozen experiment
+  → Builder: one data, component, or isolated code candidate
+  → Evaluator: independent evaluation and adversarial review
+  → deterministic release policy or explicit human approval
+  → reversible trial, keep, or rollback
+```
+
+Useful commands:
+
+```text
+/evo help
+/evo report
+/evo go <research goal>
+/evo inspect
+/evo list
+/evo show <proposal-id>
+/evo permit <proposal-id>
+/evo rollback
+```
+
+Use `evo-pi-admin <command>` for non-interactive local administration and external scheduling.
+
+## Repository packages
+
+| Package | Purpose |
+|---|---|
+| [`@earendil-works/evo-pi`](packages/evo-pi) | One-command product distribution and `evo-pi` entry point |
+| [`@earendil-works/pi-evo`](packages/evo) | Evolution engine and embedded Pi extension |
+| [`@earendil-works/pi-coding-agent`](packages/coding-agent) | Pi terminal coding-agent runtime and SDK |
+| [`@earendil-works/pi-agent-core`](packages/agent) | Agent loop and state management |
+| [`@earendil-works/pi-ai`](packages/ai) | Multi-provider model API |
+| [`@earendil-works/pi-tui`](packages/tui) | Terminal UI library |
+
+See [`packages/evo/README.md`](packages/evo/README.md) for the complete evolution architecture, approval tiers, command reference, and current limitations.
 
 ## Development
 
 ```bash
-npm install --ignore-scripts  # Install all dependencies without running lifecycle scripts
-npm run build        # Build all packages
-npm run check        # Lint, format, and type check
-./test.sh            # Run tests (skips LLM-dependent tests without API keys)
-./pi-test.sh         # Run pi from sources (can be run from any directory)
+npm install --ignore-scripts
+npm run build
+npm run check
+./test.sh
 ```
 
-## Supply-chain hardening
+Create an isolated release install outside the repository:
 
-We treat npm dependency changes as reviewed code changes.
+```bash
+npm run release:local -- --out /tmp/evo-pi-release --force
+/tmp/evo-pi-release/node/evo-pi --help
+/tmp/evo-pi-release/node/evo-pi --version
+```
 
-- Direct external dependencies are pinned to exact versions. Internal workspace packages remain version-ranged.
-- `.npmrc` sets `save-exact=true` and `min-release-age=2` to avoid same-day dependency releases during npm resolution.
-- `package-lock.json` is the dependency ground truth. Pre-commit blocks accidental lockfile commits unless `PI_ALLOW_LOCKFILE_CHANGE=1` is set.
-- `npm run check` verifies pinned direct deps, native TypeScript import compatibility, and the generated coding-agent shrinkwrap.
-- The published CLI package includes `packages/coding-agent/npm-shrinkwrap.json`, generated from the root lockfile, to pin transitive deps for npm users.
-- Release smoke tests use `npm run release:local` to build, pack, and create isolated npm and Bun installs outside the repo before tagging a release.
-- Local release installs, documented npm installs, and `pi update --self` use `--ignore-scripts` where supported.
-- CI installs with `npm ci --ignore-scripts`, and a scheduled GitHub workflow runs `npm audit --omit=dev` plus `npm audit signatures --omit=dev`.
-- Shrinkwrap generation has an explicit allowlist for dependency lifecycle scripts; new lifecycle-script deps fail checks until reviewed.
+## Security
 
-## Share your OSS coding agent sessions
+Evo-Pi has the same filesystem and process permissions as the user who launches it. Extensions and coding tools can execute code. Use a container or sandbox when stronger isolation is required. Generated ordinary code candidates remain in isolated worktrees and are not automatically merged or installed.
 
-If you use Pi or other coding agents for open source work, please share your sessions.
+Report vulnerabilities according to [`SECURITY.md`](SECURITY.md).
 
-Public OSS session data helps improve coding agents with real-world tasks, tool use, failures, and fixes instead of toy benchmarks.
+## Upstream and license
 
-For the full explanation, see [this post on X](https://x.com/badlogicgames/status/2037811643774652911).
-
-To publish sessions, use [`badlogic/pi-share-hf`](https://github.com/badlogic/pi-share-hf). Read its README.md for setup instructions. All you need is a Hugging Face account, the Hugging Face CLI, and `pi-share-hf`.
-
-You can also watch [this video](https://x.com/badlogicgames/status/2041151967695634619), where I show how I publish my `pi-mono` sessions.
-
-I regularly publish my own `pi-mono` work sessions here:
-
-- [badlogicgames/pi-mono on Hugging Face](https://huggingface.co/datasets/badlogicgames/pi-mono)
-
-## License
-
-MIT
-
-<p align="center">
-  <a href="https://pi.dev">pi.dev</a> domain graciously donated by
-  <br /><br />
-  <a href="https://exe.dev"><img src="packages/coding-agent/docs/images/exy.png" alt="Exy mascot" width="48" /><br />exe.dev</a>
-</p>
+Evo-Pi is based on [Pi](https://pi.dev). The repository is licensed under the [MIT License](LICENSE).

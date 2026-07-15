@@ -6,6 +6,7 @@ import { ensureEvoLayout } from "./paths.ts";
 import {
 	appendJsonLine,
 	atomicWriteJson,
+	canonicalJson,
 	readJson,
 	sha256,
 	truncateIncompleteFinalLine,
@@ -15,7 +16,7 @@ import type { EvaluationArtifactRef, EvidenceReference, Proposal, ProposalArtifa
 
 const PROPOSAL_ID_PATTERN = /^p-[A-Za-z0-9._-]+$/;
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
-const ARTIFACT_KINDS = new Set<ProposalArtifactKind>(["review", "replay", "validation", "retrospective"]);
+const ARTIFACT_KINDS = new Set<ProposalArtifactKind>(["review", "replay", "validation", "comparison", "retrospective"]);
 const APPROVAL_ROLES = new Set<ApprovalTurnRole>(["human", "meta"]);
 const APPROVAL_KINDS = new Set<ApprovalTurnKind>([
 	"question",
@@ -44,25 +45,33 @@ export interface ApprovalTurn {
 	evidence?: EvidenceReference[];
 }
 
+export type FixedEvaluationArtifactKind = Exclude<ProposalArtifactKind, "comparison" | "retrospective">;
+
 export interface WriteEvaluationArtifactOptions {
 	paths: EvoPaths;
 	proposalId: string;
 	revision: number;
 	diffDigest: string;
-	kind: ProposalArtifactKind;
+	kind: FixedEvaluationArtifactKind;
 	content: string;
 	now?: () => Date;
 }
-export interface WriteRetrospectiveArtifactOptions {
+export interface WriteEvidenceArtifactOptions {
 	paths: EvoPaths;
 	proposalId: string;
 	revision: number;
 	diffDigest: string;
+	kind: "comparison" | "retrospective";
 	content: string;
 	evidenceDigest: string;
 	evidenceCutoff: string;
 	now?: () => Date;
 }
+
+export type WriteRetrospectiveArtifactOptions = Omit<WriteEvidenceArtifactOptions, "kind">;
+export type WriteComparisonArtifactOptions = Omit<WriteEvidenceArtifactOptions, "kind"> & {
+	markdownContent: string;
+};
 
 export interface ReadEvaluationArtifactOptions {
 	paths: EvoPaths;
@@ -168,7 +177,7 @@ function revisionPaths(paths: EvoPaths, proposalId: string, revision: number): R
 	};
 }
 
-export function getEvaluationArtifactFile(revision: number, kind: ProposalArtifactKind): string {
+export function getEvaluationArtifactFile(revision: number, kind: FixedEvaluationArtifactKind): string {
 	if (!Number.isSafeInteger(revision) || revision <= 0) {
 		throw new Error("revision must be a positive safe integer");
 	}
@@ -176,12 +185,29 @@ export function getEvaluationArtifactFile(revision: number, kind: ProposalArtifa
 	return `revisions/${revision}/${kind}.md`;
 }
 
-export function getRetrospectiveArtifactFile(revision: number, evidenceDigest: string): string {
+function getEvidenceArtifactFile(
+	revision: number,
+	kind: "comparison" | "retrospective",
+	evidenceDigest: string,
+): string {
 	if (!Number.isSafeInteger(revision) || revision <= 0) {
 		throw new Error("revision must be a positive safe integer");
 	}
-	assertDigest(evidenceDigest, "retrospective evidence digest");
-	return `revisions/${revision}/retrospectives/${evidenceDigest}.md`;
+	assertDigest(evidenceDigest, `${kind} evidence digest`);
+	const extension = kind === "comparison" ? "json" : "md";
+	return `revisions/${revision}/${kind}s/${evidenceDigest}.${extension}`;
+}
+
+export function getRetrospectiveArtifactFile(revision: number, evidenceDigest: string): string {
+	return getEvidenceArtifactFile(revision, "retrospective", evidenceDigest);
+}
+
+export function getComparisonArtifactFile(revision: number, evidenceDigest: string): string {
+	return getEvidenceArtifactFile(revision, "comparison", evidenceDigest);
+}
+
+export function getComparisonMarkdownArtifactFile(revision: number, evidenceDigest: string): string {
+	return getComparisonArtifactFile(revision, evidenceDigest).replace(/\.json$/, ".md");
 }
 
 async function assertPlainDirectory(path: string, label: string): Promise<void> {
@@ -250,7 +276,9 @@ function assertArtifactReference(
 		throw new Error("Artifact reference diff digest does not match the revision");
 	if (reference.file !== expectedFile) throw new Error("Artifact reference does not match its fixed revision path");
 	if (reference.evidence) {
-		if (kind !== "retrospective") throw new Error("Only retrospective artifacts may bind an evidence snapshot");
+		if (kind !== "comparison" && kind !== "retrospective") {
+			throw new Error("Only comparison and retrospective artifacts may bind an evidence snapshot");
+		}
 		assertDigest(reference.evidence.digest, "Artifact evidence digest");
 		if (!reference.evidence.cutoff || !Number.isFinite(Date.parse(reference.evidence.cutoff))) {
 			throw new Error("Artifact evidence cutoff is invalid");
@@ -286,27 +314,26 @@ export async function writeEvaluationArtifact(options: WriteEvaluationArtifactOp
 	};
 }
 
-export async function writeRetrospectiveArtifact(
-	options: WriteRetrospectiveArtifactOptions,
-): Promise<EvaluationArtifactRef> {
+async function writeEvidenceArtifact(options: WriteEvidenceArtifactOptions): Promise<EvaluationArtifactRef> {
 	assertProposalRevision(options.proposalId, options.revision);
 	assertDigest(options.diffDigest, "diffDigest");
-	assertDigest(options.evidenceDigest, "retrospective evidence digest");
+	assertDigest(options.evidenceDigest, `${options.kind} evidence digest`);
 	if (!options.evidenceCutoff || !Number.isFinite(Date.parse(options.evidenceCutoff))) {
-		throw new Error("retrospective evidence cutoff is invalid");
+		throw new Error(`${options.kind} evidence cutoff is invalid`);
 	}
 	const resolved = await ensureRevisionDirectory(options.paths, options.proposalId, options.revision);
-	await ensurePlainDirectory(join(resolved.revisionDirectory, "retrospectives"), "Retrospective snapshot directory");
-	const file = getRetrospectiveArtifactFile(options.revision, options.evidenceDigest);
+	const directory = `${options.kind}s`;
+	await ensurePlainDirectory(join(resolved.revisionDirectory, directory), `${options.kind} snapshot directory`);
+	const file = getEvidenceArtifactFile(options.revision, options.kind, options.evidenceDigest);
 	const absolutePath = join(resolved.proposalDirectory, file);
 	const contentDigest = sha256(options.content);
 	if (!(await durableWriteOnceFile(absolutePath, options.content))) {
-		await assertRegularFile(absolutePath, "Retrospective snapshot");
+		await assertRegularFile(absolutePath, `${options.kind} snapshot`);
 		if (sha256(await readFile(absolutePath)) !== contentDigest) {
-			throw new Error(`Retrospective snapshot is write-once for evidence ${options.evidenceDigest}`);
+			throw new Error(`${options.kind} snapshot is write-once for evidence ${options.evidenceDigest}`);
 		}
 	}
-	await assertRegularFile(absolutePath, "Retrospective snapshot");
+	await assertRegularFile(absolutePath, `${options.kind} snapshot`);
 	return {
 		file,
 		sha256: contentDigest,
@@ -320,14 +347,36 @@ export async function writeRetrospectiveArtifact(
 	};
 }
 
+export function writeRetrospectiveArtifact(options: WriteRetrospectiveArtifactOptions): Promise<EvaluationArtifactRef> {
+	return writeEvidenceArtifact({ ...options, kind: "retrospective" });
+}
+
+export async function writeComparisonArtifact(options: WriteComparisonArtifactOptions): Promise<EvaluationArtifactRef> {
+	const reference = await writeEvidenceArtifact({ ...options, kind: "comparison" });
+	const markdownFile = getComparisonMarkdownArtifactFile(options.revision, options.evidenceDigest);
+	const markdownPath = join(options.paths.proposals, options.proposalId, markdownFile);
+	const markdownDigest = sha256(options.markdownContent);
+	if (!(await durableWriteOnceFile(markdownPath, options.markdownContent))) {
+		await assertRegularFile(markdownPath, "comparison markdown snapshot");
+		if (sha256(await readFile(markdownPath)) !== markdownDigest) {
+			throw new Error(`comparison markdown snapshot is write-once for evidence ${options.evidenceDigest}`);
+		}
+	}
+	await assertRegularFile(markdownPath, "comparison markdown snapshot");
+	return reference;
+}
+
 export async function readEvaluationArtifact(options: ReadEvaluationArtifactOptions): Promise<string> {
 	assertProposalRevision(options.proposalId, options.revision);
 	assertDigest(options.diffDigest, "diffDigest");
 	assertArtifactKind(options.kind);
-	const expectedFile =
-		options.kind === "retrospective" && options.reference.evidence
-			? getRetrospectiveArtifactFile(options.revision, options.reference.evidence.digest)
-			: getEvaluationArtifactFile(options.revision, options.kind);
+	let expectedFile: string;
+	if (options.kind === "comparison" || options.kind === "retrospective") {
+		if (!options.reference.evidence) throw new Error(`${options.kind} artifact has no evidence binding`);
+		expectedFile = getEvidenceArtifactFile(options.revision, options.kind, options.reference.evidence.digest);
+	} else {
+		expectedFile = getEvaluationArtifactFile(options.revision, options.kind);
+	}
 	assertArtifactReference(options.reference, expectedFile, options.revision, options.diffDigest, options.kind);
 	const resolved = await assertRevisionDirectory(options.paths, options.proposalId, options.revision);
 	const absolutePath = join(resolved.proposalDirectory, expectedFile);
@@ -346,6 +395,32 @@ export async function saveProposalRevisionSnapshot(paths: EvoPaths, proposal: Pr
 	assertProposalRevision(proposal.id, proposal.revision);
 	assertDigest(proposal.diffDigest, "proposal.diffDigest");
 	const resolved = await ensureRevisionDirectory(paths, proposal.id, proposal.revision);
+	const changeFile = join(resolved.revisionDirectory, "change.json");
+	const changeContent = `${canonicalJson({
+		schemaVersion: 1,
+		proposalId: proposal.id,
+		revision: proposal.revision,
+		parentBundleDigest: proposal.parentBundleDigest,
+		...(proposal.candidateDigest ? { candidateDigest: proposal.candidateDigest } : {}),
+		kind: proposal.kind,
+		tier: proposal.tier,
+		motivation: proposal.motivation,
+		expectedEffect: proposal.expectedEffect,
+		risk: proposal.risk,
+		verifyPlan: proposal.verifyPlan,
+		trialPlan: proposal.trialPlan,
+		changedPaths: proposal.changedPaths,
+		diff: proposal.diff,
+		diffDigest: proposal.diffDigest,
+		approvalDigest: proposal.approvalDigest,
+	})}\n`;
+	const changeDigest = sha256(changeContent);
+	if (!(await durableWriteOnceFile(changeFile, changeContent))) {
+		await assertRegularFile(changeFile, "Proposal change snapshot");
+		if (sha256(await readFile(changeFile)) !== changeDigest) {
+			throw new Error(`Proposal change snapshot is write-once for revision ${proposal.revision}`);
+		}
+	}
 	await assertWritableFilePath(resolved.revisionFile, "Proposal revision snapshot");
 	await atomicWriteJson(resolved.revisionFile, proposal);
 	await assertRegularFile(resolved.revisionFile, "Proposal revision snapshot");

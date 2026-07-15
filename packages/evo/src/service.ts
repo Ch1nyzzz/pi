@@ -3,14 +3,37 @@ import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { compileBundle, loadCompiledBundle } from "./bundle/compile.ts";
 import { isDigest } from "./bundle/schema.ts";
+import { storeTrialComparison, trialEvidenceDigest } from "./comparison.ts";
+import { ensureEvolutionConfiguration } from "./evolve/config.ts";
+import {
+	applyInboxDecisions,
+	garbageCollectInbox,
+	type InboxGcResult,
+	initializeInboxLifecycle,
+	linkProposalInbox,
+	readInboxEntry,
+	readInboxLifecycleStates,
+	reopenProposalInbox,
+	resolveInboxEntry,
+	settleProposalInbox,
+} from "./inbox.ts";
+import { PREFERENCES_PATH, readBundlePreferenceMemory } from "./memory/preferences.ts";
 import {
 	type EvoBundleMigrationOptions,
 	inferAgentDirectoryForEvoRoot,
 	migratePiDataToBundleSource,
 } from "./migration.ts";
 import { type EvoPaths, ensureEvoLayout, getEvoPaths } from "./paths.ts";
-import { approveProposal, deferProposal, loadProposal, rejectProposal, reopenProposal } from "./proposal.ts";
-import { createRecorderStore, type StoredInboxEntry } from "./recorder/store.ts";
+import {
+	approveProposal,
+	deferProposal,
+	loadProposal,
+	proposalApproval,
+	rejectProposal,
+	reopenProposal,
+	stageProposal,
+} from "./proposal.ts";
+import { createRecorderStore, readSessionLog, resolveStoredPayload, type StoredInboxEntry } from "./recorder/store.ts";
 import { collectEvidenceCorpus } from "./reflect/evidence.ts";
 import { BundleRegistry, type BundleRegistryOptions } from "./registry/registry.ts";
 import { atomicWriteJson, canonicalJson, durableUnlink, readJsonIfExists, sha256, withFileLock } from "./storage.ts";
@@ -70,6 +93,7 @@ export class EvoService {
 	async init(enabledTools?: string[], migrationSources?: EvoBundleMigrationOptions): Promise<CompiledBundle> {
 		await this.registry.recoverPendingTransition();
 		await ensureEvoLayout(this.paths);
+		await ensureEvolutionConfiguration(this.paths);
 		const existingDigest = await this.registry.readStableDigest();
 		if (existingDigest) return loadCompiledBundle(this.paths, existingDigest);
 
@@ -133,23 +157,146 @@ export class EvoService {
 	}
 
 	async note(sessionId: string, text: string): Promise<StoredInboxEntry> {
-		return this.writeInbox(sessionId, "NOTE", text);
+		return this.writeInbox(sessionId, "NOTE", "note", text);
 	}
 
 	async request(sessionId: string, text: string): Promise<StoredInboxEntry> {
-		return this.writeInbox(sessionId, "REQUEST", text);
+		return this.writeInbox(sessionId, "REQUEST", "request", text);
+	}
+
+	async preference(sessionId: string, text: string): Promise<StoredInboxEntry> {
+		const normalized = text.trim();
+		const inbox = await this.writeInbox(sessionId, "PREFERENCE", "preference", normalized);
+		await applyInboxDecisions(
+			this.paths,
+			[
+				{
+					file: inbox.fileName,
+					kind: "preference",
+					instruction: normalized,
+					reason: "User explicitly recorded a durable preference",
+				},
+			],
+			new Set([inbox.fileName]),
+		);
+		await this.materializePreference(inbox.fileName);
+		return inbox;
+	}
+
+	async materializePreference(file: string): Promise<Proposal | undefined> {
+		const [entry, states, stable] = await Promise.all([
+			readInboxEntry(this.paths, file),
+			readInboxLifecycleStates(this.paths),
+			this.registry.readStableDigest(),
+		]);
+		if (!stable) throw new Error("Evo-Pi registry is not initialized");
+		const state = states.get(file) ?? (await initializeInboxLifecycle(this.paths, file));
+		if (state.kind !== "preference" || !state.instruction) {
+			throw new Error("Inbox entry is not an explicitly classified durable preference");
+		}
+		if (!entry.text.includes(state.instruction)) {
+			throw new Error("Durable preference instruction is not an exact inbox substring");
+		}
+		const events = await readSessionLog(this.paths, entry.sessionId);
+		const feedback = [...events]
+			.reverse()
+			.find((event) => event.type === "explicit_feedback" && event.inboxFile === file);
+		if (!feedback || feedback.type !== "explicit_feedback") {
+			throw new Error("Explicit durable preference has no recorder evidence event");
+		}
+		const quote = await resolveStoredPayload(this.paths, feedback.text);
+		if (typeof quote !== "string" || !quote.includes(state.instruction)) {
+			throw new Error("Recorder evidence does not contain the durable preference instruction");
+		}
+		const parent = await loadCompiledBundle(this.paths, stable);
+		const memory = await readBundlePreferenceMemory(parent);
+		if (memory.preferences.some((preference) => preference.instruction === state.instruction)) {
+			await resolveInboxEntry(this.paths, file, "Preference was already active", "materialized");
+			await garbageCollectInbox(this.paths);
+			return undefined;
+		}
+		const id = `pref-${sha256(state.instruction).slice(0, 16)}`;
+		if (memory.preferences.some((preference) => preference.id === id)) {
+			throw new Error(`Durable preference id collision: ${id}`);
+		}
+		const candidateMemory = {
+			schemaVersion: 1 as const,
+			preferences: [
+				...memory.preferences,
+				{
+					id,
+					instruction: state.instruction,
+					source: { sessionId: entry.sessionId, sequence: feedback.sequence, quote },
+					addedAt: new Date().toISOString(),
+				},
+			],
+		};
+		const proposal = await stageProposal({
+			paths: this.paths,
+			parentDigest: stable,
+			draft: {
+				motivation: "Materialize an explicit user-authored durable preference.",
+				expectedEffect: "The trusted harness applies the preference across future sessions.",
+				risk: "The user can remove the preference through the same trusted control path.",
+				verifyPlan: "Compile the bundle and verify exact append-only preference provenance.",
+				trialPlan: "No semantic experiment is required for an explicit user configuration change.",
+				source: "explicit-request",
+				evidence: [{ sessionId: entry.sessionId, sequence: feedback.sequence, quote }],
+				inboxReferences: [file],
+				replayScenarios: [],
+				changes: [
+					{
+						path: PREFERENCES_PATH,
+						content: `${JSON.stringify(candidateMemory, undefined, "\t")}\n`,
+					},
+				],
+			},
+			observationsMarkdown: "# Explicit durable preference\n\nMaterialized directly from exact user evidence.",
+		});
+		if (proposal.tier !== "T0") throw new Error("Explicit durable preference did not classify as T0");
+		return this.approve(proposal.id, proposalApproval(proposal));
+	}
+
+	async forgetPreference(sessionId: string, preferenceId: string): Promise<StoredInboxEntry> {
+		if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(preferenceId)) {
+			throw new Error("Preference id is invalid");
+		}
+		return this.writeInbox(
+			sessionId,
+			"REQUEST",
+			"request",
+			`Remove the active durable preference with id ${preferenceId}`,
+		);
+	}
+
+	async gcInbox(dryRun = false): Promise<InboxGcResult> {
+		return garbageCollectInbox(this.paths, dryRun);
+	}
+
+	async resolveInbox(file: string, reason: string): Promise<void> {
+		await resolveInboxEntry(this.paths, file, reason);
+		await garbageCollectInbox(this.paths);
 	}
 
 	async approve(id: string, expected: ProposalApproval): Promise<Proposal> {
-		return this.withIntent("approve", { id, expected }, (idempotencyKey, expectedStateDigest) =>
+		const proposal = await this.withIntent("approve", { id, expected }, (idempotencyKey, expectedStateDigest) =>
 			approveProposal(this.paths, id, expected, undefined, this.registry, idempotencyKey, expectedStateDigest),
 		);
+		if (proposal.status === "kept") {
+			await settleProposalInbox(this.paths, proposal);
+			await garbageCollectInbox(this.paths);
+		} else {
+			await linkProposalInbox(this.paths, proposal);
+		}
+		return proposal;
 	}
 
 	async reject(id: string, reason: string): Promise<Proposal> {
-		return this.withIntent("reject", { id, reason }, (idempotencyKey, expectedStateDigest) =>
+		const proposal = await this.withIntent("reject", { id, reason }, (idempotencyKey, expectedStateDigest) =>
 			rejectProposal(this.paths, id, reason, this.registry, idempotencyKey, expectedStateDigest),
 		);
+		await reopenProposalInbox(this.paths, proposal, "Linked proposal was rejected; input remains open");
+		return proposal;
 	}
 
 	async defer(id: string, reason: string, until?: string): Promise<Proposal> {
@@ -169,12 +316,23 @@ export class EvoService {
 			"rollback",
 			{ targetDigest: targetDigest ?? null, reason },
 			async (idempotencyKey, expectedStateDigest) => {
+				const trial = await this.registry.readTrial();
+				if (trial) {
+					await storeTrialComparison(this.paths, await loadProposal(this.paths, trial.proposalId), trial);
+				}
 				const { from, to } = await this.registry.rollbackProposal(
 					targetDigest,
 					reason,
 					idempotencyKey,
 					expectedStateDigest,
 				);
+				if (trial) {
+					await reopenProposalInbox(
+						this.paths,
+						await loadProposal(this.paths, trial.proposalId),
+						"Trial rolled back; linked input reopened",
+					);
+				}
 				return { from, to };
 			},
 		);
@@ -182,8 +340,26 @@ export class EvoService {
 
 	async keep(reason: string): Promise<Proposal> {
 		return this.withIntent("keep", { reason }, async (idempotencyKey, expectedStateDigest) => {
-			const corpus = await collectEvidenceCorpus(this.paths, { mode: "full" });
-			return this.registry.keepProposal(reason, idempotencyKey, expectedStateDigest, corpus.evidenceDigest);
+			const trial = await this.registry.readTrial();
+			let evidenceDigest: string | undefined;
+			if (trial) {
+				const proposal = await loadProposal(this.paths, trial.proposalId);
+				const [corpus, storedComparison] = await Promise.all([
+					collectEvidenceCorpus(this.paths, { mode: "full", completedSessionsOnly: true }),
+					storeTrialComparison(this.paths, proposal, trial),
+				]);
+				evidenceDigest = trialEvidenceDigest(corpus.evidenceDigest, storedComparison.comparison.evidenceDigest);
+			} else {
+				const stable = await this.registry.readStableDigest();
+				const completed = (await this.listProposals()).find(
+					(proposal) => proposal.status === "kept" && proposal.candidateDigest === stable,
+				);
+				evidenceDigest = completed?.artifacts.retrospective?.evidence?.digest;
+			}
+			const proposal = await this.registry.keepProposal(reason, idempotencyKey, expectedStateDigest, evidenceDigest);
+			await settleProposalInbox(this.paths, proposal);
+			await garbageCollectInbox(this.paths);
+			return proposal;
 		});
 	}
 
@@ -254,14 +430,29 @@ export class EvoService {
 		return result;
 	}
 
-	private async writeInbox(sessionId: string, kind: "NOTE" | "REQUEST", text: string): Promise<StoredInboxEntry> {
+	private async writeInbox(
+		sessionId: string,
+		label: "NOTE" | "REQUEST" | "PREFERENCE",
+		kind: "note" | "request" | "preference",
+		text: string,
+	): Promise<StoredInboxEntry> {
 		const normalized = text.trim();
-		if (!normalized) throw new Error(`${kind.toLowerCase()} text must not be empty`);
+		if (!normalized) throw new Error(`${label.toLowerCase()} text must not be empty`);
 		const store = await createRecorderStore({
 			paths: this.paths,
 			sessionId,
 			bundleDigest: await this.registry.readStableDigest(),
 		});
-		return store.writeInbox(`${kind}: ${normalized}`, "extension");
+		const inbox = await store.writeInbox(`${label}: ${normalized}`, "extension", kind);
+		await initializeInboxLifecycle(this.paths, inbox.fileName);
+		if (kind === "preference") {
+			await store.append({
+				type: "explicit_feedback",
+				source: "extension",
+				text: await store.storePayload(normalized),
+				inboxFile: inbox.fileName,
+			});
+		}
+		return inbox;
 	}
 }

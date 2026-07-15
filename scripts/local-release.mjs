@@ -11,6 +11,7 @@ const packages = [
 	{ directory: "packages/agent", name: "@earendil-works/pi-agent-core" },
 	{ directory: "packages/coding-agent", name: "@earendil-works/pi-coding-agent" },
 	{ directory: "packages/evo", name: "@earendil-works/pi-evo" },
+	{ directory: "packages/evo-pi", name: "@earendil-works/evo-pi" },
 ];
 
 function printUsage() {
@@ -166,19 +167,31 @@ function buildBunBinaryRelease(targetDirectory, archiveDirectory) {
 	return platform;
 }
 
-function createPiShim(installDirectory) {
+function createCommandShim(installDirectory, command) {
 	const binDirectory = join(installDirectory, "node_modules", ".bin");
 	if (process.platform === "win32") {
-		if (existsSync(join(binDirectory, "pi.cmd"))) {
-			writeFileSync(join(installDirectory, "pi.cmd"), '@ECHO off\r\n"%~dp0node_modules\\.bin\\pi.cmd" %*\r\n');
-			writeFileSync(join(installDirectory, "pi.ps1"), '& "$PSScriptRoot/node_modules/.bin/pi.ps1" @args\n');
+		if (existsSync(join(binDirectory, `${command}.cmd`))) {
+			writeFileSync(
+				join(installDirectory, `${command}.cmd`),
+				`@ECHO off\r\n"%~dp0node_modules\\.bin\\${command}.cmd" %*\r\n`,
+			);
+			writeFileSync(
+				join(installDirectory, `${command}.ps1`),
+				`& "$PSScriptRoot/node_modules/.bin/${command}.ps1" @args\n`,
+			);
 			return;
 		}
-		writeFileSync(join(installDirectory, "pi.cmd"), '@ECHO off\r\n"%~dp0node_modules\\.bin\\pi.exe" %*\r\n');
-		writeFileSync(join(installDirectory, "pi.ps1"), '& "$PSScriptRoot/node_modules/.bin/pi.exe" @args\n');
+		writeFileSync(
+			join(installDirectory, `${command}.cmd`),
+			`@ECHO off\r\n"%~dp0node_modules\\.bin\\${command}.exe" %*\r\n`,
+		);
+		writeFileSync(
+			join(installDirectory, `${command}.ps1`),
+			`& "$PSScriptRoot/node_modules/.bin/${command}.exe" @args\n`,
+		);
 		return;
 	}
-	symlinkSync(join("node_modules", ".bin", "pi"), join(installDirectory, "pi"));
+	symlinkSync(join("node_modules", ".bin", command), join(installDirectory, command));
 }
 
 function packPackage(pkg, tarballDirectory) {
@@ -241,7 +254,9 @@ if (!options.skipInstall) {
 	writeFileSync(join(nodeInstallDirectory, "package.json"), installPackageJson);
 
 	run("npm", ["install", "--omit=dev", "--ignore-scripts"], { cwd: nodeInstallDirectory });
-	createPiShim(nodeInstallDirectory);
+	createCommandShim(nodeInstallDirectory, "pi");
+	createCommandShim(nodeInstallDirectory, "evo-pi");
+	createCommandShim(nodeInstallDirectory, "evo-pi-admin");
 
 	if (!options.skipBunInstall) {
 		if (!commandExists("bun")) {
@@ -253,7 +268,9 @@ if (!options.skipInstall) {
 		);
 		writeFileSync(join(bunInstallDirectory, "package.json"), `${JSON.stringify({ private: true, dependencies: bunDependencies, overrides: bunDependencies }, undefined, "\t")}\n`);
 		run("bun", ["install", "--production", "--ignore-scripts"], { cwd: bunInstallDirectory });
-		createPiShim(bunInstallDirectory);
+		createCommandShim(bunInstallDirectory, "pi");
+		createCommandShim(bunInstallDirectory, "evo-pi");
+		createCommandShim(bunInstallDirectory, "evo-pi-admin");
 	}
 }
 
@@ -275,11 +292,13 @@ if (!options.skipInstall) {
 	console.log(`  ${nodeInstallDirectory}`);
 	console.log("\nRun the locally packed npm CLI from outside the repository:");
 	console.log(`  ${join(nodeInstallDirectory, process.platform === "win32" ? "pi.cmd" : "pi")} --help`);
+	console.log(`  ${join(nodeInstallDirectory, process.platform === "win32" ? "evo-pi.cmd" : "evo-pi")} --help`);
 
 	if (!options.skipBunInstall) {
 		console.log("\nIsolated Bun package install:");
 		console.log(`  ${bunInstallDirectory}`);
 		console.log("\nRun the locally packed Bun package CLI from outside the repository:");
 		console.log(`  ${join(bunInstallDirectory, process.platform === "win32" ? "pi.cmd" : "pi")} --help`);
+		console.log(`  ${join(bunInstallDirectory, process.platform === "win32" ? "evo-pi.cmd" : "evo-pi")} --help`);
 	}
 }

@@ -1,0 +1,379 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import { type Component, Key, matchesKey, type TUI, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import type { EvoPaths } from "../paths.ts";
+import type { EvolutionRun, EvolutionRunStatus } from "../types.ts";
+import { evolutionRunDirectory, listEvolutionRuns, readEvolutionRun } from "./run.ts";
+
+interface TranscriptEvent {
+	timestamp: string;
+	phase: string;
+	type: "text" | "thinking" | "tool-arguments" | "tool-call" | "tool-result" | "complete";
+	delta?: string;
+	name?: string;
+	arguments?: Record<string, unknown>;
+	text?: string;
+	isError?: boolean;
+	stopReason?: string;
+}
+
+interface RunArtifacts {
+	plan?: string;
+	experiment?: string;
+	evaluation?: string;
+}
+
+const TERMINAL_STATUSES = new Set<EvolutionRunStatus>(["completed", "failed", "cancelled"]);
+const PHASE_ORDER: EvolutionRunStatus[] = ["queued", "researching", "planned", "building", "evaluating", "completed"];
+const SECTION_NAMES = ["当前思考", "工具调用", "阶段成果"] as const;
+
+async function readOptional(path: string, maxCharacters = 40_000): Promise<string | undefined> {
+	try {
+		const text = await readFile(path, "utf8");
+		return text.length > maxCharacters ? `${text.slice(0, maxCharacters)}\n[内容已截断]` : text;
+	} catch {
+		return undefined;
+	}
+}
+
+async function readTranscript(paths: EvoPaths, runId: string): Promise<TranscriptEvent[]> {
+	const text = await readOptional(join(evolutionRunDirectory(paths, runId), "transcript.jsonl"), 500_000);
+	if (!text) return [];
+	return text.split("\n").flatMap((line) => {
+		try {
+			return [JSON.parse(line) as TranscriptEvent];
+		} catch {
+			return [];
+		}
+	});
+}
+
+function cleanThinking(value: string): string {
+	return value.replaceAll("**", "").replace(/\s+/g, " ").trim();
+}
+
+function elapsed(startedAt: string): string {
+	const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(startedAt)) / 1_000));
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	return minutes < 60 ? `${minutes}m ${seconds % 60}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+function phaseLabel(status: EvolutionRunStatus): string {
+	return {
+		queued: "等待执行",
+		researching: "研究问题并制定实验计划",
+		planned: "研究计划已冻结",
+		building: "构建候选改进",
+		evaluating: "评估候选效果",
+		paused: "已暂停",
+		completed: "已完成",
+		failed: "执行失败",
+		cancelled: "已取消",
+	}[status];
+}
+
+function toolDescription(event: TranscriptEvent): string {
+	const args = event.arguments ?? {};
+	if (event.name === "evo_research_search") {
+		return `检索 ${String(args.source ?? "资料源")}：${String(args.query ?? "")}`;
+	}
+	if (event.name === "evo_research_fetch") return `读取研究资料：${String(args.url ?? args.id ?? "")}`;
+	return `${event.name ?? "工具"} ${Object.keys(args).length > 0 ? JSON.stringify(args) : ""}`.trim();
+}
+
+function currentActivity(events: TranscriptEvent[], status: EvolutionRunStatus): string {
+	for (let index = events.length - 1; index >= 0; index--) {
+		const event = events[index];
+		if (!event) continue;
+		if (event.type === "text" && cleanThinking(event.delta ?? "")) {
+			return `正在整理输出：${cleanThinking(event.delta ?? "")}`;
+		}
+		if (event.type === "thinking" && cleanThinking(event.delta ?? "")) return cleanThinking(event.delta ?? "");
+		if (event.type === "tool-call") return toolDescription(event);
+		if (event.type === "tool-result")
+			return event.isError ? `${event.name} 执行失败` : `${event.name} 已返回，正在分析`;
+	}
+	return phaseLabel(status);
+}
+
+function stageProgress(theme: Theme, status: EvolutionRunStatus): string {
+	const current = PHASE_ORDER.indexOf(status);
+	const stages = [
+		{ threshold: 1, label: "研究" },
+		{ threshold: 3, label: "构建" },
+		{ threshold: 4, label: "评估" },
+		{ threshold: 5, label: "完成" },
+	];
+	return stages
+		.map((stage) => {
+			if (status === "failed" || status === "cancelled") return theme.fg("muted", `○ ${stage.label}`);
+			if (current > stage.threshold) return theme.fg("success", `● ${stage.label}`);
+			if (current === stage.threshold || (stage.threshold === 1 && status === "planned")) {
+				return theme.fg("accent", `◆ ${stage.label}`);
+			}
+			return theme.fg("dim", `○ ${stage.label}`);
+		})
+		.join("  ");
+}
+
+function thinkingText(events: TranscriptEvent[]): string {
+	return events
+		.filter((event) => event.type === "thinking")
+		.map((event) => event.delta ?? "")
+		.join("")
+		.trim();
+}
+
+function toolEvents(events: TranscriptEvent[]): Array<{ call: TranscriptEvent; result?: TranscriptEvent }> {
+	const calls: Array<{ call: TranscriptEvent; result?: TranscriptEvent }> = [];
+	for (const event of events) {
+		if (event.type === "tool-call") calls.push({ call: event });
+		else if (event.type === "tool-result") {
+			const pending = [...calls].reverse().find((entry) => !entry.result && entry.call.name === event.name);
+			if (pending) pending.result = event;
+		} else if (event.type === "thinking" || event.type === "text") {
+			for (const pending of calls.filter((entry) => !entry.result)) {
+				pending.result = {
+					timestamp: event.timestamp,
+					phase: event.phase,
+					type: "tool-result",
+					name: pending.call.name,
+					isError: false,
+				};
+			}
+		}
+	}
+	return calls;
+}
+
+export class EvolutionProcessInspector implements Component {
+	private timer: NodeJS.Timeout;
+	private runs: EvolutionRun[] = [];
+	private run?: EvolutionRun;
+	private events: TranscriptEvent[] = [];
+	private artifacts: RunArtifacts = {};
+	private mode: "tasks" | "run";
+	private taskIndex = 0;
+	private sectionIndex = 0;
+	private expandedSection?: number;
+	private scrollFromBottom = 0;
+	private readonly tui: TUI;
+	private readonly theme: Theme;
+	private readonly paths: EvoPaths;
+	private readonly close: () => void;
+	private runId?: string;
+
+	constructor(tui: TUI, theme: Theme, paths: EvoPaths, runId: string | undefined, close: () => void) {
+		this.tui = tui;
+		this.theme = theme;
+		this.paths = paths;
+		this.runId = runId;
+		this.close = close;
+		this.mode = runId ? "run" : "tasks";
+		void this.refresh();
+		this.timer = setInterval(() => void this.refresh(), 250);
+		this.timer.unref?.();
+	}
+
+	private async refresh(): Promise<void> {
+		try {
+			this.runs = await listEvolutionRuns(this.paths);
+			this.taskIndex = Math.min(this.taskIndex, Math.max(0, this.runs.length - 1));
+			if (this.mode === "run" && this.runId) {
+				this.run = await readEvolutionRun(this.paths, this.runId);
+				const directory = evolutionRunDirectory(this.paths, this.runId);
+				[this.events, this.artifacts.plan, this.artifacts.experiment, this.artifacts.evaluation] =
+					await Promise.all([
+						readTranscript(this.paths, this.runId),
+						readOptional(join(directory, "plan.md")),
+						readOptional(join(directory, "experiment.json")),
+						readOptional(join(directory, "evaluation.md")),
+					]);
+			}
+			this.tui.requestRender();
+		} catch (error) {
+			if (this.mode === "run") {
+				this.run = undefined;
+				this.events = [
+					{
+						timestamp: new Date().toISOString(),
+						phase: "unknown",
+						type: "text",
+						delta: error instanceof Error ? error.message : String(error),
+					},
+				];
+			}
+			this.tui.requestRender();
+		}
+	}
+
+	private taskLines(): string[] {
+		const lines = [
+			this.theme.fg("accent", this.theme.bold("Evo 工作流")),
+			"",
+			"选择任务并按 Enter 查看实时进度：",
+			"",
+		];
+		if (this.runs.length === 0) lines.push(this.theme.fg("muted", "暂无任务"));
+		for (const [index, run] of this.runs.entries()) {
+			const selected = index === this.taskIndex;
+			const marker = selected ? this.theme.fg("accent", "›") : " ";
+			const stateColor = TERMINAL_STATUSES.has(run.status)
+				? "muted"
+				: run.status === "paused"
+					? "warning"
+					: "success";
+			lines.push(`${marker} ${this.theme.fg(stateColor, phaseLabel(run.status))}  ${run.request ?? "定时演化"}`);
+			lines.push(`    ${this.theme.fg("dim", `${run.id} · ${elapsed(run.startedAt)}`)}`);
+		}
+		lines.push("", this.theme.fg("dim", "↑↓ 选择 • Enter 查看 • Esc 关闭"));
+		return lines;
+	}
+
+	private sectionHeader(index: number, summary: string): string {
+		const marker = this.sectionIndex === index ? this.theme.fg("accent", "›") : " ";
+		const expanded = this.expandedSection === index ? "▾" : "▸";
+		return `${marker} ${expanded} ${this.theme.bold(SECTION_NAMES[index] ?? "详情")}  ${this.theme.fg("muted", summary)}`;
+	}
+
+	private runLines(): string[] {
+		const run = this.run;
+		if (!run) return [this.theme.fg("warning", "正在连接后台任务……")];
+		const thinking = thinkingText(this.events);
+		const tools = toolEvents(this.events);
+		const outcomes = [
+			this.artifacts.plan && "研究计划",
+			this.artifacts.experiment && "冻结实验",
+			run.proposalId && "候选提案",
+			this.artifacts.evaluation && "评估报告",
+		].filter(Boolean) as string[];
+		const lines = [
+			this.theme.fg("accent", this.theme.bold("Evo 工作流进度")),
+			"",
+			`${this.theme.bold("目标")}  ${run.request ?? "定时演化"}`,
+			`${this.theme.bold("状态")}  ${phaseLabel(run.status)} · ${elapsed(run.startedAt)} · PID ${run.workerPid ?? "已退出"}`,
+			"",
+			stageProgress(this.theme, run.status),
+			"",
+			`${this.theme.bold("当前活动")}  ${currentActivity(this.events, run.status)}`,
+			"",
+			this.sectionHeader(0, thinking ? `${thinking.length} 字符` : "尚无输出"),
+		];
+		if (this.expandedSection === 0) {
+			lines.push(
+				"",
+				...(thinking
+					? thinking.split("\n").map((line) => this.theme.fg("dim", `  ${line}`))
+					: ["  尚无 thinking 输出"]),
+				"",
+			);
+		}
+		lines.push(this.sectionHeader(1, tools.length > 0 ? `${tools.length} 次调用` : "尚未调用"));
+		if (this.expandedSection === 1) {
+			lines.push("");
+			for (const [index, entry] of tools.entries()) {
+				lines.push(`  ${index + 1}. ${toolDescription(entry.call)}`);
+				if (entry.result) {
+					lines.push(
+						this.theme.fg(
+							entry.result.isError ? "error" : "success",
+							`     ${entry.result.isError ? "失败" : "完成"}`,
+						),
+					);
+					if (entry.result.text)
+						lines.push(
+							...entry.result.text
+								.split("\n")
+								.slice(0, 12)
+								.map((line) => this.theme.fg("dim", `     ${line}`)),
+						);
+				} else lines.push(this.theme.fg("warning", "     运行中"));
+			}
+			if (tools.length === 0) lines.push("  尚无工具调用");
+			lines.push("");
+		}
+		lines.push(this.sectionHeader(2, outcomes.length > 0 ? outcomes.join("、") : "尚无阶段成果"));
+		if (this.expandedSection === 2) {
+			lines.push("");
+			if (this.artifacts.plan)
+				lines.push(
+					this.theme.fg("success", "  ✓ 研究计划"),
+					...this.artifacts.plan.split("\n").map((line) => `    ${line}`),
+				);
+			if (this.artifacts.experiment)
+				lines.push(
+					this.theme.fg("success", "  ✓ 冻结实验"),
+					...this.artifacts.experiment.split("\n").map((line) => `    ${line}`),
+				);
+			if (run.proposalId) lines.push(this.theme.fg("success", `  ✓ 候选提案 ${run.proposalId}`));
+			if (this.artifacts.evaluation)
+				lines.push(
+					this.theme.fg("success", "  ✓ 评估报告"),
+					...this.artifacts.evaluation.split("\n").map((line) => `    ${line}`),
+				);
+			if (outcomes.length === 0) lines.push("  当前阶段尚未生成可审阅成果");
+			lines.push("");
+		}
+		if (run.error) lines.push(this.theme.fg("error", `错误：${run.error}`), "");
+		lines.push(this.theme.fg("dim", "↑↓ 选择 • Enter 展开/收起 • Esc 返回任务列表 • 实时更新"));
+		return lines;
+	}
+
+	render(width: number): string[] {
+		const logical = this.mode === "tasks" ? this.taskLines() : this.runLines();
+		const wrapped = logical
+			.flatMap((line) => wrapTextWithAnsi(line, Math.max(1, width - 2)))
+			.map((line) => ` ${line}`);
+		const viewport = Math.max(5, this.tui.terminal.rows - 4);
+		const maxStart = Math.max(0, wrapped.length - viewport);
+		const start = Math.max(0, maxStart - this.scrollFromBottom);
+		return wrapped.slice(start, start + viewport);
+	}
+
+	handleInput(data: string): void {
+		if (matchesKey(data, Key.escape) || data === "q") {
+			if (this.mode === "run") {
+				this.mode = "tasks";
+				this.runId = undefined;
+				this.scrollFromBottom = 0;
+			} else this.close();
+			this.tui.requestRender();
+			return;
+		}
+		if (this.mode === "tasks") {
+			if (matchesKey(data, Key.up)) this.taskIndex = Math.max(0, this.taskIndex - 1);
+			else if (matchesKey(data, Key.down)) this.taskIndex = Math.min(this.runs.length - 1, this.taskIndex + 1);
+			else if (matchesKey(data, Key.enter)) {
+				const selected = this.runs[this.taskIndex];
+				if (selected) {
+					this.runId = selected.id;
+					this.run = selected;
+					this.mode = "run";
+					this.sectionIndex = 0;
+					this.expandedSection = undefined;
+					this.scrollFromBottom = 0;
+					void this.refresh();
+				}
+			}
+		} else {
+			if (matchesKey(data, Key.up)) this.sectionIndex = Math.max(0, this.sectionIndex - 1);
+			else if (matchesKey(data, Key.down))
+				this.sectionIndex = Math.min(SECTION_NAMES.length - 1, this.sectionIndex + 1);
+			else if (matchesKey(data, Key.enter)) {
+				this.expandedSection = this.expandedSection === this.sectionIndex ? undefined : this.sectionIndex;
+				this.scrollFromBottom = 0;
+			}
+			if (matchesKey(data, Key.home)) this.scrollFromBottom = Number.MAX_SAFE_INTEGER;
+			else if (matchesKey(data, Key.end)) this.scrollFromBottom = 0;
+		}
+		this.tui.requestRender();
+	}
+
+	invalidate(): void {}
+
+	dispose(): void {
+		clearInterval(this.timer);
+	}
+}

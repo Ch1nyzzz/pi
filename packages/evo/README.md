@@ -1,8 +1,8 @@
 # @earendil-works/pi-evo
 
-Evo-Pi is a self-evolving Pi coding-agent workflow. It records session evidence, proposes grounded data or code changes, evaluates them independently, and requires a human decision before anything becomes active or ready for integration.
+Evo-Pi is a self-evolving Pi coding-agent workflow. It records session evidence, runs a fixed research-plan → experiment → candidate cycle, evaluates candidates independently, and activates only through a deterministic standing release policy or explicit human decision.
 
-The implementation covers the complete data and isolated-code evolution loop: T0/T1/T2 risk tiers, revision-bound approval, trials and rollback, code worktrees, one-shot scheduled reflection, and runtime feature gates.
+The implementation covers T0/T1/T2 risk tiers, revision-bound approval, trials and rollback, code worktrees, scheduled evolution, user-editable workflow instructions, and host-defined component ABIs. The default control roles are ResearchPlanner `openai-codex/gpt-5.6-sol` at `max`, Builder `openai-codex/gpt-5.6-terra` at `max`, and Evaluator `openai-codex/gpt-5.6-terra` at `xhigh`; override them in `evo/config.json` when needed.
 
 ## Install
 
@@ -10,7 +10,7 @@ The implementation covers the complete data and isolated-code evolution loop: T0
 pi install npm:@earendil-works/pi-evo
 ```
 
-The package installs a Pi extension with one `/evo` command and the `evo-pi` local CLI.
+The package installs a Pi extension with one `/evo` command. The standalone Evo-Pi distribution exposes the same state-management operations through `evo-pi-admin`.
 
 Initialize the immutable seed bundle before running improvement workflows:
 
@@ -21,11 +21,12 @@ Initialize the immutable seed bundle before running improvement workflows:
 
 On first initialization, Evo-Pi automatically imports supported global Pi data from the agent directory into the seed bundle: `SYSTEM.md`, `APPEND_SYSTEM.md`, the first available `AGENTS.md`/`CLAUDE.md` context, and valid data-only skills. If none exists, initialization creates a policy-only seed.
 
-Then use Pi normally. The Recorder writes session evidence without making live optimization decisions. Run reflection when enough evidence exists:
+Then use Pi normally. The Recorder writes session evidence without making live optimization decisions. Run an evolution cycle when enough evidence exists:
 
 ```text
 /evo report
-/evo improve
+/evo go <research goal>
+/evo inspect
 /evo list
 /evo show <proposal-id>
 /evo permit <proposal-id>
@@ -35,32 +36,40 @@ Pending proposals appear in the Pi status bar; startup never opens an approval d
 
 ## Commands
 
-| Pi command | Local CLI | Purpose |
+| Pi command | Admin CLI | Purpose |
 |---|---|---|
-| `/evo help` | `evo-pi help` | Show command help. |
-| `/evo init` | `evo-pi init` | Migrate supported agent-global data into an immutable seed, or create a policy-only seed, and initialize `registry/stable`. Safe to run again. |
-| `/evo status` | `evo-pi status` | Show the stable digest, active trial, pending/deferred counts, and pause state. |
-| `/evo report` | `evo-pi report` | Generate a read-only evidence report covering the window since the last successful improve. |
-| `/evo improve` | `evo-pi improve` | Run the Reflector, grounding checks, L1 validation, and applicable Critic/replay steps; stage up to two proposals. |
-| `/evo scheduled-improve` | `evo-pi scheduled-improve` | Make one guarded scheduled-reflection attempt at the configured cadence, then exit. |
-| `/evo schedule [cadence]` | `evo-pi schedule [cadence]` | Show or set the reflection cadence: `daily`, `3d`, `weekly`, `every <n>d`, or `manual`. |
-| `/evo list` | `evo-pi list` | List proposals, revisions, and statuses. |
-| `/evo show <id>` | `evo-pi show <id>` | Show the proposal card, exact diff, evidence, validation, review, replay, and retrospective when present. |
-| `/evo note <text>` | `evo-pi note <session-id> <text>` | Add an explicit `NOTE:` inbox item. |
-| `/evo request <text>` | `evo-pi request <session-id> <text>` | Add an explicit `REQUEST:` inbox item. |
-| `/evo permit <id>` | `evo-pi permit <id>` | Ask questions, request an eligible revision, defer/reopen, reject, or approve the displayed proposal revision. |
-| `/evo reject <id> <reason>` | `evo-pi reject <id> <reason>` | Reject a pending or deferred proposal and journal the reason. |
-| `/evo rollback [digest] [reason]` | `evo-pi rollback [digest] [reason]` | Restore the active trial parent; without a trial, restore the stable bundle's manifest parent. An explicit target must be a previously committed stable ancestor. |
-| `/evo retrospect` | `evo-pi retrospect` | Generate and display a retrospective for the active data trial. |
-| `/evo keep [reason]` | `evo-pi keep [reason]` | Generate or reuse the current evidence-bound retrospective, ask for confirmation, then keep the active data trial. |
-| `/evo pause [reason]` | `evo-pi pause [reason]` | Pause proposal-generating improve and scheduled-improve runs. Recording, reports, and trial review continue. |
-| `/evo resume [reason]` | `evo-pi resume [reason]` | Resume improvement/reflection runs. |
+| `/evo help` | `evo-pi-admin help` | Show command help. |
+| `/evo init` | `evo-pi-admin init` | Migrate supported agent-global data into an immutable seed, or create a policy-only seed, and initialize `registry/stable`. Safe to run again. |
+| `/evo status` | `evo-pi-admin status` | Show the stable digest, active trial, pending/deferred counts, and pause state. |
+| `/evo report` | `evo-pi-admin report` | Generate a read-only evidence report covering the window since the last successful improve. |
+| `/evo go [request]` | `evo-pi-admin go [request]` | Start a detached headless ResearchPlanner → Builder → Evaluator task and return immediately. |
+| `/evo inspect [run-id]` | `evo-pi-admin inspect [run-id]` | Open the workflow task picker and a human-readable live dashboard; select Thinking, Tool calls, or Phase results and press Enter to expand. The local CLI prints a snapshot. |
+| `/evo pause <run-id>` | `evo-pi-admin pause <run-id>` | Suspend a live task without deleting its process or artifacts. |
+| `/evo resume <run-id>` | `evo-pi-admin resume <run-id>` | Continue a suspended task. |
+| `/evo delete <run-id>` | `evo-pi-admin delete <run-id>` | Stop a live worker and permanently delete the task directory. |
+| `/evo scheduled-improve` | `evo-pi-admin scheduled-improve` | Make one guarded scheduled-evolution attempt at the configured cadence, then exit. |
+| `/evo schedule [cadence]` | `evo-pi-admin schedule [cadence]` | Show or set the evolution cadence: `daily`, `3d`, `weekly`, `every <n>d`, or `manual`. |
+| `/evo workflow [reset]` | `evo-pi-admin workflow [reset]` | Show the trusted user-editable `workflow.md`, or restore its packaged default. |
+| `/evo list` | `evo-pi-admin list` | List proposals, revisions, and statuses. |
+| `/evo show <id>` | `evo-pi-admin show <id>` | Show the proposal card, exact diff, evidence, validation, review, replay, and retrospective when present. |
+| `/evo note <text>` | `evo-pi-admin note <session-id> <text>` | Add an explicit `NOTE:` inbox item. |
+| `/evo request <text>` | `evo-pi-admin request <session-id> <text>` | Add an explicit feature/research request. |
+| `/evo preference <text>` | `evo-pi-admin preference <session-id> <text>` | Materialize an explicit durable preference directly through the trusted append-only T0 path; no model cycle is used. |
+| `/evo preferences` | `evo-pi-admin preferences` | Show instructions in the active stable `memory/preferences.json`. |
+| `/evo forget <preference-id>` | `evo-pi-admin forget <session-id> <preference-id>` | Queue removal of an active preference through the normal evaluated release path. |
+| `/evo resolve <inbox-file> [reason]` | `evo-pi-admin resolve <inbox-file> [reason]` | Mark an externally completed input fulfilled and collect its payload. |
+| `/evo gc [--dry-run]` | `evo-pi-admin gc [--dry-run]` | Preview or collect terminal inbox payloads while retaining lifecycle tombstones. |
+| `/evo permit <id>` | `evo-pi-admin permit <id>` | Ask questions, request an eligible revision, defer/reopen, reject, or approve the displayed proposal revision. |
+| `/evo reject <id> <reason>` | `evo-pi-admin reject <id> <reason>` | Reject a pending or deferred proposal and journal the reason. |
+| `/evo rollback [digest] [reason]` | `evo-pi-admin rollback [digest] [reason]` | Restore the active trial parent; without a trial, restore the stable bundle's manifest parent. An explicit target must be a previously committed stable ancestor. |
+| `/evo retrospect` | `evo-pi-admin retrospect` | Generate and display a retrospective for the active data trial. |
+| `/evo keep [reason]` | `evo-pi-admin keep [reason]` | Generate or reuse the current evidence-bound retrospective, ask for confirmation, then keep the active data trial. |
 
-`report`, `improve`, `scheduled-improve`, `retrospect`, and `keep` may invoke the configured Pi subscription model and authentication. Every background model call appends model, token, cost, session, phase, and time metadata to `reports/model-usage.jsonl`; reports include a rolling seven-day usage summary. A retrospective is reused only while its proposal revision and full evidence digest are unchanged.
+`report`, `go`, `scheduled-improve`, `retrospect`, and `keep` may invoke the configured Pi subscription model and authentication. Every background model call appends model, token, cost, session, phase, and time metadata to `reports/model-usage.jsonl`; reports include a rolling seven-day usage summary. A retrospective is reused only while its proposal revision and full evidence digest are unchanged.
 
-The local `permit`, `reject`, `rollback`, `keep`, `pause`, and `resume` commands require both stdin and stdout to be interactive terminals and fail closed for piped input. The decision flow asks for explicit confirmation before the corresponding state or pointer transition.
+The local `permit`, `reject`, `rollback`, `keep`, and `delete` commands require both stdin and stdout to be interactive terminals when they require confirmation. Task `pause`, `resume`, and `inspect` are direct lifecycle operations keyed by run ID.
 
-`pause` blocks new interactive improve runs and aborts an in-flight scheduled-improve through its `AbortSignal`. An interactive improve that already passed its start check is not polled; stop that foreground command directly if needed.
+`go` persists the run before spawning a detached worker, writes worker output to the run's `worker.log`, and never occupies the current Pi conversation. `pause` suspends that worker and `resume` continues the same process; `delete` is a separate irreversible operation that kills the worker before removing its run directory.
 
 ## Initial resource migration
 
@@ -75,7 +84,7 @@ The default Evo root is inside the Pi agent directory, so first-time `init` auto
 
 Migration accepts regular, non-executable UTF-8 Markdown data. Skill discovery must match Pi's loader exactly, and a skill containing `SKILL.md` may not carry support code or other files. Symlinks, executable files, ambiguous skills, unsupported files, path collisions, and sources that change while being read fail initialization.
 
-Library callers can declare additional sources explicitly. Prompt, memory, and preference directories must contain direct Markdown files; skill directories must satisfy the same data-only rules:
+Library callers can declare additional sources explicitly. Migrated prompt, memory, and preference directories must contain direct Markdown files; skill directories must satisfy the same data-only rules. Evo-managed durable preferences use the separately validated `memory/preferences.json` schema:
 
 ```ts
 await service.init(undefined, {
@@ -91,31 +100,35 @@ Each migrated asset records its canonical source root, relative source path, bun
 
 ## Evolution workflow
 
-1. The Recorder pins each session event stream to the selected bundle digest. Explicit notes and requests are stored in the inbox with their source session ID.
-2. The Reflector reads a bounded incremental evidence corpus with independent bundle, history, inbox, and session quotas, and may return at most two proposals. It always writes a grounded observation artifact, even when it proposes nothing, and advances `registry/review-cursor.json` only after the complete run succeeds. Reports, permit review, and retrospectives use a full corpus.
-3. Data changes are compiled into immutable content-addressed bundles. Code patches are staged in the index of a proposal-specific Git worktree whose branch starts at the current commit.
-4. Evo-Pi determines the actual kind and risk tier, runs the fixed deterministic L1 profile, and adds the required Critic or replay artifacts.
-5. A human reviews one exact revision. Approval fails if the revision, diff, canonical review/replay/validation references, bundle parent, code base commit, repository identity, or worktree integrity no longer matches.
-6. Approved T0 data becomes stable immediately; T1/T2 data starts a reversible trial; approved code remains isolated for manual integration.
+1. The Recorder pins every foreground session event stream to the selected bundle digest, backfills missing user turns when a session is resumed, and writes a compact derived session digest. A cheap phrase matcher may copy likely durable instructions to the inbox only as unclassified candidates; it never decides that a feature request is a preference.
+2. The trusted `/evo preference` path directly materializes an exact user-authored instruction without model calls. ResearchPlanner classifies ambiguous natural-language candidates as `preference`, `request`, `note`, or `task-local`. Open inferred preferences and requests remain visible across evidence-cursor advances; merely reviewing an item does not consume it.
+3. Sol Ultra writes immutable `runs/<id>/plan.md` and `experiment.json`. The experiment is frozen before implementation and may reference only fixed check profiles, never model-selected shell commands.
+4. Terra Max returns one exact data change or code patch after read-only repository inspection. Data compiles to an immutable bundle; code is staged and validated in an isolated worktree.
+5. Terra XHigh evaluates the frozen experiment, then runs a second adversarial pass in a fresh context. Existing T2 generate-only replay retains its stated limitations.
+6. Deterministic release policy may apply supported T0 data directly or start a reversible data/component trial when standing policy allows. New ABI, arbitrary code, capability-expanding, and control-boundary changes remain pending for explicit review.
+7. Kept preference candidates become structured `memory/preferences.json`; kept requests become fulfilled. Rollback reopens linked inputs. Terminal inbox payloads are garbage-collected after a digest-bearing tombstone is written, while active preferences remain in the bundle.
+8. The evidence cursor advances only after the complete cycle succeeds. For a private project, create `.pi/evo-private` to suppress recording entirely.
+
+The sequence is intentionally fixed rather than a model-generated DAG. Users may edit `${PI_CODING_AGENT_DIR}/evo/workflow.md`; the model cannot edit that trusted file during an evolution run.
 
 The proposal card is the approval boundary. A revision produces a new diff and new approval context; confirmation of an older revision cannot approve it. Questions, answers, revision requests/results, deferrals, and reopens are retained in the proposal approval log.
 
-## Human approval tiers
+## Human and standing approval tiers
 
-Evo-Pi derives `kind` and tier from the candidate contents rather than trusting the model's requested tier. A model may only make the tier stricter.
+Evo-Pi derives `kind` and tier from candidate contents rather than trusting a model. `evo/config.json` controls standing automatic T0 application and reversible data/component trials. Disable those booleans to require an explicit decision for every activation. A model may only make review stricter.
 
 | Tier | Behavior |
 |---|---|
-| T0 | Deterministically low-risk data changes, currently proven reorder-only changes or one verbatim preference captured by the explicit-feedback recorder event. Approval advances `registry/stable` and marks the proposal kept without a trial. |
-| T1 | Other non-core data changes. The proposal requires a Critic artifact. Approval starts a trial rather than permanently accepting the candidate. |
-| T2 data | Core data or policy changes. The proposal requires Critic review, generate-only counterfactual replay, and exact approval-context confirmation. Approval starts a trial. |
-| T2 code | Every code proposal. The proposal requires isolated-worktree L1 validation, Critic review, generate-only `code-patch-hypothesis` replay, and exact approval-context confirmation. Approval records the staged worktree as ready for an explicit human commit and normal integration; it does not alter the stable bundle or main worktree. |
+| T0 | Deterministically low-risk data changes: proven reorder-only changes, legacy verbatim memory additions, or append-only `memory/preferences.json` entries whose instruction and source quote are verified against a recorded user event. Standing policy may advance `registry/stable` directly; otherwise explicit approval is required. |
+| T1 | Other non-core data changes. The proposal requires an independent Evaluator artifact. Standing policy or explicit approval starts a trial rather than permanently accepting the candidate. |
+| T2 data | Core data or policy changes. The proposal requires Evaluator review, generate-only counterfactual replay, and exact approval-context confirmation. A pre-defined ABI component may enter a standing-policy trial; a new ABI cannot. |
+| T2 code | Every ordinary code proposal. The proposal requires isolated-worktree L1 validation, Evaluator review, generate-only `code-patch-hypothesis` replay, and exact approval-context confirmation. It remains isolated for explicit source integration. |
 
 Changes to `managedSources`, `enabledTools`, or `enabledFeatures` are always core T2 data changes because they alter the runtime trust or executable-capability boundary.
 
 For a managed-source T2 data replay, Evo-Pi uses the Recorder's original `systemPromptOptions` to reconstruct the parent and candidate bases, preserves other extension wrappers, and excludes targets already consumed by semantic prompt/context/skill replacement. Missing or ambiguous reconstruction fails the replay instead of evaluating a duplicated prompt.
 
-For T1 and T2 proposals, `permit` can ask grounded follow-up questions before a decision. T2 proposals can also be revised from explicit constraints. A revision reruns applicable staging, validation, replay, and Critic work. Pending proposals can be deferred and later reopened without losing their approval transcript.
+For T1 and T2 proposals, `permit` can ask grounded follow-up questions before a decision. T2 proposals can also be revised from explicit constraints. A revision reruns applicable staging, validation, replay, and Evaluator work. Pending proposals can be deferred and later reopened without losing their approval transcript.
 
 Final confirmation binds the displayed revision and diff plus a canonical digest of the current review, replay, and validation references. For code, the approval context also binds the repository, base commit, and exact staged diff, rather than treating the patch text as portable between repositories or commits.
 
@@ -151,13 +164,13 @@ Approving a T1 or T2 data proposal performs a crash-recoverable registry transit
 
 During a trial:
 
-1. Use Pi normally and collect evidence.
-2. Run `/evo retrospect` to inspect an immutable pre/post memo bound to the proposal revision and the current full evidence digest.
-3. Run `/evo keep` to reuse that snapshot only if the evidence digest is still current, or `/evo rollback` to restore the parent immediately. New evidence makes the prior memo stale, so generate and review another retrospective before keeping.
+1. Use Pi normally; every completed pinned session joins the baseline or candidate cohort automatically.
+2. After 10 candidate sessions or 7 days by default, the background loop writes an immutable automatic comparison and retrospective. `/evo retrospect` remains available to refresh it manually.
+3. Review the comparison through `/evo show <proposal>` and run `/evo keep` or `/evo rollback`. New evidence makes the prior memo stale, so keeping refreshes the evidence check.
 
 Bundles are immutable and content-addressed. Rollback accepts only a digest recorded as committed stable history that is also an ancestor of the current stable manifest chain; the current digest, a pending candidate, or a detached historical bundle is rejected. A successful rollback changes the registry pointer and current proposal lifecycle status without rewriting historical bundles, revision artifacts, approval logs, or recorded evidence.
 
-## Background reflection cadence
+## Background evolution cadence
 
 Evo-Pi reflects on its own schedule with no external setup. The Pi extension runs the guarded scheduled-improve loop inside live sessions: shortly after a session starts, and periodically while it stays open, it makes one guarded attempt at the configured cadence. The user only sees the result — a status-bar entry and notification when new proposals are staged for approval.
 
@@ -165,23 +178,44 @@ The cadence persists in `registry/schedule.json` and is controlled with `/evo sc
 
 - `/evo schedule` shows the cadence, the last background run, and the next eligible day (interactively it also offers the presets).
 - `/evo schedule daily | 3d | weekly | every <n>d` reflects at most once every N local days (default: every 3 days).
-- `/evo schedule manual` disables automatic reflection entirely; only explicit `/evo improve` runs the Reflector.
+- `/evo schedule manual` disables automatic evolution entirely; explicit `/evo go` tasks remain available.
 
 Every attempt — in-session or external — passes the same guards: pause state, cadence (`interval-not-elapsed` until N days after the last completed run), optional quiet hours (`null` by default, meaning any time), recent session-log activity from *other* sessions (the running session's own log is excluded), the per-day run limit, and an atomically published heartbeating directory lease that excludes concurrent runs. Torn trailing run-journal records are repaired, started/completed/failed events are recorded, and a failed run does not push back the cadence, so the next eligible day retries.
 
 While a scheduled run is active, Evo-Pi monitors pause state through its `AbortSignal` and checks pause again while holding the registry lock before it records completion. A pause cannot race a final successful completion into the journal.
 
-`evo-pi scheduled-improve` remains available as a one-shot guarded attempt for cron, systemd, launchd, or another external scheduler; it honors the same persisted schedule. For example, an hourly cron entry lets Evo-Pi's own guards select at most one eligible run:
+`evo-pi-admin scheduled-improve` remains available as a one-shot guarded attempt for cron, systemd, launchd, or another external scheduler; it honors the same persisted schedule. For example, an hourly cron entry lets Evo-Pi's own guards select at most one eligible run:
 
 ```cron
-0 * * * * evo-pi scheduled-improve
+0 * * * * evo-pi-admin scheduled-improve
 ```
 
 Library callers can pass `quietHours` (or `null`), `inactivityMinutes`, `dailyRunLimit`, `everyDays`, and `lockStaleMs` to `runScheduledImprove`, or use `runConfiguredImprove` to honor `registry/schedule.json`; their `improve(signal)` callback must honor the supplied `AbortSignal`. An external scheduler must provide the same `PI_CODING_AGENT_DIR`, model authentication, working directory, and runtime environment as interactive Pi.
 
+## Host-defined component ABIs
+
+A bundle may select a content-addressed implementation only for an ABI registered by the host. The first supported ABI is `compaction/v1`; unknown ABI names and versions fail bundle compilation. A selection binds surface, component id, ABI, artifact digest, and JSON configuration:
+
+```json
+{
+  "components": {
+    "compaction": {
+      "id": "hierarchical-summary",
+      "abi": "compaction/v1",
+      "artifactDigest": "<sha256>",
+      "config": {}
+    }
+  }
+}
+```
+
+Component artifacts contain an immutable `manifest.json` and `.mjs` JSONL process entrypoint. Loading verifies the complete artifact identity, ABI activation boundary, configuration schema, and requested capabilities against the ABI ceiling. Generated components run out-of-process with no inherited credentials and, on Linux, a networkless bubblewrap launcher. The runtime validates every invocation input and output. A failed compaction component falls back to Pi's default compaction and is visible to the Recorder.
+
+The host predefines slots, not implementations. Evo may research and prepare a T2 patch for a new ABI, but an unknown ABI cannot declare itself and activate in the same cycle.
+
 ## Runtime feature gates
 
-The pinned bundle may select `enabledTools` and `modelRouting.worker`. A worker route is either `provider/model` or a bare model ID that must be unique. Bundle loading, managed-source verification, route resolution, and model activation are fail-closed: a failure clears bundle features, blocks all tools, and restores the pre-bundle model when possible. Session replacement and shutdown restore the original model and tool set.
+The pinned bundle may select `enabledTools`, `components`, and `modelRouting.worker`. A worker route is either `provider/model` or a bare model ID that must be unique. Bundle loading, managed-source verification, route resolution, and model activation are fail-closed: a failure clears bundle features, blocks all tools, and restores the pre-bundle model when possible. Session replacement and shutdown restore the original model and tool set.
 
 Code merged into the package can remain dormant by registering it through `createEvoExtension({ codeFeatures })`. Each definition receives a restricted `EvoCodeFeatureAPI` containing only guarded `on` and `registerTool` methods:
 
@@ -216,14 +250,21 @@ By default, data is stored under `${PI_CODING_AGENT_DIR:-~/.pi/agent}/evo/`:
 
 ```text
 log/<session-id>.jsonl                    Recorder events
+session-digests/<session-id>.json         Derived per-session metrics and evidence references
 artifacts/sha256/<digest>                 Large message, tool-output, and diff payloads
-inbox/                                    Explicit notes and requests
+components/sha256/<digest>/               Immutable ABI component artifacts
+runs/<run-id>/{run.json,plan.md,...}      Fixed evolution-cycle state and artifacts
+workflow.md                               Trusted user-editable workflow instructions
+config.json                               Trusted role routes and standing release policy
+inbox/                                    Active unclassified/preference/request/note payloads
+bundles/<digest>/memory/preferences.json  Structured active preference instructions and provenance
 bundles/<digest>/                         Immutable compiled data bundles
 registry/stable                           Active bundle digest
 registry/trial.json                       Active data trial, when present
 registry/transition.json                  In-flight crash-recovery after-images, when present
 registry/receipts.jsonl                   Append-only operation completion receipts
 registry/history.jsonl                    Append-only decisions and pointer changes
+registry/inbox-history.jsonl              Inbox classification, lifecycle, and GC tombstones
 registry/improve-runs.jsonl               Scheduled-run started/completed/failed events
 registry/review-cursor.json               Last successfully reviewed incremental evidence
 registry/paused                           Pause marker
@@ -231,6 +272,8 @@ registry/intents/                         State-bound service operation intents
 proposals/<proposal-id>/proposal.json     Current proposal revision and state
 proposals/<proposal-id>/approval.jsonl     Questions, answers, revisions, deferrals, and reopens
 proposals/<proposal-id>/revisions/<n>/     Revision snapshot, exact artifacts, and code metadata
+proposals/<proposal-id>/revisions/<n>/change.json
+proposals/<proposal-id>/revisions/<n>/comparisons/<digest>.{json,md}
 proposals/<proposal-id>/revisions/<n>/retrospectives/<digest>.md
 reports/*.md                              Generated observation and evidence reports
 reports/model-usage.jsonl                 Append-only background model usage journal
@@ -250,10 +293,10 @@ Evaluation artifacts are write-once, content-digested, and bound to the proposal
 
 - Automatic `init` migration covers only conventional agent-global `SYSTEM.md`, `APPEND_SYSTEM.md`, the first `AGENTS.md`/`CLAUDE.md` context, and data-only skills, plus explicitly declared library sources. It does not infer arbitrary settings, project-local instructions, dependencies, or executable skill support files.
 - Replay is generate-only. Data replay compares a first response or intended first action; code replay uses the patch as quoted hypothesis data and predicts a speculative first response or action. Neither restores a workspace, loads candidate code or tool schemas, executes tools, or establishes end-to-end behavior.
-- Code approval is not deployment. Evo-Pi never automatically commits, merges, cherry-picks, installs dependencies, or changes the main worktree.
-- Low-level registry and service APIs are trusted host-integration surfaces and must not be exposed as model tools. Built-in model runs disable all tools, and generated code remains isolated until a human manually commits and integrates it. A process already running as the same Unix user can import these APIs, edit Evo-Pi files, or automate a pseudo-terminal, so this is not a hard security boundary against a malicious same-user process.
+- Ordinary source-patch approval is not deployment. Evo-Pi never automatically commits, merges, cherry-picks, installs dependencies, or changes the main worktree. Only artifacts implementing a pre-defined ABI may enter the isolated component trial path.
+- Low-level registry and service APIs are trusted host-integration surfaces and are not model tools. ResearchPlanner receives read-only local tools plus allowlisted public research tools; Builder receives read-only repository tools and returns a patch or component artifact. Generated components run through validated JSONL RPC and, on supported Linux hosts, a no-network `bwrap` sandbox. A process already running as the same Unix user can still edit Evo-Pi files or automate a pseudo-terminal, so this is not a hard security boundary against a malicious same-user process.
 - The local CLI's TTY check prevents ordinary non-interactive mutation but cannot prove that a real human controls the terminal. Protect the host account and Evo-Pi directory accordingly.
 - Protected-path checks guard the current judge prompts and registry implementation; path checks cannot prove the semantics of arbitrary code, so human review must reject patches that introduce alternate approval or registry-write paths.
-- In-session background reflection only runs while a Pi session is open; a machine that never runs Pi needs cron, systemd, launchd, or another external trigger for `evo-pi scheduled-improve`. Both paths honor the persisted `/evo schedule` cadence.
+- In-session background evolution only runs while a Pi session is open; a machine that never runs Pi needs cron, systemd, launchd, or another external trigger for `evo-pi-admin scheduled-improve`. Both paths honor the persisted `/evo schedule` cadence.
 - Controlled `codeFeatures` gating covers only hooks and tools registered through `EvoCodeFeatureAPI`. Direct raw `ExtensionAPI` use, retained API references, other registration channels, commands, shortcuts, providers, and module or `setup` side effects remain outside the wrapper.
 - The default code validator requires a supported OS sandbox and a fixed related-test mapping. Unsupported platforms or unmapped candidates fail closed and require workflow/code changes rather than reduced validation.

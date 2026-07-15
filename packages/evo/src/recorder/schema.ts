@@ -38,6 +38,8 @@ export interface MessageRecord {
 	type: "message";
 	role: string;
 	message: StoredPayload;
+	/** Pi session entry id, used to deduplicate resume-time backfill. */
+	sourceEntryId?: string;
 }
 
 export interface UsageRecord {
@@ -80,6 +82,18 @@ export interface ExplicitFeedbackRecord {
 	inboxFile: string;
 }
 
+export interface CompactionRecord {
+	type: "compaction";
+	reason: "manual" | "threshold" | "overflow";
+	willRetry: boolean;
+	fromExtension: boolean;
+	firstKeptEntryId: string;
+	tokensBefore: number;
+	durationMs: number | null;
+	summary: StoredPayload;
+	details?: StoredPayload;
+}
+
 export type RecorderEventData =
 	| SessionStartRecord
 	| SessionEndRecord
@@ -88,10 +102,13 @@ export type RecorderEventData =
 	| UsageRecord
 	| ToolRecord
 	| GitDiffRecord
-	| ExplicitFeedbackRecord;
+	| ExplicitFeedbackRecord
+	| CompactionRecord;
 
 export type RecorderEvent = RecorderEventBase & RecorderEventData;
 export type RecordedEvent = RecorderEvent;
+
+export type RecorderInboxKind = "candidate" | "preference" | "request" | "note";
 
 export interface RecorderInboxEntry {
 	schemaVersion: 1;
@@ -100,6 +117,8 @@ export interface RecorderInboxEntry {
 	sessionId: string;
 	source: "interactive" | "rpc" | "extension";
 	text: string;
+	/** Legacy entries omit this and are classified from their text prefix. */
+	kind?: RecorderInboxKind;
 }
 
 export interface RecorderSessionReference {

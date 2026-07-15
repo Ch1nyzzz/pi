@@ -280,7 +280,11 @@ function getPathComparisonCandidates(path: string): string[] {
 function getEntrypointPackageDir(): string | undefined {
 	const entrypoint = process.argv[1];
 	if (!entrypoint) return undefined;
-	let dir = dirname(entrypoint);
+	let resolvedEntrypoint = entrypoint;
+	try {
+		resolvedEntrypoint = realpathSync(entrypoint);
+	} catch {}
+	let dir = dirname(resolvedEntrypoint);
 	while (dir !== dirname(dir)) {
 		if (existsSync(join(dir, "package.json"))) {
 			return dir;
@@ -425,7 +429,7 @@ export function getPackageJsonPath(): string {
 
 /** Get path to README.md */
 export function getReadmePath(): string {
-	return resolve(join(getPackageDir(), "README.md"));
+	return resolve(join(productPackageDir ?? getPackageDir(), "README.md"));
 }
 
 /** Get path to docs directory */
@@ -440,7 +444,7 @@ export function getExamplesPath(): string {
 
 /** Get path to CHANGELOG.md */
 export function getChangelogPath(): string {
-	return resolve(join(getPackageDir(), "CHANGELOG.md"));
+	return resolve(join(productPackageDir ?? getPackageDir(), "CHANGELOG.md"));
 }
 
 /**
@@ -471,29 +475,69 @@ interface PackageJson {
 	name?: string;
 	version?: string;
 	piConfig?: {
+		product?: boolean;
 		name?: string;
+		displayName?: string;
+		envPrefix?: string;
 		configDir?: string;
+		upstreamName?: string;
+		onboardingMessage?: string;
+		selfUpdate?: boolean;
+		versionCheckUrl?: string | null;
+		changelogUrl?: string | null;
+		changelogEnabled?: boolean;
+		installTelemetryUrl?: string | null;
 	};
 }
 
-let pkg: PackageJson = {};
-try {
-	pkg = JSON.parse(readFileSync(getPackageJsonPath(), "utf-8")) as PackageJson;
-} catch (e: unknown) {
-	const err = e as NodeJS.ErrnoException;
-	if (err.code !== "ENOENT") throw e;
+function readPackageJson(path: string): PackageJson {
+	try {
+		return JSON.parse(readFileSync(path, "utf-8")) as PackageJson;
+	} catch (error: unknown) {
+		const err = error as NodeJS.ErrnoException;
+		if (err.code === "ENOENT") return {};
+		throw error;
+	}
 }
+
+const hostPackage = readPackageJson(getPackageJsonPath());
+const entrypointPackageDir = getEntrypointPackageDir();
+const entrypointPackage = entrypointPackageDir
+	? readPackageJson(join(entrypointPackageDir, "package.json"))
+	: undefined;
+const productPackage = entrypointPackage?.piConfig?.product === true ? entrypointPackage : undefined;
+const productPackageDir = productPackage ? entrypointPackageDir : undefined;
+const pkg = productPackage ?? hostPackage;
 
 const piConfigName: string | undefined = pkg.piConfig?.name;
 export const PACKAGE_NAME: string = pkg.name || "@earendil-works/pi-coding-agent";
 export const APP_NAME: string = piConfigName || "pi";
-export const APP_TITLE: string = piConfigName ? APP_NAME : "π";
+export const APP_DISPLAY_NAME: string = pkg.piConfig?.displayName || APP_NAME;
+export const APP_TITLE: string = pkg.piConfig?.displayName ? APP_DISPLAY_NAME : piConfigName ? APP_NAME : "π";
 export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".pi";
 export const VERSION: string = pkg.version || "0.0.0";
+export const UPSTREAM_NAME: string | undefined = pkg.piConfig?.upstreamName;
+export const APP_VERSION_LABEL: string = UPSTREAM_NAME ? `based on ${UPSTREAM_NAME} v${VERSION}` : `v${VERSION}`;
+export const ONBOARDING_MESSAGE: string =
+	pkg.piConfig?.onboardingMessage ||
+	`${APP_DISPLAY_NAME} can explain its own features and look up its docs. Ask it how to use or extend ${APP_DISPLAY_NAME}.`;
+export const SELF_UPDATE_ENABLED: boolean = pkg.piConfig?.selfUpdate ?? true;
+export const VERSION_CHECK_URL: string | undefined =
+	pkg.piConfig?.versionCheckUrl === null
+		? undefined
+		: (pkg.piConfig?.versionCheckUrl ?? "https://pi.dev/api/latest-version");
+export const CHANGELOG_URL: string | undefined =
+	pkg.piConfig?.changelogUrl === null ? undefined : (pkg.piConfig?.changelogUrl ?? "https://pi.dev/changelog");
+export const CHANGELOG_ENABLED: boolean = pkg.piConfig?.changelogEnabled ?? true;
+export const INSTALL_TELEMETRY_URL: string | undefined =
+	pkg.piConfig?.installTelemetryUrl === null
+		? undefined
+		: (pkg.piConfig?.installTelemetryUrl ?? "https://pi.dev/api/report-install");
 
 // e.g., PI_CODING_AGENT_DIR or TAU_CODING_AGENT_DIR
-export const ENV_AGENT_DIR = `${APP_NAME.toUpperCase()}_CODING_AGENT_DIR`;
-export const ENV_SESSION_DIR = `${APP_NAME.toUpperCase()}_CODING_AGENT_SESSION_DIR`;
+const envPrefix = pkg.piConfig?.envPrefix || APP_NAME;
+export const ENV_AGENT_DIR = `${envPrefix.toUpperCase().replaceAll("-", "_")}_CODING_AGENT_DIR`;
+export const ENV_SESSION_DIR = `${envPrefix.toUpperCase().replaceAll("-", "_")}_CODING_AGENT_SESSION_DIR`;
 
 export function expandTildePath(path: string): string {
 	return normalizePath(path);

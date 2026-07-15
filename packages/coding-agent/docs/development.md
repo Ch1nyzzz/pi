@@ -26,13 +26,15 @@ Configure via `package.json`:
 ```json
 {
   "piConfig": {
-    "name": "pi",
-    "configDir": ".pi"
+    "product": true,
+    "name": "my-agent",
+    "displayName": "My Agent",
+    "configDir": ".my-agent"
   }
 }
 ```
 
-Change `name`, `configDir`, and `bin` field for your fork. Affects CLI banner, config paths, and environment variable names.
+Set `product: true` on a wrapper entrypoint package to make its metadata override the shared coding-agent package. Change `name`, `displayName`, `configDir`, and the wrapper's `bin` field for your distribution. This affects CLI branding, config paths, environment variable names, version reporting, and self-update package selection.
 
 ## Path Resolution
 

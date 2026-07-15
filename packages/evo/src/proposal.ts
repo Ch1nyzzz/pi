@@ -11,6 +11,8 @@ import {
 	revalidateCodeWorktree,
 	stageCodeWorktree,
 } from "./code/worktree.ts";
+import { createDefaultEvoAbiRegistry } from "./components/registry.ts";
+import { PREFERENCES_PATH, parsePreferenceMemory } from "./memory/preferences.ts";
 import type { EvoPaths } from "./paths.ts";
 import {
 	saveProposalRevisionSnapshot,
@@ -18,7 +20,6 @@ import {
 	writeEvaluationArtifact,
 	writeRetrospectiveArtifact,
 } from "./proposal-artifacts.ts";
-import type { RecordedEvent } from "./recorder/schema.ts";
 import { readSessionLog, resolveStoredPayload } from "./recorder/store.ts";
 import { BundleRegistry } from "./registry/registry.ts";
 import { atomicWriteJson, canonicalJson, readJson, sha256, withFileLock } from "./storage.ts";
@@ -28,7 +29,6 @@ import type {
 	EvidenceReference,
 	Proposal,
 	ProposalApproval,
-	ProposalArtifactKind,
 	ProposalTier,
 	ReplayScenario,
 } from "./types.ts";
@@ -48,6 +48,8 @@ export interface DraftProposal {
 	evidence: EvidenceReference[];
 	inboxReferences: string[];
 	replayScenarios: ReplayScenario[];
+	targetAbi?: string;
+	requiresNewAbi?: boolean;
 	suggestedTier?: ProposalTier;
 	changes?: DraftChange[];
 	codePatch?: string;
@@ -63,6 +65,16 @@ function assertCodeDraftReplayScenario(draft: DraftProposal): void {
 	if ((draft.codePatch !== undefined || draft.changes === undefined) && !draft.replayScenarios[0]) {
 		throw new Error("Code proposals require at least one replay scenario");
 	}
+}
+
+function assertDraftAbi(draft: DraftProposal): void {
+	if (draft.requiresNewAbi) {
+		if (draft.codePatch === undefined && draft.changes !== undefined) {
+			throw new Error("A new ABI requires an infrastructure code proposal");
+		}
+		return;
+	}
+	if (draft.targetAbi) createDefaultEvoAbiRegistry().require(draft.targetAbi);
 }
 
 function asRecord(value: unknown, label: string): Record<string, unknown> {
@@ -144,6 +156,14 @@ export function parseReflectorOutput(text: string): ReflectorOutput {
 		if (codePatch !== undefined && typeof codePatch !== "string") {
 			throw new Error(`proposals[${index}].codePatch must be a string`);
 		}
+		const targetAbi = record.targetAbi;
+		if (targetAbi !== undefined && typeof targetAbi !== "string") {
+			throw new Error(`proposals[${index}].targetAbi must be a string`);
+		}
+		const requiresNewAbi = record.requiresNewAbi;
+		if (requiresNewAbi !== undefined && typeof requiresNewAbi !== "boolean") {
+			throw new Error(`proposals[${index}].requiresNewAbi must be boolean`);
+		}
 		const suggestedTier = record.suggestedTier;
 		if (suggestedTier !== undefined && suggestedTier !== "T0" && suggestedTier !== "T1" && suggestedTier !== "T2") {
 			throw new Error(`proposals[${index}].suggestedTier must be T0, T1, or T2`);
@@ -158,6 +178,8 @@ export function parseReflectorOutput(text: string): ReflectorOutput {
 			evidence: parseEvidence(record.evidence, `proposals[${index}].evidence`),
 			inboxReferences: parseStringArray(record.inboxReferences, `proposals[${index}].inboxReferences`),
 			replayScenarios: parseReplays(record.replayScenarios, `proposals[${index}].replayScenarios`),
+			targetAbi: targetAbi as string | undefined,
+			requiresNewAbi: requiresNewAbi as boolean | undefined,
 			suggestedTier: suggestedTier as ProposalTier | undefined,
 			changes: parseChanges(record.changes, `proposals[${index}].changes`),
 			codePatch,
@@ -222,6 +244,7 @@ function isCoreChange(parentPolicy: BundlePolicy, candidatePolicy: BundlePolicy,
 		enabledTools: parentPolicy.enabledTools ?? [],
 		limits: parentPolicy.limits ?? {},
 		managedSources: parentPolicy.managedSources ?? [],
+		components: parentPolicy.components ?? {},
 		modelRouting: parentPolicy.modelRouting ?? {},
 		validation: parentPolicy.validation ?? {},
 	};
@@ -231,10 +254,45 @@ function isCoreChange(parentPolicy: BundlePolicy, candidatePolicy: BundlePolicy,
 		enabledTools: candidatePolicy.enabledTools ?? [],
 		limits: candidatePolicy.limits ?? {},
 		managedSources: candidatePolicy.managedSources ?? [],
+		components: candidatePolicy.components ?? {},
 		modelRouting: candidatePolicy.modelRouting ?? {},
 		validation: candidatePolicy.validation ?? {},
 	};
 	return canonicalJson(parentCorePolicy) !== canonicalJson(candidateCorePolicy);
+}
+
+function containsText(value: unknown, quote: string): boolean {
+	if (typeof value === "string") return value.includes(quote);
+	if (Array.isArray(value)) return value.some((entry) => containsText(entry, quote));
+	if (typeof value !== "object" || value === null) return false;
+	return Object.values(value as Record<string, unknown>).some((entry) => containsText(entry, quote));
+}
+
+async function evidenceContainsPreferenceSource(
+	paths: EvoPaths,
+	evidence: EvidenceReference[],
+	source: { sessionId: string; sequence: number; quote: string },
+): Promise<boolean> {
+	const reference = evidence.find(
+		(entry) =>
+			entry.sessionId === source.sessionId &&
+			entry.sequence === source.sequence &&
+			entry.quote !== undefined &&
+			source.quote.includes(entry.quote),
+	);
+	if (!reference?.quote) return false;
+	const event = (await readSessionLog(paths, source.sessionId)).find((entry) => entry.sequence === source.sequence);
+	if (!event) return false;
+	if (event.type === "explicit_feedback") {
+		return containsText(await resolveStoredPayload(paths, event.text), source.quote);
+	}
+	if (event.type === "message") {
+		return containsText(await resolveStoredPayload(paths, event.message), source.quote);
+	}
+	if (event.type === "before_agent_start") {
+		return containsText(await resolveStoredPayload(paths, event.prompt), source.quote);
+	}
+	return false;
 }
 
 async function isDirectPreference(
@@ -244,24 +302,38 @@ async function isDirectPreference(
 	before: Map<string, string>,
 	after: Map<string, string>,
 ): Promise<boolean> {
-	if (changedPaths.length !== 1 || !changedPaths[0].startsWith("memory/") || before.has(changedPaths[0])) return false;
-	const content = after.get(changedPaths[0]);
-	if (!content || !normalizeText(content)) return false;
-	const logs = new Map<string, Promise<RecordedEvent[]>>();
-	for (const reference of evidence) {
-		if (reference.quote === undefined || normalizeText(reference.quote) !== normalizeText(content)) continue;
-		let events = logs.get(reference.sessionId);
-		if (!events) {
-			events = readSessionLog(paths, reference.sessionId);
-			logs.set(reference.sessionId, events);
-		}
-		const event = (await events).find((candidate) => candidate.sequence === reference.sequence);
-		if (event?.type === "explicit_feedback") {
+	if (changedPaths.length !== 1) return false;
+	if (changedPaths[0] !== PREFERENCES_PATH) {
+		const path = changedPaths[0];
+		if (!path?.startsWith("memory/") || before.has(path)) return false;
+		const content = after.get(path);
+		if (!content || !normalizeText(content)) return false;
+		for (const reference of evidence) {
+			if (reference.quote === undefined || normalizeText(reference.quote) !== normalizeText(content)) continue;
+			const event = (await readSessionLog(paths, reference.sessionId)).find(
+				(candidate) => candidate.sequence === reference.sequence,
+			);
+			if (event?.type !== "explicit_feedback") continue;
 			const text = await resolveStoredPayload(paths, event.text);
 			if (typeof text === "string" && normalizeText(text) === normalizeText(reference.quote)) return true;
 		}
+		return false;
 	}
-	return false;
+	const afterContent = after.get(PREFERENCES_PATH);
+	if (!afterContent) return false;
+	const previous = before.has(PREFERENCES_PATH)
+		? parsePreferenceMemory(JSON.parse(before.get(PREFERENCES_PATH) ?? ""))
+		: { schemaVersion: 1 as const, preferences: [] };
+	const next = parsePreferenceMemory(JSON.parse(afterContent));
+	if (next.preferences.length <= previous.preferences.length) return false;
+	for (const [index, preference] of previous.preferences.entries()) {
+		if (canonicalJson(preference) !== canonicalJson(next.preferences[index])) return false;
+	}
+	for (const preference of next.preferences.slice(previous.preferences.length)) {
+		if (!preference.source.quote.includes(preference.instruction)) return false;
+		if (!(await evidenceContainsPreferenceSource(paths, evidence, preference.source))) return false;
+	}
+	return true;
 }
 
 async function readBundleFileMap(directory: string, paths: string[]): Promise<Map<string, string>> {
@@ -409,6 +481,7 @@ export async function stageProposal(options: {
 	signal?: AbortSignal;
 }): Promise<Proposal> {
 	assertCodeDraftReplayScenario(options.draft);
+	assertDraftAbi(options.draft);
 	const id = formatProposalId();
 	const temporaryDirectory = join(options.paths.proposals, `.tmp-${id}`);
 	const proposalDirectory = join(options.paths.proposals, id);
@@ -447,6 +520,8 @@ export async function stageProposal(options: {
 				evidence: options.draft.evidence,
 				inboxReferences: options.draft.inboxReferences,
 				replayScenarios: options.draft.replayScenarios,
+				...(options.draft.targetAbi ? { targetAbi: options.draft.targetAbi } : {}),
+				...(options.draft.requiresNewAbi !== undefined ? { requiresNewAbi: options.draft.requiresNewAbi } : {}),
 				changedPaths: staged.changedPaths,
 				diffDigest,
 				approvalDigest: staged.approvalDigest,
@@ -519,6 +594,8 @@ export async function stageProposal(options: {
 			evidence: options.draft.evidence,
 			inboxReferences: options.draft.inboxReferences,
 			replayScenarios: options.draft.replayScenarios,
+			...(options.draft.targetAbi ? { targetAbi: options.draft.targetAbi } : {}),
+			...(options.draft.requiresNewAbi !== undefined ? { requiresNewAbi: options.draft.requiresNewAbi } : {}),
 			changedPaths: evaluation.changedPaths,
 			diffDigest,
 			approvalDigest: diffDigest,
@@ -562,7 +639,7 @@ export async function attachProposalArtifact(options: {
 	paths: EvoPaths;
 	proposalId: string;
 	expected: ProposalApproval;
-	kind: ProposalArtifactKind;
+	kind: "review" | "replay" | "validation";
 	content: string;
 	allowedStatuses: readonly Proposal["status"][];
 }): Promise<Proposal> {
@@ -778,6 +855,7 @@ export async function reviseProposal(options: {
 	codeValidationExecutor?: CodeValidationExecutor;
 }): Promise<Proposal> {
 	assertCodeDraftReplayScenario(options.draft);
+	assertDraftAbi(options.draft);
 	const stableDigest = await new BundleRegistry(options.paths).readStableDigest();
 	return withProposalLock(options.paths, options.id, async () => {
 		const current = await loadProposal(options.paths, options.id);
@@ -818,6 +896,8 @@ export async function reviseProposal(options: {
 				evidence: options.draft.evidence,
 				inboxReferences: options.draft.inboxReferences,
 				replayScenarios: options.draft.replayScenarios,
+				...(options.draft.targetAbi ? { targetAbi: options.draft.targetAbi } : {}),
+				...(options.draft.requiresNewAbi !== undefined ? { requiresNewAbi: options.draft.requiresNewAbi } : {}),
 				changedPaths: staged.changedPaths,
 				diffDigest: staged.diffDigest,
 				approvalDigest: staged.approvalDigest,
@@ -890,6 +970,8 @@ export async function reviseProposal(options: {
 					evidence: options.draft.evidence,
 					inboxReferences: options.draft.inboxReferences,
 					replayScenarios: options.draft.replayScenarios,
+					...(options.draft.targetAbi ? { targetAbi: options.draft.targetAbi } : {}),
+					...(options.draft.requiresNewAbi !== undefined ? { requiresNewAbi: options.draft.requiresNewAbi } : {}),
 					changedPaths: evaluation.changedPaths,
 					diffDigest,
 					approvalDigest: diffDigest,

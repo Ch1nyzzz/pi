@@ -64,6 +64,7 @@ function createHarness(cwd: string) {
 		registerShortcut: (shortcut: string, registration: ShortcutRegistration) => {
 			shortcuts.set(shortcut, registration);
 		},
+		registerEntryRenderer: () => {},
 		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }),
 		sendMessage: (message: Record<string, unknown>, options: unknown) => sentMessages.push({ message, options }),
 		getActiveTools: () => [...activeTools],
@@ -479,8 +480,6 @@ describe("Evo CLI extension", () => {
 		const mutations = [
 			`reject ${proposal.id} headless rejection`,
 			`rollback ${proposal.candidateDigest} headless rollback`,
-			"pause headless pause",
-			"resume headless resume",
 		];
 		const headlessContext = { ...harness.context, hasUI: false } as ExtensionCommandContext;
 
@@ -498,8 +497,6 @@ describe("Evo CLI extension", () => {
 		expect(harness.confirmations.map((confirmation) => confirmation.title)).toEqual([
 			`Reject ${proposal.id}`,
 			"Roll back Evo-Pi",
-			"Pause Evo-Pi",
-			"Resume Evo-Pi",
 		]);
 		expect((await fixture.service.getProposal(proposal.id)).status).toBe("pending");
 		expect((await fixture.service.status()).stableDigest).toBe(seed.digest);
@@ -551,13 +548,7 @@ describe("Evo CLI extension", () => {
 			writeError: () => {},
 			question: async () => "",
 		};
-		for (const commandArgs of [
-			["reject", proposal.id, "not approved"],
-			["rollback"],
-			["keep"],
-			["pause"],
-			["resume"],
-		]) {
+		for (const commandArgs of [["reject", proposal.id, "not approved"], ["rollback"], ["keep"]]) {
 			await expect(
 				runEvoCli(commandArgs, {
 					service: fixture.service,
@@ -608,20 +599,13 @@ describe("Evo CLI extension", () => {
 			io,
 		});
 		await runEvoCli(["rollback"], { service: fixture.service, runner: fixture.runner, io });
-		await runEvoCli(["pause"], { service: fixture.service, runner: fixture.runner, io });
 		expect((await fixture.service.getProposal(proposal.id)).status).toBe("pending");
 		expect((await fixture.service.status()).paused).toBe(false);
-
-		await fixture.service.pause("Test resume confirmation");
-		await runEvoCli(["resume"], { service: fixture.service, runner: fixture.runner, io });
-		expect((await fixture.service.status()).paused).toBe(true);
 		expect(prompts).toEqual([
 			`Reject proposal ${proposal.id}? [y/N] `,
 			"Roll back the active trial or stable bundle? [y/N] ",
-			"Pause Evo-Pi reflection work? [y/N] ",
-			"Resume Evo-Pi reflection work? [y/N] ",
 		]);
-		expect(output).toEqual(["Rejection cancelled", "Rollback cancelled", "Pause cancelled", "Resume cancelled"]);
+		expect(output).toEqual(["Rejection cancelled", "Rollback cancelled"]);
 		expect(fixture.getModelCalls()).toBe(0);
 	});
 
@@ -754,18 +738,30 @@ describe("Evo CLI extension", () => {
 	it("surfaces an overdue trial in the status indicator", async () => {
 		const fixture = await createFixture();
 		const seed = await fixture.service.init();
-		const source = await mkdtemp(join(fixture.root, "trial-due-"));
-		await writeFile(join(source, "policy.json"), await readFile(join(seed.directory, "policy.json")));
-		const trialBundle = await compileBundle({
+		const proposal = await stageProposal({
 			paths: fixture.service.paths,
-			sourceDirectory: source,
 			parentDigest: seed.digest,
-			summary: "Trial bundle for due reminder",
+			observationsMarkdown: "A due trial needs a status reminder.",
+			draft: {
+				motivation: "Exercise the due-trial status",
+				expectedEffect: "The status becomes visible",
+				risk: "The reminder may be noisy",
+				verifyPlan: "Inspect the status indicator",
+				trialPlan: "Watch for a week",
+				source: "pattern",
+				evidence: [],
+				inboxReferences: [],
+				replayScenarios: [],
+				changes: [{ path: "memory/trial-due.md", content: "Trial due reminder.\n" }],
+			},
 		});
+		if (!proposal.candidateDigest) throw new Error("Due-trial proposal has no candidate digest");
+		proposal.status = "trialing";
+		await saveProposal(fixture.service.paths, proposal);
 		await fixture.service.registry.activateTrial({
-			digest: trialBundle.digest,
-			proposalId: "p-trial-due",
-			plan: "Watch for a week",
+			digest: proposal.candidateDigest,
+			proposalId: proposal.id,
+			plan: proposal.trialPlan,
 		});
 		const harness = createHarness(fixture.root);
 		const dependencies = { service: fixture.service, paths: fixture.service.paths };
@@ -775,7 +771,7 @@ describe("Evo CLI extension", () => {
 
 		const eightDaysLater = () => new Date(Date.now() + 8 * 24 * 60 * 60 * 1000);
 		await refreshEvoStatusIndicator(dependencies, harness.context, eightDaysLater);
-		expect(harness.statuses.at(-1)?.text).toBe("evo: trial p-trial-due due [/evo keep or /evo rollback]");
+		expect(harness.statuses.at(-1)?.text).toBe(`evo: trial ${proposal.id} due [automatic comparison pending]`);
 
 		await writeScheduleConfig(fixture.service.paths, { trialDueAfterDays: 30 });
 		await refreshEvoStatusIndicator(dependencies, harness.context, eightDaysLater);

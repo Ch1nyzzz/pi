@@ -1,12 +1,30 @@
-import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { access } from "node:fs/promises";
+import { join } from "node:path";
+import type { ExtensionContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { resolveSessionBundleDigest } from "../bundle/runtime.ts";
+import { initializeInboxLifecycle } from "../inbox.ts";
 import { type EvoPaths, getEvoPaths } from "../paths.ts";
 import { BundleRegistry } from "../registry/registry.ts";
 import type { UsageSummary } from "../types.ts";
+import { buildSessionDigest } from "./digest.ts";
 import type { RecorderSessionReference, VerificationKind, VerificationRecord } from "./schema.ts";
-import { createRecorderStore, type RecorderStore } from "./store.ts";
+import { createRecorderStore, type RecorderStore, readSessionLog, resolveStoredPayload } from "./store.ts";
 
-const EXPLICIT_FEEDBACK_PATTERN = /以后都这样|from\s+now\s+on|\balways\b|记住/i;
+const DURABLE_PREFERENCE_PATTERN =
+	/以后|今后|从现在开始|每次|始终|一律|默认|记住|不要再|别再|优先|注意不要|第一性原理|不要.{0,12}过度|from\s+now\s+on|going\s+forward|every\s+time|by\s+default|\balways\b|\bnever\b|\bremember\b|\bprefer\b/i;
+
+export function isDurablePreferenceInstruction(text: string): boolean {
+	return DURABLE_PREFERENCE_PATTERN.test(text);
+}
+
+async function isPrivacyExcluded(cwd: string): Promise<boolean> {
+	try {
+		await access(join(cwd, ".pi", "evo-private"));
+		return true;
+	} catch {
+		return false;
+	}
+}
 
 interface PendingTool {
 	input: unknown;
@@ -92,6 +110,14 @@ function collectText(value: unknown, visited: WeakSet<object> = new WeakSet<obje
 	}
 }
 
+function messageFingerprint(message: unknown): string | undefined {
+	if (!isRecord(message)) return undefined;
+	const role = getString(message, "role");
+	if (!role) return undefined;
+	const timestamp = typeof message.timestamp === "number" ? String(message.timestamp) : "";
+	return `${role}\0${timestamp}\0${collectText(message.content)}`;
+}
+
 function inferBashExitCode(result: unknown, isError: boolean): number | null {
 	if (!isError) return 0;
 	const match = /Command exited with code\s+(-?\d+)/.exec(collectText(result));
@@ -137,6 +163,8 @@ export function createRecorderExtension(options: RecorderExtensionOptions = {}):
 	const pendingTools = new Map<string, PendingTool>();
 	const registry = new BundleRegistry(paths);
 	let store: RecorderStore | undefined;
+	let excludedSessionId: string | undefined;
+	let compactionStartedAtMs: number | undefined;
 	let queue = Promise.resolve();
 
 	function reportError(error: unknown): void {
@@ -154,6 +182,31 @@ export function createRecorderExtension(options: RecorderExtensionOptions = {}):
 	}
 
 	return (pi) => {
+		async function backfillMissingUserMessages(activeStore: RecorderStore, ctx: ExtensionContext): Promise<void> {
+			const recorded = await readSessionLog(paths, activeStore.sessionId);
+			const sourceIds = new Set(
+				recorded.flatMap((event) => (event.type === "message" && event.sourceEntryId ? [event.sourceEntryId] : [])),
+			);
+			const fingerprints = new Set<string>();
+			for (const event of recorded) {
+				if (event.type !== "message") continue;
+				const fingerprint = messageFingerprint(await resolveStoredPayload(paths, event.message));
+				if (fingerprint) fingerprints.add(fingerprint);
+			}
+			for (const entry of ctx.sessionManager.getEntries()) {
+				if (entry.type !== "message" || entry.message.role !== "user" || sourceIds.has(entry.id)) continue;
+				const fingerprint = messageFingerprint(entry.message);
+				if (fingerprint && fingerprints.has(fingerprint)) continue;
+				await activeStore.append({
+					type: "message",
+					role: "user",
+					message: await activeStore.storePayload(entry.message),
+					sourceEntryId: entry.id,
+				});
+				if (fingerprint) fingerprints.add(fingerprint);
+			}
+		}
+
 		async function getFallbackBundleDigest(): Promise<string | undefined> {
 			let bundleDigest = options.bundleDigest;
 			if (bundleDigest === undefined) {
@@ -176,6 +229,7 @@ export function createRecorderExtension(options: RecorderExtensionOptions = {}):
 				now,
 			});
 			pendingTools.clear();
+			compactionStartedAtMs = undefined;
 			return store;
 		}
 
@@ -187,6 +241,13 @@ export function createRecorderExtension(options: RecorderExtensionOptions = {}):
 		pi.on("session_start", (event, ctx) =>
 			enqueue(async () => {
 				const sessionId = ctx.sessionManager.getSessionId();
+				if (await isPrivacyExcluded(ctx.cwd)) {
+					excludedSessionId = sessionId;
+					pendingTools.clear();
+					store = undefined;
+					return;
+				}
+				excludedSessionId = undefined;
 				const recordedDigest = resolveSessionBundleDigest(ctx.sessionManager.getEntries(), sessionId, event.reason);
 				const activeStore = await openStore(sessionId, recordedDigest ?? (await getFallbackBundleDigest()));
 				await activeStore.append({
@@ -196,6 +257,10 @@ export function createRecorderExtension(options: RecorderExtensionOptions = {}):
 					sessionFile: ctx.sessionManager.getSessionFile(),
 					previousSessionFile: event.previousSessionFile,
 				});
+				if (event.reason === "resume" || event.reason === "reload") {
+					await backfillMissingUserMessages(activeStore, ctx);
+				}
+				await buildSessionDigest(paths, activeStore.sessionId);
 
 				const hasReference = ctx.sessionManager.getEntries().some((entry) => {
 					if (entry.type !== "custom" || entry.customType !== "evo-recorder-ref" || !isRecord(entry.data)) {
@@ -221,6 +286,7 @@ export function createRecorderExtension(options: RecorderExtensionOptions = {}):
 
 		pi.on("before_agent_start", (event, ctx) =>
 			enqueue(async () => {
+				if (excludedSessionId === ctx.sessionManager.getSessionId()) return;
 				const activeStore = await getStore(ctx.sessionManager.getSessionId());
 				const prompt = await activeStore.storePayload(event.prompt);
 				const systemPrompt = await activeStore.storePayload(event.systemPrompt);
@@ -238,11 +304,16 @@ export function createRecorderExtension(options: RecorderExtensionOptions = {}):
 
 		pi.on("message_end", (event, ctx) =>
 			enqueue(async () => {
+				if (excludedSessionId === ctx.sessionManager.getSessionId()) return;
 				const activeStore = await getStore(ctx.sessionManager.getSessionId());
+				const sourceEntry = [...ctx.sessionManager.getEntries()]
+					.reverse()
+					.find((entry) => entry.type === "message" && entry.message === event.message);
 				await activeStore.append({
 					type: "message",
 					role: getString(event.message, "role") ?? "unknown",
 					message: await activeStore.storePayload(event.message),
+					...(sourceEntry ? { sourceEntryId: sourceEntry.id } : {}),
 				});
 
 				const usage = getUsage(event.message);
@@ -257,8 +328,9 @@ export function createRecorderExtension(options: RecorderExtensionOptions = {}):
 			}),
 		);
 
-		pi.on("tool_execution_start", (event) =>
+		pi.on("tool_execution_start", (event, ctx) =>
 			enqueue(async () => {
+				if (excludedSessionId === ctx.sessionManager.getSessionId()) return;
 				pendingTools.set(event.toolCallId, {
 					input: event.args,
 					startedAtMs: now().getTime(),
@@ -266,15 +338,17 @@ export function createRecorderExtension(options: RecorderExtensionOptions = {}):
 			}),
 		);
 
-		pi.on("tool_call", (event) =>
+		pi.on("tool_call", (event, ctx) =>
 			enqueue(async () => {
+				if (excludedSessionId === ctx.sessionManager.getSessionId()) return;
 				const pending = pendingTools.get(event.toolCallId);
 				if (pending) pending.input = event.input;
 			}),
 		);
 
-		pi.on("tool_result", (event) =>
+		pi.on("tool_result", (event, ctx) =>
 			enqueue(async () => {
+				if (excludedSessionId === ctx.sessionManager.getSessionId()) return;
 				const pending = pendingTools.get(event.toolCallId);
 				if (!pending) return;
 				pending.input = event.input;
@@ -288,6 +362,7 @@ export function createRecorderExtension(options: RecorderExtensionOptions = {}):
 
 		pi.on("tool_execution_end", (event, ctx) =>
 			enqueue(async () => {
+				if (excludedSessionId === ctx.sessionManager.getSessionId()) return;
 				const endedAtMs = now().getTime();
 				const pending = pendingTools.get(event.toolCallId);
 				pendingTools.delete(event.toolCallId);
@@ -311,11 +386,43 @@ export function createRecorderExtension(options: RecorderExtensionOptions = {}):
 			}),
 		);
 
-		pi.on("input", (event, ctx) => {
-			if (!EXPLICIT_FEEDBACK_PATTERN.test(event.text)) return;
-			return enqueue(async () => {
+		pi.on("session_before_compact", (_event, ctx) =>
+			enqueue(async () => {
+				if (excludedSessionId === ctx.sessionManager.getSessionId()) return;
+				compactionStartedAtMs = now().getTime();
+			}),
+		);
+
+		pi.on("session_compact", (event, ctx) =>
+			enqueue(async () => {
+				if (excludedSessionId === ctx.sessionManager.getSessionId()) return;
+				const endedAtMs = now().getTime();
+				const startedAtMs = compactionStartedAtMs;
+				compactionStartedAtMs = undefined;
 				const activeStore = await getStore(ctx.sessionManager.getSessionId());
-				const inbox = await activeStore.writeInbox(event.text, event.source);
+				await activeStore.append({
+					type: "compaction",
+					reason: event.reason,
+					willRetry: event.willRetry,
+					fromExtension: event.fromExtension,
+					firstKeptEntryId: event.compactionEntry.firstKeptEntryId,
+					tokensBefore: event.compactionEntry.tokensBefore,
+					durationMs: startedAtMs === undefined ? null : Math.max(0, endedAtMs - startedAtMs),
+					summary: await activeStore.storePayload(event.compactionEntry.summary),
+					...(event.compactionEntry.details === undefined
+						? {}
+						: { details: await activeStore.storePayload(event.compactionEntry.details) }),
+				});
+			}),
+		);
+
+		pi.on("input", (event, ctx) => {
+			if (!isDurablePreferenceInstruction(event.text)) return;
+			return enqueue(async () => {
+				if (excludedSessionId === ctx.sessionManager.getSessionId()) return;
+				const activeStore = await getStore(ctx.sessionManager.getSessionId());
+				const inbox = await activeStore.writeInbox(event.text, event.source, "candidate");
+				await initializeInboxLifecycle(paths, inbox.fileName);
 				await activeStore.append({
 					type: "explicit_feedback",
 					source: event.source,
@@ -327,6 +434,11 @@ export function createRecorderExtension(options: RecorderExtensionOptions = {}):
 
 		pi.on("session_shutdown", (event, ctx) =>
 			enqueue(async () => {
+				if (excludedSessionId === ctx.sessionManager.getSessionId()) {
+					excludedSessionId = undefined;
+					pendingTools.clear();
+					return;
+				}
 				const activeStore = await getStore(ctx.sessionManager.getSessionId());
 				try {
 					const execOptions = {
@@ -354,7 +466,9 @@ export function createRecorderExtension(options: RecorderExtensionOptions = {}):
 					reason: event.reason,
 					targetSessionFile: event.targetSessionFile,
 				});
+				await buildSessionDigest(paths, activeStore.sessionId);
 				pendingTools.clear();
+				compactionStartedAtMs = undefined;
 				store = undefined;
 			}),
 		);

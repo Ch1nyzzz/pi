@@ -340,7 +340,12 @@ export async function loginAnthropic(options: {
 		options.onProgress?.("Exchanging authorization code for tokens...");
 		return exchangeAuthorizationCode(code, state, verifier, redirectUriForExchange);
 	} finally {
-		server.server.close();
+		await new Promise<void>((resolve, reject) => {
+			server.server.close((error) => {
+				if (error) reject(error);
+				else resolve();
+			});
+		});
 	}
 }
 

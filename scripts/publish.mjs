@@ -10,6 +10,7 @@ const packages = [
 	{ directory: "packages/tui", name: "@earendil-works/pi-tui" },
 	{ directory: "packages/coding-agent", name: "@earendil-works/pi-coding-agent" },
 	{ directory: "packages/evo", name: "@earendil-works/pi-evo" },
+	{ directory: "packages/evo-pi", name: "@earendil-works/evo-pi" },
 ];
 
 const dryRun = process.argv.includes("--dry-run");

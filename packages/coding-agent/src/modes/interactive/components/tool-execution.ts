@@ -4,10 +4,18 @@ import { createAllToolDefinitions, type ToolName } from "../../../core/tools/ind
 import { getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.ts";
 import { convertToPng } from "../../../utils/image-convert.ts";
 import { theme } from "../theme/theme.ts";
+import { keyHint } from "./keybinding-hints.ts";
+
+export interface CollapsedToolSummary {
+	count: number;
+}
 
 export interface ToolExecutionOptions {
 	showImages?: boolean;
 	imageWidthCells?: number;
+	displayStyle?: "boxed" | "minimal";
+	hiddenWhenCollapsed?: boolean;
+	collapsedSummary?: CollapsedToolSummary;
 }
 
 export class ToolExecutionComponent extends Container {
@@ -25,6 +33,9 @@ export class ToolExecutionComponent extends Container {
 	private expanded = false;
 	private showImages: boolean;
 	private imageWidthCells: number;
+	private displayStyle: "boxed" | "minimal";
+	private hiddenWhenCollapsed: boolean;
+	private collapsedSummary?: CollapsedToolSummary;
 	private isPartial = true;
 	private toolDefinition?: ToolDefinition<any, any>;
 	private builtInToolDefinition?: ToolDefinition<any, any>;
@@ -57,6 +68,9 @@ export class ToolExecutionComponent extends Container {
 		this.builtInToolDefinition = createAllToolDefinitions(cwd)[toolName as ToolName];
 		this.showImages = options.showImages ?? true;
 		this.imageWidthCells = options.imageWidthCells ?? 60;
+		this.displayStyle = options.displayStyle ?? "boxed";
+		this.hiddenWhenCollapsed = options.hiddenWhenCollapsed ?? false;
+		this.collapsedSummary = options.collapsedSummary;
 		this.ui = ui;
 		this.cwd = cwd;
 
@@ -65,8 +79,17 @@ export class ToolExecutionComponent extends Container {
 		// Always create all shell variants. contentBox is used for default renderer-based composition.
 		// selfRenderContainer is used when the tool renders its own framing.
 		// contentText is reserved for generic fallback rendering when no tool definition exists.
-		this.contentBox = new Box(1, 1, (text: string) => theme.bg("toolPendingBg", text));
-		this.contentText = new Text("", 1, 1, (text: string) => theme.bg("toolPendingBg", text));
+		this.contentBox = new Box(
+			1,
+			this.displayStyle === "minimal" ? 0 : 1,
+			this.displayStyle === "minimal" ? undefined : (text: string) => theme.bg("toolPendingBg", text),
+		);
+		this.contentText = new Text(
+			"",
+			1,
+			this.displayStyle === "minimal" ? 0 : 1,
+			this.displayStyle === "minimal" ? undefined : (text: string) => theme.bg("toolPendingBg", text),
+		);
 		this.selfRenderContainer = new Container();
 
 		if (this.hasRendererDefinition()) {
@@ -219,6 +242,14 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	override render(width: number): string[] {
+		if (this.hiddenWhenCollapsed && !this.expanded) {
+			if (!this.collapsedSummary) {
+				return [];
+			}
+			const count = this.collapsedSummary.count;
+			const label = `${theme.fg("dim", `… ${count} tool${count === 1 ? "" : "s"} hidden`)}${theme.fg("dim", " · ")}${keyHint("app.tools.expand", "to expand")}`;
+			return new Text(label, 1, 0).render(width);
+		}
 		if (this.hideComponent) {
 			return [];
 		}
@@ -262,7 +293,7 @@ export class ToolExecutionComponent extends Container {
 		if (this.hasRendererDefinition()) {
 			const renderContainer = this.getRenderShell() === "self" ? this.selfRenderContainer : this.contentBox;
 			if (renderContainer instanceof Box) {
-				renderContainer.setBgFn(bgFn);
+				renderContainer.setBgFn(this.displayStyle === "minimal" ? undefined : bgFn);
 			}
 			renderContainer.clear();
 
@@ -313,7 +344,7 @@ export class ToolExecutionComponent extends Container {
 				}
 			}
 		} else {
-			this.contentText.setCustomBgFn(bgFn);
+			this.contentText.setCustomBgFn(this.displayStyle === "minimal" ? undefined : bgFn);
 			this.contentText.setText(this.formatToolExecution());
 			hasContent = true;
 		}

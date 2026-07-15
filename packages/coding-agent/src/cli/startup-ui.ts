@@ -27,7 +27,7 @@ const OFFICIAL_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 const OFFICIAL_APP_NAME = "pi";
 const OFFICIAL_CONFIG_DIR_NAME = ".pi";
 
-interface DistributionMetadata {
+export interface DistributionMetadata {
 	packageName: string;
 	appName: string;
 	configDirName: string;
@@ -112,14 +112,15 @@ async function clearStartupTui(ui: TUI): Promise<void> {
  * - the default agent directory is used (no custom agent dir override)
  * - setup was not completed before (settings.json does not exist)
  */
-export function shouldRunFirstTimeSetup(settingsPath: string = getSettingsPath()): boolean {
-	if (
-		!isOfficialDistribution({
-			packageName: PACKAGE_NAME,
-			appName: APP_NAME,
-			configDirName: CONFIG_DIR_NAME,
-		})
-	) {
+export function shouldRunFirstTimeSetup(
+	settingsPath: string = getSettingsPath(),
+	distribution: DistributionMetadata = {
+		packageName: PACKAGE_NAME,
+		appName: APP_NAME,
+		configDirName: CONFIG_DIR_NAME,
+	},
+): boolean {
+	if (!isOfficialDistribution(distribution)) {
 		return false;
 	}
 	if (!areExperimentalFeaturesEnabled()) {

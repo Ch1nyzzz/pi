@@ -3,17 +3,20 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { compileBundle } from "../src/bundle/compile.ts";
+import { compileBundle, loadCompiledBundle } from "../src/bundle/compile.ts";
 import type { CodeL1Result, CodeValidationContext, CodeValidationExecutor } from "../src/code/worktree.ts";
+import { storeTrialComparison, trialEvidenceDigest } from "../src/comparison.ts";
+import { readBundlePreferenceMemory } from "../src/memory/preferences.ts";
 import { getEvoPaths } from "../src/paths.ts";
 import { approveProposal, type DraftProposal, proposalApproval, saveProposal, stageProposal } from "../src/proposal.ts";
 import {
+	type FixedEvaluationArtifactKind,
 	saveProposalRevisionSnapshot,
 	writeEvaluationArtifact,
 	writeRetrospectiveArtifact,
 } from "../src/proposal-artifacts.ts";
 import type { RecorderInboxEntry } from "../src/recorder/schema.ts";
-import { createRecorderStore } from "../src/recorder/store.ts";
+import { createRecorderStore, readSessionLog } from "../src/recorder/store.ts";
 import { collectEvidenceCorpus } from "../src/reflect/evidence.ts";
 import type { ModelRunner, ModelRunRequest, ModelRunResult } from "../src/reflect/model-runner.ts";
 import { runRetrospective } from "../src/reflect/retrospective.ts";
@@ -23,7 +26,7 @@ import type {
 	RegistryTransitionStep,
 } from "../src/registry/registry.ts";
 import { EvoService } from "../src/service.ts";
-import type { Proposal, ProposalArtifactKind } from "../src/types.ts";
+import type { Proposal } from "../src/types.ts";
 
 class PassingCodeValidator implements CodeValidationExecutor {
 	readonly calls: CodeValidationContext[] = [];
@@ -100,7 +103,9 @@ describe("EvoService", () => {
 		};
 	}
 
-	async function historyEntries(service: EvoService): Promise<Array<{ action: string; eventId?: string }>> {
+	async function historyEntries(
+		service: EvoService,
+	): Promise<Array<{ action: string; eventId?: string; evidenceDigest?: string; comparisonDigest?: string }>> {
 		const content = await readFile(service.paths.history, "utf8");
 		return content
 			.trim()
@@ -115,7 +120,7 @@ describe("EvoService", () => {
 	async function attachArtifact(
 		service: EvoService,
 		proposal: Proposal,
-		kind: ProposalArtifactKind,
+		kind: FixedEvaluationArtifactKind,
 		content: string,
 	): Promise<void> {
 		proposal.artifacts[kind] = await writeEvaluationArtifact({
@@ -131,16 +136,23 @@ describe("EvoService", () => {
 	}
 
 	async function attachRetrospectiveFixture(service: EvoService, proposal: Proposal): Promise<void> {
-		const current = await service.getProposal(proposal.id);
-		const corpus = await collectEvidenceCorpus(service.paths, { mode: "full" });
+		const trial = await service.registry.readTrial();
+		if (!trial) throw new Error("Retrospective fixture requires an active trial");
+		const initial = await service.getProposal(proposal.id);
+		const [corpus, storedComparison] = await Promise.all([
+			collectEvidenceCorpus(service.paths, { mode: "full", completedSessionsOnly: true }),
+			storeTrialComparison(service.paths, initial, trial),
+		]);
+		const current = storedComparison.proposal;
+		const comparison = storedComparison.comparison;
 		current.artifacts.retrospective = await writeRetrospectiveArtifact({
 			paths: service.paths,
 			proposalId: current.id,
 			revision: current.revision,
 			diffDigest: current.diffDigest,
 			content: "# Retrospective\n\nFixture supports keeping this trial.\n",
-			evidenceDigest: corpus.evidenceDigest,
-			evidenceCutoff: corpus.nextReviewCursor.updatedAt,
+			evidenceDigest: trialEvidenceDigest(corpus.evidenceDigest, comparison.evidenceDigest),
+			evidenceCutoff: comparison.generatedAt,
 		});
 		await saveProposal(service.paths, current);
 		await saveProposalRevisionSnapshot(service.paths, current);
@@ -245,6 +257,8 @@ describe("EvoService", () => {
 		expect(rolledBackStatus.stableDigest).toBe(seed.digest);
 		expect(rolledBackStatus.trial).toBeUndefined();
 		expect((await service.getProposal(proposal.id)).status).toBe("rolled-back");
+		const rollback = (await historyEntries(service)).find((entry) => entry.action === "rollback");
+		expect(rollback?.comparisonDigest).toMatch(/^[a-f0-9]{64}$/);
 	});
 
 	it("recovers an interrupted approval without duplicating history events", async () => {
@@ -280,6 +294,9 @@ describe("EvoService", () => {
 
 		await attachRetrospectiveFixture(service, proposal);
 		expect((await service.keep(reason)).status).toBe("kept");
+		const kept = (await historyEntries(service)).find((entry) => entry.action === "trial-keep");
+		expect(kept?.evidenceDigest).toMatch(/^[a-f0-9]{64}$/);
+		expect(kept?.comparisonDigest).toMatch(/^[a-f0-9]{64}$/);
 	});
 
 	it("recovers an interrupted keep as one proposal and registry transition", async () => {
@@ -1155,13 +1172,18 @@ describe("EvoService", () => {
 		expect((await service.status()).trial).toBeUndefined();
 	});
 
-	it("writes notes and requests to the recorder inbox", async () => {
+	it("writes notes, requests, and explicit preferences to the recorder inbox", async () => {
 		const service = await createService();
 		await service.init();
 		const note = await service.note("session-1", "keep answers concise");
 		const request = await service.request("session-1", "add a release checklist");
-		expect(note.entry.text).toBe("NOTE: keep answers concise");
-		expect(request.entry.text).toBe("REQUEST: add a release checklist");
+		const preference = await service.preference("session-1", "prefer design-first implementation");
+		expect(note.entry).toMatchObject({ kind: "note", text: "NOTE: keep answers concise" });
+		expect(request.entry).toMatchObject({ kind: "request", text: "REQUEST: add a release checklist" });
+		expect(preference.entry).toMatchObject({
+			kind: "preference",
+			text: "PREFERENCE: prefer design-first implementation",
+		});
 
 		const files = (await readdir(service.paths.inbox)).sort();
 		expect(files).toHaveLength(2);
@@ -1174,5 +1196,13 @@ describe("EvoService", () => {
 			"NOTE: keep answers concise",
 			"REQUEST: add a release checklist",
 		]);
+		expect(
+			(await readSessionLog(service.paths, "session-1")).filter((event) => event.type === "explicit_feedback"),
+		).toHaveLength(1);
+		const stable = await service.registry.readStableDigest();
+		if (!stable) throw new Error("Preference fixture has no stable bundle");
+		expect(
+			(await readBundlePreferenceMemory(await loadCompiledBundle(service.paths, stable))).preferences,
+		).toMatchObject([{ instruction: "prefer design-first implementation" }]);
 	});
 });

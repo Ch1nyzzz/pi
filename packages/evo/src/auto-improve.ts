@@ -1,9 +1,12 @@
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { refreshEvoStatusIndicator } from "./cli.ts";
+import { buildTrialComparison } from "./comparison.ts";
+import { readEvoControlConfig } from "./evolve/config.ts";
+import { runEvolutionCycle } from "./evolve/cycle.ts";
 import { type EvoPaths, getEvoPaths } from "./paths.ts";
 import { createPiModelRunner, type ModelRunner } from "./reflect/model-runner.ts";
-import { runReflector } from "./reflect/reflector.ts";
-import { runConfiguredImprove } from "./scheduler.ts";
+import { runRetrospective, type TrialRecommendation } from "./reflect/retrospective.ts";
+import { readScheduleConfig, runConfiguredImprove } from "./scheduler.ts";
 import { EvoService } from "./service.ts";
 
 const DEFAULT_INITIAL_DELAY_MS = 45_000;
@@ -11,6 +14,12 @@ const DEFAULT_CHECK_INTERVAL_MS = 30 * 60_000;
 
 export interface AutoImproveOutcome {
 	proposals: ReadonlyArray<{ id: string }>;
+}
+
+export interface AutoRetrospectiveOutcome {
+	proposal: { id: string };
+	recommendation?: TrialRecommendation;
+	reused?: boolean;
 }
 
 export interface EvoAutoImproveExtensionOptions {
@@ -24,6 +33,8 @@ export interface EvoAutoImproveExtensionOptions {
 	initialDelayMs?: number;
 	checkIntervalMs?: number;
 	improve?: (signal: AbortSignal) => Promise<AutoImproveOutcome>;
+	retrospect?: () => Promise<AutoRetrospectiveOutcome>;
+	now?: () => Date;
 }
 
 function errorMessage(error: unknown): string {
@@ -45,14 +56,28 @@ export function createEvoAutoImproveExtension(options: EvoAutoImproveExtensionOp
 	const improve =
 		options.improve ??
 		((signal: AbortSignal) =>
-			runReflector({
+			runEvolutionCycle({
+				paths,
+				runner,
+				service,
+				...(options.cwd ? { cwd: options.cwd } : {}),
+				...(options.agentDir ? { agentDir: options.agentDir } : {}),
+				signal,
+			}));
+	const retrospect =
+		options.retrospect ??
+		(async () => {
+			const config = await readEvoControlConfig(paths);
+			return runRetrospective({
 				paths,
 				runner,
 				...(options.cwd ? { cwd: options.cwd } : {}),
 				...(options.agentDir ? { agentDir: options.agentDir } : {}),
-				...(options.model ? { model: options.model } : {}),
-				signal,
-			}));
+				model: options.model ?? config.models.evaluator.model,
+				...(config.models.evaluator.thinkingLevel ? { thinkingLevel: config.models.evaluator.thinkingLevel } : {}),
+			});
+		});
+	const now = options.now ?? (() => new Date());
 
 	return (pi) => {
 		let timer: NodeJS.Timeout | undefined;
@@ -73,7 +98,44 @@ export function createEvoAutoImproveExtension(options: EvoAutoImproveExtensionOp
 			const tick = async (): Promise<void> => {
 				try {
 					if (stopped || !ctx.isIdle()) return;
-					if (!(await service.status()).initialized) return;
+					const status = await service.status();
+					if (!status.initialized) return;
+					if (status.trial) {
+						const proposal = await service.getProposal(status.trial.proposalId);
+						const schedule = await readScheduleConfig(paths);
+						const comparison = await buildTrialComparison(paths, proposal, status.trial);
+						const dueAt = Date.parse(status.trial.startedAt) + schedule.trialDueAfterDays * 24 * 60 * 60 * 1_000;
+						const due =
+							now().getTime() >= dueAt || comparison.after.totals.sessions >= schedule.trialDueAfterSessions;
+						if (due) {
+							const result = await retrospect();
+							notifiedFailure = false;
+							const config = await readEvoControlConfig(paths);
+							if (config.release.autoKeepSuccessfulTrial && result.recommendation === "keep") {
+								await service.keep("Automatic keep after evidence-bound retrospective recommendation");
+								ctx.ui.notify(`Evo-Pi automatically kept trial ${result.proposal.id}`, "info");
+								await refreshEvoStatusIndicator({ service, paths }, ctx, now);
+								return;
+							}
+							if (result.recommendation === "rollback") {
+								await service.rollback(
+									undefined,
+									"Automatic rollback after evidence-bound retrospective recommendation",
+								);
+								ctx.ui.notify(`Evo-Pi automatically rolled back trial ${result.proposal.id}`, "warning");
+								await refreshEvoStatusIndicator({ service, paths }, ctx, now);
+								return;
+							}
+							if (!result.reused) {
+								ctx.ui.notify(
+									`Evo-Pi automatically compared the trial with its baseline; review ${result.proposal.id} with /evo show ${result.proposal.id}`,
+									"info",
+								);
+								await refreshEvoStatusIndicator({ service, paths }, ctx, now);
+							}
+						}
+						return;
+					}
 					const result = await runConfiguredImprove({
 						paths,
 						excludeSessionIds: [ctx.sessionManager.getSessionId()],
@@ -84,11 +146,11 @@ export function createEvoAutoImproveExtension(options: EvoAutoImproveExtensionOp
 					const staged = result.value.proposals.length;
 					ctx.ui.notify(
 						staged > 0
-							? `Evo-Pi reflected in the background and staged ${staged} proposal${staged === 1 ? "" : "s"}; review with /evo list`
-							: "Evo-Pi reflected in the background; no grounded proposal was produced",
+							? `Evo-Pi evolved in the background and produced ${staged} proposal${staged === 1 ? "" : "s"}; review with /evo list`
+							: "Evo-Pi completed a background research cycle without a candidate",
 						"info",
 					);
-					await refreshEvoStatusIndicator({ service, paths }, ctx);
+					await refreshEvoStatusIndicator({ service, paths }, ctx, now);
 				} catch (error) {
 					if (!notifiedFailure) {
 						notifiedFailure = true;

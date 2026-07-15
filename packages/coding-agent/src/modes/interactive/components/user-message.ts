@@ -1,4 +1,4 @@
-import { Box, Container, Markdown, type MarkdownTheme } from "@earendil-works/pi-tui";
+import { Box, Container, Markdown, type MarkdownTheme, Spacer } from "@earendil-works/pi-tui";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -12,12 +12,14 @@ export class UserMessageComponent extends Container {
 	private text: string;
 	private markdownTheme: MarkdownTheme;
 	private outputPad: number;
+	private verticalPadding: number;
 
-	constructor(text: string, markdownTheme: MarkdownTheme = getMarkdownTheme(), outputPad = 1) {
+	constructor(text: string, markdownTheme: MarkdownTheme = getMarkdownTheme(), outputPad = 1, verticalPadding = 1) {
 		super();
 		this.text = text;
 		this.markdownTheme = markdownTheme;
 		this.outputPad = outputPad;
+		this.verticalPadding = verticalPadding;
 		this.rebuild();
 	}
 
@@ -28,7 +30,9 @@ export class UserMessageComponent extends Container {
 
 	private rebuild(): void {
 		this.clear();
-		const contentBox = new Box(this.outputPad, 1, (content: string) => theme.bg("userMessageBg", content));
+		const contentBox = new Box(this.outputPad, this.verticalPadding, (content: string) =>
+			theme.bg("userMessageBg", content),
+		);
 		contentBox.addChild(
 			new Markdown(
 				this.text,
@@ -42,6 +46,10 @@ export class UserMessageComponent extends Container {
 			),
 		);
 		this.addChild(contentBox);
+		if (this.verticalPadding === 0) {
+			// Keep the OSC 133 closing markers on a separate line without adding space inside the message background.
+			this.addChild(new Spacer(1));
+		}
 	}
 
 	override render(width: number): string[] {

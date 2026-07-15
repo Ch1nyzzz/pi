@@ -3,6 +3,7 @@ import chalk from "chalk";
 import { selectConfig } from "./cli/config-selector.ts";
 import { createProjectTrustContext } from "./cli/project-trust.ts";
 import {
+	APP_DISPLAY_NAME,
 	APP_NAME,
 	CONFIG_DIR_NAME,
 	detectInstallMethod,
@@ -11,9 +12,11 @@ import {
 	getSelfUpdateCommand,
 	getSelfUpdateUnavailableInstruction,
 	PACKAGE_NAME,
+	SELF_UPDATE_ENABLED,
 	type SelfUpdateCommand,
 	type SelfUpdatePackageTarget,
 	VERSION,
+	VERSION_CHECK_URL,
 } from "./config.ts";
 import type { InlineExtension } from "./core/extensions/types.ts";
 import { DefaultPackageManager } from "./core/package-manager.ts";
@@ -146,26 +149,36 @@ Examples:
 			return;
 
 		case "update":
-			console.log(`${chalk.bold("Usage:")}
+			console.log(
+				SELF_UPDATE_ENABLED
+					? `${chalk.bold("Usage:")}
   ${getPackageCommandUsage("update")}
 
-Update pi and installed packages.
+Update ${APP_DISPLAY_NAME} and installed packages.
 
 Options:
-  --self                  Update pi only (default when no target is given)
+  --self                  Update ${APP_DISPLAY_NAME} only (default when no target is given)
   --extensions            Update installed packages only
-  --all                   Update pi and installed packages
+  --all                   Update ${APP_DISPLAY_NAME} and installed packages
   --extension <source>    Update one package only
   -a, --approve           Trust project-local files for this command
   -na, --no-approve       Ignore project-local files for this command
-  --force                 Reinstall pi even if the current version is latest
+  --force                 Reinstall ${APP_DISPLAY_NAME} even if the current version is latest
 
 Short forms:
-  ${APP_NAME} update                Update pi only
-  ${APP_NAME} update --all          Update pi and all extensions
+  ${APP_NAME} update                Update ${APP_DISPLAY_NAME} only
+  ${APP_NAME} update --all          Update ${APP_DISPLAY_NAME} and all extensions
   ${APP_NAME} update <source>       Update one package
-  ${APP_NAME} update pi             Update pi only (self works as alias to pi)
-`);
+  ${APP_NAME} update pi             Update ${APP_DISPLAY_NAME} only (self works as alias to pi)
+`
+					: `${chalk.bold("Usage:")}
+  ${APP_NAME} update --extensions
+  ${APP_NAME} update --extension <source>
+  ${APP_NAME} update <source>
+
+Update installed packages. This ${APP_DISPLAY_NAME} source build does not self-update.
+`,
+			);
 			return;
 
 		case "list":
@@ -422,10 +435,10 @@ interface SelfUpdatePlan {
 	note?: string;
 }
 
-async function getSelfUpdatePlan(force: boolean): Promise<SelfUpdatePlan> {
+async function getSelfUpdatePlan(force: boolean, versionCheckUrl: string | undefined): Promise<SelfUpdatePlan> {
 	let latestRelease: Awaited<ReturnType<typeof getLatestPiRelease>>;
 	try {
-		latestRelease = await getLatestPiRelease(VERSION);
+		latestRelease = await getLatestPiRelease(VERSION, { url: versionCheckUrl });
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new Error(`Could not determine latest ${APP_NAME} version: ${message}`);
@@ -485,6 +498,8 @@ function prepareWindowsNpmSelfUpdate(): void {
 
 export interface PackageCommandRuntimeOptions {
 	extensionFactories?: InlineExtension[];
+	selfUpdateEnabled?: boolean;
+	versionCheckUrl?: string;
 }
 
 interface CommandSettingsResult {
@@ -756,6 +771,14 @@ export async function handlePackageCommand(
 
 			case "update": {
 				const target = options.updateTarget ?? { type: "self" };
+				const selfUpdateEnabled = runtimeOptions.selfUpdateEnabled ?? SELF_UPDATE_ENABLED;
+				if (updateTargetIncludesSelf(target) && !selfUpdateEnabled) {
+					console.error(chalk.red(`${APP_DISPLAY_NAME} self-update is disabled for this source build.`));
+					console.error(chalk.dim(`Update it through the ${APP_DISPLAY_NAME} repository workflow.`));
+					console.error(chalk.dim(`Use "${APP_NAME} update --extensions" to update installed packages.`));
+					process.exitCode = 1;
+					return true;
+				}
 				if (options.showExtensionsSkippedNote) {
 					console.log(
 						chalk.dim(`Extensions are skipped. Run ${APP_NAME} update --extensions to update extensions.`),
@@ -771,7 +794,10 @@ export async function handlePackageCommand(
 					}
 				}
 				if (updateTargetIncludesSelf(target)) {
-					const selfUpdatePlan = await getSelfUpdatePlan(options.force);
+					const selfUpdatePlan = await getSelfUpdatePlan(
+						options.force,
+						runtimeOptions.versionCheckUrl ?? VERSION_CHECK_URL,
+					);
 					if (!selfUpdatePlan.shouldRun) {
 						return true;
 					}

@@ -690,6 +690,16 @@ describe("schedule configuration", () => {
 		expect(manual).toMatchObject({ mode: "manual", everyDays: 7 });
 	});
 
+	it("adds the session threshold when reading an older schedule", async () => {
+		const fixture = await createFixture();
+		await mkdir(fixture.paths.registry, { recursive: true });
+		const { trialDueAfterSessions: _omitted, ...olderSchedule } = DEFAULT_EVO_SCHEDULE_CONFIG;
+		await writeFile(getScheduleConfigPath(fixture.paths), JSON.stringify(olderSchedule));
+		expect(await readScheduleConfig(fixture.paths)).toMatchObject({
+			trialDueAfterSessions: DEFAULT_EVO_SCHEDULE_CONFIG.trialDueAfterSessions,
+		});
+	});
+
 	it("fails closed on invalid stored schedule configuration", async () => {
 		const fixture = await createFixture();
 		await mkdir(fixture.paths.registry, { recursive: true });

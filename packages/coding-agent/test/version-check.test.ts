@@ -7,6 +7,7 @@ import {
 	isNewerPackageVersion,
 } from "../src/utils/version-check.ts";
 
+const VERSION_CHECK_URL = "https://pi.dev/api/latest-version";
 const originalSkipVersionCheck = process.env.PI_SKIP_VERSION_CHECK;
 const originalOffline = process.env.PI_OFFLINE;
 
@@ -38,15 +39,15 @@ describe("version checks", () => {
 		const fetchMock = vi.fn(async () => Response.json({ version: "1.2.3" }));
 		vi.stubGlobal("fetch", fetchMock);
 
-		await expect(checkForNewPiVersion("1.2.3")).resolves.toBeUndefined();
-		await expect(checkForNewPiVersion("1.2.2")).resolves.toEqual({ version: "1.2.3" });
+		await expect(checkForNewPiVersion("1.2.3", { url: VERSION_CHECK_URL })).resolves.toBeUndefined();
+		await expect(checkForNewPiVersion("1.2.2", { url: VERSION_CHECK_URL })).resolves.toEqual({ version: "1.2.3" });
 	});
 
 	it("uses the pi.dev version check api with a pi user agent", async () => {
 		const fetchMock = vi.fn(async () => Response.json({ version: "1.2.4" }));
 		vi.stubGlobal("fetch", fetchMock);
 
-		await expect(getLatestPiVersion("1.2.3")).resolves.toBe("1.2.4");
+		await expect(getLatestPiVersion("1.2.3", { url: VERSION_CHECK_URL })).resolves.toBe("1.2.4");
 		expect(fetchMock).toHaveBeenCalledWith(
 			"https://pi.dev/api/latest-version",
 			expect.objectContaining({
@@ -67,7 +68,7 @@ describe("version checks", () => {
 		);
 		vi.stubGlobal("fetch", fetchMock);
 
-		await expect(getLatestPiRelease("1.2.3")).resolves.toEqual({
+		await expect(getLatestPiRelease("1.2.3", { url: VERSION_CHECK_URL })).resolves.toEqual({
 			packageName: "@new-scope/pi",
 			version: "1.2.4",
 		});
@@ -77,7 +78,10 @@ describe("version checks", () => {
 		const fetchMock = vi.fn(async () => Response.json({ note: " **Read this** ", version: "1.2.4" }));
 		vi.stubGlobal("fetch", fetchMock);
 
-		await expect(getLatestPiRelease("1.2.3")).resolves.toEqual({ note: "**Read this**", version: "1.2.4" });
+		await expect(getLatestPiRelease("1.2.3", { url: VERSION_CHECK_URL })).resolves.toEqual({
+			note: "**Read this**",
+			version: "1.2.4",
+		});
 	});
 
 	it("skips api calls when version checks are disabled", async () => {
@@ -85,7 +89,15 @@ describe("version checks", () => {
 		const fetchMock = vi.fn();
 		vi.stubGlobal("fetch", fetchMock);
 
-		await expect(getLatestPiVersion("1.2.3")).resolves.toBeUndefined();
+		await expect(getLatestPiVersion("1.2.3", { url: VERSION_CHECK_URL })).resolves.toBeUndefined();
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("does not call an upstream API when the distribution has no version-check URL", async () => {
+		const fetchMock = vi.fn();
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(getLatestPiVersion("1.2.3", { url: null })).resolves.toBeUndefined();
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 });

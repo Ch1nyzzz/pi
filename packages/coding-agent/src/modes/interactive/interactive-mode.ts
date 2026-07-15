@@ -48,14 +48,20 @@ import {
 import chalk from "chalk";
 import { spawn, spawnSync } from "child_process";
 import {
+	APP_DISPLAY_NAME,
 	APP_NAME,
 	APP_TITLE,
+	APP_VERSION_LABEL,
+	CHANGELOG_ENABLED,
+	CHANGELOG_URL,
 	CONFIG_DIR_NAME,
 	getAgentDir,
 	getAuthPath,
 	getDebugLogPath,
 	getDocsPath,
 	getShareViewerUrl,
+	INSTALL_TELEMETRY_URL,
+	ONBOARDING_MESSAGE,
 	VERSION,
 } from "../../config.ts";
 import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
@@ -139,7 +145,7 @@ import {
 	type StatusIndicator,
 	WorkingStatusIndicator,
 } from "./components/status-indicator.ts";
-import { ToolExecutionComponent } from "./components/tool-execution.ts";
+import { type CollapsedToolSummary, ToolExecutionComponent } from "./components/tool-execution.ts";
 import { TreeSelectorComponent } from "./components/tree-selector.ts";
 import { TrustSelectorComponent } from "./components/trust-selector.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
@@ -387,6 +393,8 @@ export class InteractiveMode {
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
+	private toolCallsInCurrentUserTurn = 0;
+	private collapsedToolSummary: CollapsedToolSummary | undefined;
 
 	// Thinking block visibility state
 	private hideThinkingBlock = false;
@@ -747,7 +755,7 @@ export class InteractiveMode {
 
 		// Add header with keybindings from config (unless silenced)
 		if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
-			const logo = theme.bold(theme.fg("accent", APP_NAME)) + theme.fg("dim", ` v${this.version}`);
+			const logo = theme.bold(theme.fg("accent", APP_DISPLAY_NAME)) + theme.fg("dim", ` · ${APP_VERSION_LABEL}`);
 
 			// Build startup instructions using keybinding hint helpers
 			const hint = (keybinding: AppKeybinding, description: string) => keyHint(keybinding, description);
@@ -784,10 +792,7 @@ export class InteractiveMode {
 				"dim",
 				`Press ${keyText("app.tools.expand")} to show full startup help and loaded resources.`,
 			);
-			const onboarding = theme.fg(
-				"dim",
-				`Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.`,
-			);
+			const onboarding = theme.fg("dim", ONBOARDING_MESSAGE);
 			this.builtInHeader = new ExpandableText(
 				() => `${logo}\n${compactInstructions}\n${compactOnboarding}\n\n${onboarding}`,
 				() => `${logo}\n${expandedInstructions}\n\n${onboarding}`,
@@ -980,7 +985,7 @@ export class InteractiveMode {
 		}
 
 		if (extendedKeysFormat === "xterm") {
-			return "tmux extended-keys-format is xterm. Pi works best with csi-u. Add `set -g extended-keys-format csi-u` to ~/.tmux.conf and restart tmux.";
+			return `tmux extended-keys-format is xterm. ${APP_DISPLAY_NAME} works best with csi-u. Add \`set -g extended-keys-format csi-u\` to ~/.tmux.conf and restart tmux.`;
 		}
 
 		return undefined;
@@ -991,6 +996,10 @@ export class InteractiveMode {
 	 * Only shows new entries since last seen version, skips for resumed sessions.
 	 */
 	private getChangelogForDisplay(): string | undefined {
+		if (!CHANGELOG_ENABLED) {
+			return undefined;
+		}
+
 		// Skip changelog for resumed/continued sessions (already have messages)
 		if (this.session.state.messages.length > 0) {
 			return undefined;
@@ -1018,7 +1027,7 @@ export class InteractiveMode {
 	}
 
 	private reportInstallTelemetry(version: string): void {
-		if (process.env.PI_OFFLINE) {
+		if (process.env.PI_OFFLINE || !INSTALL_TELEMETRY_URL) {
 			return;
 		}
 
@@ -1026,7 +1035,7 @@ export class InteractiveMode {
 			return;
 		}
 
-		void fetch(`https://pi.dev/api/report-install?version=${encodeURIComponent(version)}`, {
+		void fetch(`${INSTALL_TELEMETRY_URL}?version=${encodeURIComponent(version)}`, {
 			headers: {
 				"User-Agent": getPiUserAgent(version),
 			},
@@ -1761,6 +1770,40 @@ export class InteractiveMode {
 	 */
 	private getRegisteredToolDefinition(toolName: string) {
 		return this.session.getToolDefinition(toolName);
+	}
+
+	private createToolExecutionComponent(toolName: string, toolCallId: string, args: unknown): ToolExecutionComponent {
+		const maxCollapsedToolsPerTurn = this.settingsManager.getMaxCollapsedToolsPerTurn();
+		const hiddenWhenCollapsed =
+			maxCollapsedToolsPerTurn !== undefined && this.toolCallsInCurrentUserTurn >= maxCollapsedToolsPerTurn;
+		let collapsedSummary: CollapsedToolSummary | undefined;
+		if (hiddenWhenCollapsed) {
+			const isFirstHiddenTool = this.collapsedToolSummary === undefined;
+			this.collapsedToolSummary ??= { count: 0 };
+			this.collapsedToolSummary.count += 1;
+			if (isFirstHiddenTool) {
+				collapsedSummary = this.collapsedToolSummary;
+			}
+		}
+
+		const component = new ToolExecutionComponent(
+			toolName,
+			toolCallId,
+			args,
+			{
+				showImages: this.settingsManager.getShowImages(),
+				imageWidthCells: this.settingsManager.getImageWidthCells(),
+				displayStyle: this.settingsManager.getToolDisplayStyle(),
+				hiddenWhenCollapsed,
+				collapsedSummary,
+			},
+			this.getRegisteredToolDefinition(toolName),
+			this.ui,
+			this.sessionManager.getCwd(),
+		);
+		this.toolCallsInCurrentUserTurn += 1;
+		component.setExpanded(this.toolOutputExpanded);
+		return component;
 	}
 
 	/**
@@ -2836,6 +2879,8 @@ export class InteractiveMode {
 		switch (event.type) {
 			case "agent_start":
 				this.pendingTools.clear();
+				this.toolCallsInCurrentUserTurn = 0;
+				this.collapsedToolSummary = undefined;
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);
 				}
@@ -2887,6 +2932,8 @@ export class InteractiveMode {
 					this.addMessageToChat(event.message);
 					this.ui.requestRender();
 				} else if (event.message.role === "user") {
+					this.toolCallsInCurrentUserTurn = 0;
+					this.collapsedToolSummary = undefined;
 					this.addMessageToChat(event.message);
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
@@ -2913,19 +2960,11 @@ export class InteractiveMode {
 					for (const content of this.streamingMessage.content) {
 						if (content.type === "toolCall") {
 							if (!this.pendingTools.has(content.id)) {
-								const component = new ToolExecutionComponent(
+								const component = this.createToolExecutionComponent(
 									content.name,
 									content.id,
 									content.arguments,
-									{
-										showImages: this.settingsManager.getShowImages(),
-										imageWidthCells: this.settingsManager.getImageWidthCells(),
-									},
-									this.getRegisteredToolDefinition(content.name),
-									this.ui,
-									this.sessionManager.getCwd(),
 								);
-								component.setExpanded(this.toolOutputExpanded);
 								this.chatContainer.addChild(component);
 								this.pendingTools.set(content.id, component);
 							} else {
@@ -2983,19 +3022,7 @@ export class InteractiveMode {
 			case "tool_execution_start": {
 				let component = this.pendingTools.get(event.toolCallId);
 				if (!component) {
-					component = new ToolExecutionComponent(
-						event.toolName,
-						event.toolCallId,
-						event.args,
-						{
-							showImages: this.settingsManager.getShowImages(),
-							imageWidthCells: this.settingsManager.getImageWidthCells(),
-						},
-						this.getRegisteredToolDefinition(event.toolName),
-						this.ui,
-						this.sessionManager.getCwd(),
-					);
-					component.setExpanded(this.toolOutputExpanded);
+					component = this.createToolExecutionComponent(event.toolName, event.toolCallId, event.args);
 					this.chatContainer.addChild(component);
 					this.pendingTools.set(event.toolCallId, component);
 				}
@@ -3244,6 +3271,7 @@ export class InteractiveMode {
 								skillBlock.userMessage,
 								this.getMarkdownThemeWithSettings(),
 								this.outputPad,
+								this.settingsManager.getUserMessagePaddingY(),
 							);
 							this.chatContainer.addChild(userComponent);
 						}
@@ -3252,6 +3280,7 @@ export class InteractiveMode {
 							textContent,
 							this.getMarkdownThemeWithSettings(),
 							this.outputPad,
+							this.settingsManager.getUserMessagePaddingY(),
 						);
 						this.chatContainer.addChild(userComponent);
 					}
@@ -3287,6 +3316,8 @@ export class InteractiveMode {
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
 		this.pendingTools.clear();
+		this.toolCallsInCurrentUserTurn = 0;
+		this.collapsedToolSummary = undefined;
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
 		// Cache-miss notices are not persisted; re-derive them from the full entry
 		// list and re-inject them after the assistant messages that paid for them.
@@ -3312,19 +3343,7 @@ export class InteractiveMode {
 				// Render tool call components
 				for (const content of message.content) {
 					if (content.type === "toolCall") {
-						const component = new ToolExecutionComponent(
-							content.name,
-							content.id,
-							content.arguments,
-							{
-								showImages: this.settingsManager.getShowImages(),
-								imageWidthCells: this.settingsManager.getImageWidthCells(),
-							},
-							this.getRegisteredToolDefinition(content.name),
-							this.ui,
-							this.sessionManager.getCwd(),
-						);
-						component.setExpanded(this.toolOutputExpanded);
+						const component = this.createToolExecutionComponent(content.name, content.id, content.arguments);
 						this.chatContainer.addChild(component);
 
 						if (message.stopReason === "aborted" || message.stopReason === "error") {
@@ -3357,6 +3376,10 @@ export class InteractiveMode {
 				}
 			} else {
 				// All other messages use standard rendering
+				if (message.role === "user") {
+					this.toolCallsInCurrentUserTurn = 0;
+					this.collapsedToolSummary = undefined;
+				}
 				this.addMessageToChat(message, options);
 			}
 		}
@@ -3867,11 +3890,12 @@ export class InteractiveMode {
 	showNewVersionNotification(release: LatestPiRelease): void {
 		const action = theme.fg("accent", `${APP_NAME} update`);
 		const updateInstruction = theme.fg("muted", `New version ${release.version} is available. Run `) + action;
-		const changelogUrl = "https://pi.dev/changelog";
-		const changelogLink = getCapabilities().hyperlinks
-			? hyperlink(theme.fg("accent", changelogUrl), changelogUrl)
-			: theme.fg("accent", changelogUrl);
-		const changelogLine = theme.fg("muted", "Changelog: ") + changelogLink;
+		const changelogLine = CHANGELOG_URL
+			? theme.fg("muted", "Changelog: ") +
+				(getCapabilities().hyperlinks
+					? hyperlink(theme.fg("accent", CHANGELOG_URL), CHANGELOG_URL)
+					: theme.fg("accent", CHANGELOG_URL))
+			: undefined;
 		const note = release.note?.trim();
 
 		this.chatContainer.addChild(new Spacer(1));
@@ -3888,7 +3912,9 @@ export class InteractiveMode {
 			);
 			this.chatContainer.addChild(new Spacer(1));
 		}
-		this.chatContainer.addChild(new Text(changelogLine, 1, 0));
+		if (changelogLine) {
+			this.chatContainer.addChild(new Text(changelogLine, 1, 0));
+		}
 		this.chatContainer.addChild(new DynamicBorder((text) => theme.fg("warning", text)));
 		this.ui.requestRender();
 	}
@@ -5679,6 +5705,11 @@ export class InteractiveMode {
 	}
 
 	private handleChangelogCommand(): void {
+		if (!CHANGELOG_ENABLED) {
+			this.showWarning(`${APP_DISPLAY_NAME} changelog is not available for this development build.`);
+			return;
+		}
+
 		const changelogPath = getChangelogPath();
 		const allEntries = parseChangelog(changelogPath);
 

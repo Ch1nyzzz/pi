@@ -6,6 +6,10 @@ import type { ModelRunResult } from "./model-runner.ts";
 
 export const MODEL_USAGE_PHASES = [
 	"reflector",
+	"research-plan",
+	"builder",
+	"evaluator",
+	"adversarial-review",
 	"report",
 	"critic",
 	"replay-old",

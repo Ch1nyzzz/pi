@@ -8,6 +8,7 @@ import type {
 	BundlePolicyLimits,
 	BundleValidationPolicy,
 	DeterministicCheck,
+	EvoComponentSelection,
 } from "../types.ts";
 
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
@@ -22,11 +23,16 @@ const POLICY_KEYS = new Set([
 	"coreAssets",
 	"limits",
 	"modelRouting",
+	"components",
 	"validation",
 	"managedSources",
 ]);
 const LIMIT_KEYS = new Set(["promptBytes", "skillBytes", "totalBytes"]);
 const MODEL_ROUTING_KEYS = new Set(["worker", "reflector", "critic"]);
+const COMPONENT_SELECTION_KEYS = new Set(["id", "abi", "artifactDigest", "config"]);
+const COMPONENT_SURFACE_PATTERN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
+const COMPONENT_ID_PATTERN = COMPONENT_SURFACE_PATTERN;
+const COMPONENT_ABI_PATTERN = /^[a-z][a-z0-9-]*\/v[1-9][0-9]*$/;
 const VALIDATION_KEYS = new Set(["requiredChecks"]);
 const MANAGED_SOURCE_KEYS = new Set(["kind", "sourceRoot", "relativePath", "targetPath", "sourceSha256"]);
 const MANAGED_SOURCE_KINDS = new Set<BundleManagedSourceKind>([
@@ -92,6 +98,63 @@ function parseModelRouting(value: unknown): BundleModelRouting | undefined {
 			throw new Error(`policy.modelRouting.${key} must be a non-empty provider/model identifier`);
 		}
 		result[key as keyof BundleModelRouting] = route;
+	}
+	return result;
+}
+
+function assertJsonData(value: unknown, label: string): void {
+	if (value === null || typeof value === "string" || typeof value === "boolean") return;
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) throw new Error(`${label} contains a non-finite number`);
+		return;
+	}
+	if (Array.isArray(value)) {
+		value.forEach((entry, index) => {
+			assertJsonData(entry, `${label}[${index}]`);
+		});
+		return;
+	}
+	if (typeof value !== "object" || value === null) throw new Error(`${label} must contain JSON data`);
+	for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+		if (key.includes("\0")) throw new Error(`${label} contains an invalid key`);
+		assertJsonData(entry, `${label}.${key}`);
+	}
+}
+
+function parseComponents(value: unknown): Record<string, EvoComponentSelection> | undefined {
+	if (value === undefined) return undefined;
+	const record = asRecord(value, "policy.components");
+	const result: Record<string, EvoComponentSelection> = {};
+	for (const surface of Object.keys(record).sort()) {
+		if (!COMPONENT_SURFACE_PATTERN.test(surface) || surface.length > 128) {
+			throw new Error(`policy.components has an invalid surface: ${surface}`);
+		}
+		const selection = asRecord(record[surface], `policy.components.${surface}`);
+		rejectUnknownKeys(selection, COMPONENT_SELECTION_KEYS, `policy.components.${surface}`);
+		if (typeof selection.id !== "string" || !COMPONENT_ID_PATTERN.test(selection.id) || selection.id.length > 128) {
+			throw new Error(`policy.components.${surface}.id is invalid`);
+		}
+		if (
+			typeof selection.abi !== "string" ||
+			!COMPONENT_ABI_PATTERN.test(selection.abi) ||
+			selection.abi.length > 128
+		) {
+			throw new Error(`policy.components.${surface}.abi is invalid`);
+		}
+		if (typeof selection.artifactDigest !== "string" || !isDigest(selection.artifactDigest)) {
+			throw new Error(`policy.components.${surface}.artifactDigest must be a digest`);
+		}
+		let config: Record<string, unknown> | undefined;
+		if (selection.config !== undefined) {
+			config = asRecord(selection.config, `policy.components.${surface}.config`);
+			assertJsonData(config, `policy.components.${surface}.config`);
+		}
+		result[surface] = {
+			id: selection.id,
+			abi: selection.abi,
+			artifactDigest: selection.artifactDigest,
+			...(config ? { config } : {}),
+		};
 	}
 	return result;
 }
@@ -196,6 +259,7 @@ export function assertAssetPath(path: string): void {
 	const allowed =
 		path === "policy.json" ||
 		path === "bundle.json" ||
+		path === "memory/preferences.json" ||
 		(parts.length === 2 &&
 			(parts[0] === "prompts" || parts[0] === "memory") &&
 			parts[1].endsWith(".md") &&
@@ -218,6 +282,7 @@ export function parseBundlePolicy(value: unknown): BundlePolicy {
 		coreAssets: parseStringArray(record.coreAssets, "policy.coreAssets"),
 		limits: parseLimits(record.limits),
 		modelRouting: parseModelRouting(record.modelRouting),
+		components: parseComponents(record.components),
 		validation: parseValidation(record.validation),
 		managedSources: parseManagedSources(record.managedSources),
 	};

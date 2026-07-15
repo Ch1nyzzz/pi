@@ -28,8 +28,31 @@ export interface BundlePolicyLimits {
 
 export interface BundleModelRouting {
 	worker?: string;
+	/** @deprecated Evolution control-plane routing now belongs in evo/config.json. */
 	reflector?: string;
+	/** @deprecated Evaluation routing now belongs in evo/config.json. */
 	critic?: string;
+}
+
+export type EvoComponentActivationBoundary = "turn" | "session" | "process";
+
+export interface EvoComponentManifest {
+	schemaVersion: 1;
+	id: string;
+	version: string;
+	artifactDigest: string;
+	entrypointSha256: string;
+	abi: string;
+	activationBoundary: EvoComponentActivationBoundary;
+	capabilities: string[];
+	entrypoint: string;
+}
+
+export interface EvoComponentSelection {
+	id: string;
+	abi: string;
+	artifactDigest: string;
+	config?: Record<string, unknown>;
 }
 
 export type DeterministicCheck = "bundle-compile";
@@ -65,6 +88,8 @@ export interface BundlePolicy {
 	coreAssets?: string[];
 	limits?: BundlePolicyLimits;
 	modelRouting?: BundleModelRouting;
+	/** Surface id to a content-addressed implementation of a host-defined ABI. */
+	components?: Record<string, EvoComponentSelection>;
 	validation?: BundleValidationPolicy;
 	managedSources?: BundleManagedSource[];
 }
@@ -93,7 +118,7 @@ export interface ProposalL1Result {
 	errors: string[];
 }
 
-export type ProposalArtifactKind = "review" | "replay" | "validation" | "retrospective";
+export type ProposalArtifactKind = "review" | "replay" | "validation" | "comparison" | "retrospective";
 
 export interface EvaluationEvidenceBinding {
 	digest: string;
@@ -113,6 +138,7 @@ export interface ProposalArtifacts {
 	review?: EvaluationArtifactRef;
 	replay?: EvaluationArtifactRef;
 	validation?: EvaluationArtifactRef;
+	comparison?: EvaluationArtifactRef;
 	retrospective?: EvaluationArtifactRef;
 }
 
@@ -157,6 +183,10 @@ export interface Proposal {
 	evidence: EvidenceReference[];
 	inboxReferences: string[];
 	replayScenarios: ReplayScenario[];
+	/** Existing host-defined ABI implemented by this candidate, when applicable. */
+	targetAbi?: string;
+	/** True only for infrastructure proposals that add a new host ABI. */
+	requiresNewAbi?: boolean;
 	changedPaths: string[];
 	diffDigest: string;
 	approvalDigest: string;
@@ -201,6 +231,8 @@ export interface HistoryEntry {
 	diffDigest?: string;
 	approvalDigest?: string;
 	candidateDigest?: string;
+	evidenceDigest?: string;
+	comparisonDigest?: string;
 	branch?: string;
 	reason: string;
 }
@@ -232,4 +264,79 @@ export interface EvoStatus {
 	pendingProposals: number;
 	deferredProposals: number;
 	paused: boolean;
+}
+
+export type EvolutionRunActiveStatus = "queued" | "researching" | "planned" | "building" | "evaluating";
+export type EvolutionRunStatus = EvolutionRunActiveStatus | "paused" | "completed" | "failed" | "cancelled";
+
+export interface EvoExperimentSpec {
+	baseline: string;
+	hypothesis: string;
+	checkProfiles: Array<
+		"bundle-compile" | "repo-check" | "related-tests" | "paired-replay" | "session-comparison" | "compaction-replay"
+	>;
+	metrics: string[];
+	minimumEffect: Record<string, number>;
+	trialPlan: string;
+	rollbackConditions: string[];
+}
+
+export interface EvolutionInboxDecision {
+	file: string;
+	kind: "preference" | "request" | "note" | "task-local";
+	reason: string;
+	/** Exact user-authored substring; required only for a durable preference. */
+	instruction?: string;
+}
+
+export interface EvolutionResearchPlan {
+	topic: string;
+	reason: string;
+	planMarkdown: string;
+	experiment: EvoExperimentSpec;
+	targetAbi?: string;
+	requiresNewAbi: boolean;
+	candidateKind: "none" | "data" | "component" | "code";
+	builderInstructions: string;
+	inboxDecisions: EvolutionInboxDecision[];
+}
+
+export interface EvolutionRun {
+	schemaVersion: 1;
+	id: string;
+	trigger: "scheduled" | "request";
+	request?: string;
+	status: EvolutionRunStatus;
+	startedAt: string;
+	updatedAt: string;
+	evidenceDigest: string;
+	planFile?: string;
+	experimentFile?: string;
+	proposalId?: string;
+	error?: string;
+	workerPid?: number;
+	workerStartedAt?: string;
+	logFile?: string;
+	pausedAt?: string;
+	pausedFrom?: EvolutionRunActiveStatus;
+}
+
+export interface EvoRoleModelConfig {
+	model: string;
+	thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+}
+
+export interface EvoControlConfig {
+	schemaVersion: 1;
+	models: {
+		researchPlanner: EvoRoleModelConfig;
+		builder: EvoRoleModelConfig;
+		evaluator: EvoRoleModelConfig;
+	};
+	release: {
+		autoApplyT0: boolean;
+		autoStartDataTrial: boolean;
+		autoStartComponentTrial: boolean;
+		autoKeepSuccessfulTrial: boolean;
+	};
 }

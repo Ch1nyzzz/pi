@@ -60,6 +60,7 @@ export interface EvoScheduleConfig {
 	inactivityMinutes: number;
 	dailyRunLimit: number;
 	trialDueAfterDays: number;
+	trialDueAfterSessions: number;
 }
 
 export interface EvoScheduleConfigInput {
@@ -69,6 +70,7 @@ export interface EvoScheduleConfigInput {
 	inactivityMinutes?: number;
 	dailyRunLimit?: number;
 	trialDueAfterDays?: number;
+	trialDueAfterSessions?: number;
 }
 
 export const DEFAULT_EVO_SCHEDULE_CONFIG: Readonly<EvoScheduleConfig> = {
@@ -79,6 +81,7 @@ export const DEFAULT_EVO_SCHEDULE_CONFIG: Readonly<EvoScheduleConfig> = {
 	inactivityMinutes: 15,
 	dailyRunLimit: 1,
 	trialDueAfterDays: 7,
+	trialDueAfterSessions: 10,
 };
 
 export interface ImproveRunStartedEvent {
@@ -509,7 +512,8 @@ function parseScheduleConfig(value: unknown): EvoScheduleConfig {
 		typeof config.everyDays !== "number" ||
 		typeof config.inactivityMinutes !== "number" ||
 		typeof config.dailyRunLimit !== "number" ||
-		typeof config.trialDueAfterDays !== "number"
+		typeof config.trialDueAfterDays !== "number" ||
+		(config.trialDueAfterSessions !== undefined && typeof config.trialDueAfterSessions !== "number")
 	) {
 		throw new Error("Stored Evo-Pi schedule configuration is invalid");
 	}
@@ -521,6 +525,10 @@ function parseScheduleConfig(value: unknown): EvoScheduleConfig {
 		inactivityMinutes: requirePositiveSafeInteger(config.inactivityMinutes, "inactivityMinutes"),
 		dailyRunLimit: requirePositiveSafeInteger(config.dailyRunLimit, "dailyRunLimit"),
 		trialDueAfterDays: requireScheduleDays(config.trialDueAfterDays, "trialDueAfterDays"),
+		trialDueAfterSessions: requirePositiveSafeInteger(
+			config.trialDueAfterSessions ?? DEFAULT_EVO_SCHEDULE_CONFIG.trialDueAfterSessions,
+			"trialDueAfterSessions",
+		),
 	};
 }
 
@@ -542,6 +550,7 @@ export async function writeScheduleConfig(paths: EvoPaths, input: EvoScheduleCon
 			inactivityMinutes: input.inactivityMinutes ?? current.inactivityMinutes,
 			dailyRunLimit: input.dailyRunLimit ?? current.dailyRunLimit,
 			trialDueAfterDays: input.trialDueAfterDays ?? current.trialDueAfterDays,
+			trialDueAfterSessions: input.trialDueAfterSessions ?? current.trialDueAfterSessions,
 		});
 		await atomicWriteJson(getScheduleConfigPath(paths), next);
 		return next;

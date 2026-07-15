@@ -128,6 +128,16 @@ describe("proposal revision artifacts", () => {
 		proposal.artifacts.review = reference;
 		expect(await saveProposalRevisionSnapshot(fixture.paths, proposal)).toBe("revisions/1/revision.json");
 		expect(await readProposalRevisionSnapshot(fixture.paths, proposal.id, proposal.revision)).toEqual(proposal);
+		expect(
+			JSON.parse(await readFile(join(fixture.paths.proposals, proposal.id, "revisions/1/change.json"), "utf8")),
+		).toMatchObject({
+			schemaVersion: 1,
+			proposalId: proposal.id,
+			revision: 1,
+			changedPaths: proposal.changedPaths,
+			diff: proposal.diff,
+			diffDigest: proposal.diffDigest,
+		});
 	});
 
 	it("rejects tampered, stale-revision, wrong-digest, and relocated artifacts", async () => {

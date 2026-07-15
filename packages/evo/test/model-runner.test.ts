@@ -85,6 +85,26 @@ describe("createPiModelRunner", () => {
 		expect(result.stats.tokens.output).toBeGreaterThan(0);
 	});
 
+	it("exposes the live headless-agent stream", async () => {
+		const { faux, model, runner } = createFauxRunner();
+		faux.setResponses([fauxAssistantMessage("streamed result")]);
+		const events: Array<{ type: string; delta?: string; stopReason?: string }> = [];
+		await runner.run({
+			cwd: process.cwd(),
+			systemPrompt: "judge",
+			prompt: "review",
+			model: `${model.provider}/${model.id}`,
+			onStreamEvent: (event) => events.push(event),
+		});
+		expect(
+			events
+				.filter((event) => event.type === "text")
+				.map((event) => event.delta)
+				.join(""),
+		).toBe("streamed result");
+		expect(events.at(-1)).toMatchObject({ type: "complete", stopReason: "stop" });
+	});
+
 	it("does not reuse messages between runs", async () => {
 		const { faux, model, runner } = createFauxRunner();
 		faux.setResponses([

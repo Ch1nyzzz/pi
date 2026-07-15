@@ -2,8 +2,10 @@ import { lstat, readdir, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { loadCompiledBundle } from "../bundle/compile.ts";
+import { readInboxLifecycleStates } from "../inbox.ts";
 import { type EvoPaths, ensureEvoLayout } from "../paths.ts";
 import type { DraftProposal } from "../proposal.ts";
+import { listSessionDigests } from "../recorder/digest.ts";
 import type { RecordedEvent, RecorderInboxEntry } from "../recorder/schema.ts";
 import { readSessionLog, resolveStoredPayload } from "../recorder/store.ts";
 import { BundleRegistry } from "../registry/registry.ts";
@@ -40,6 +42,7 @@ export interface CollectEvidenceCorpusOptions {
 	maxBytes?: number;
 	mode?: "full" | "incremental";
 	reviewCursor?: EvidenceReviewCursor;
+	completedSessionsOnly?: boolean;
 	now?: () => Date;
 }
 
@@ -66,7 +69,7 @@ export interface LoadedReplayScenario {
 	cwd: string;
 }
 
-interface RecentFile {
+interface EvidenceFile {
 	name: string;
 	mtimeMs: number;
 }
@@ -215,7 +218,11 @@ function createSourceCollector(maxBytes: number): SourceCollector {
 	};
 }
 
-async function listRecentFiles(directory: string, suffix: string): Promise<RecentFile[]> {
+async function listEvidenceFiles(
+	directory: string,
+	suffix: string,
+	order: "oldest" | "newest",
+): Promise<EvidenceFile[]> {
 	const entries = await readdir(directory, { withFileTypes: true }).catch((error: unknown) => {
 		if (isMissingFile(error)) return [];
 		throw error;
@@ -223,7 +230,7 @@ async function listRecentFiles(directory: string, suffix: string): Promise<Recen
 	const files = await Promise.all(
 		entries
 			.filter((entry) => entry.isFile() && entry.name.endsWith(suffix))
-			.map(async (entry): Promise<RecentFile | undefined> => {
+			.map(async (entry): Promise<EvidenceFile | undefined> => {
 				try {
 					const metadata = await lstat(join(directory, entry.name));
 					if (!metadata.isFile()) return undefined;
@@ -234,9 +241,10 @@ async function listRecentFiles(directory: string, suffix: string): Promise<Recen
 				}
 			}),
 	);
+	const direction = order === "oldest" ? 1 : -1;
 	return files
-		.filter((file): file is RecentFile => file !== undefined)
-		.sort((left, right) => right.mtimeMs - left.mtimeMs || right.name.localeCompare(left.name));
+		.filter((file): file is EvidenceFile => file !== undefined)
+		.sort((left, right) => direction * (left.mtimeMs - right.mtimeMs || left.name.localeCompare(right.name)));
 }
 
 async function restoreEvent(event: RecordedEvent, paths: EvoPaths): Promise<Record<string, unknown>> {
@@ -308,6 +316,67 @@ async function readInboxEntry(paths: EvoPaths, fileName: string): Promise<Record
 	return parseInboxEntry(value, fileName);
 }
 
+async function fullEvidenceStateDigest(
+	paths: EvoPaths,
+	bundleDigest: string | undefined,
+	digests: Awaited<ReturnType<typeof listSessionDigests>>,
+): Promise<string> {
+	const sessionDigests = digests.map((digest) => ({
+		sessionId: digest.sessionId,
+		sourceDigest: digest.sourceDigest,
+	}));
+	const inbox = await Promise.all(
+		(await listEvidenceFiles(paths.inbox, ".json", "oldest")).map(async (file) => ({
+			file: file.name,
+			sha256: sha256(await readFile(join(paths.inbox, file.name), "utf8")),
+		})),
+	);
+	let history = "";
+	let inboxHistory = "";
+	try {
+		history = await readFile(paths.history, "utf8");
+	} catch (error) {
+		if (!isMissingFile(error)) throw error;
+	}
+	try {
+		inboxHistory = await readFile(paths.inboxHistory, "utf8");
+	} catch (error) {
+		if (!isMissingFile(error)) throw error;
+	}
+	return sha256(
+		canonicalJson({
+			fullEvidenceSchemaVersion: 1,
+			bundleDigest: bundleDigest ?? null,
+			history: sha256(history),
+			inboxHistory: sha256(inboxHistory),
+			inbox,
+			sessions: sessionDigests,
+		}),
+	);
+}
+
+function compactSessionDigest(digest: Awaited<ReturnType<typeof listSessionDigests>>[number]) {
+	const metrics = Object.fromEntries(
+		Object.entries(digest.metrics).filter(([key, value]) =>
+			key === "usage" ? digest.metrics.usage.totalTokens > 0 : value !== 0,
+		),
+	);
+	return {
+		schemaVersion: digest.schemaVersion,
+		sessionId: digest.sessionId,
+		bundleDigest: digest.bundleDigest,
+		taskClass: digest.taskClass,
+		startedAt: digest.startedAt,
+		endedAt: digest.endedAt,
+		complete: digest.complete,
+		lastSequence: digest.lastSequence,
+		sourceDigest: digest.sourceDigest,
+		preferenceEvidence: digest.preferenceEvidence,
+		assessment: digest.assessment,
+		metrics,
+	};
+}
+
 function extractMessageText(value: unknown, label: string): string {
 	if (!isRecord(value) || value.role !== "user") throw new Error(`${label} must contain a user message`);
 	if (typeof value.content === "string") return value.content;
@@ -352,6 +421,7 @@ export async function collectEvidenceCorpus(
 	const previousCursor =
 		mode === "incremental" && options.reviewCursor ? parseReviewCursor(options.reviewCursor) : undefined;
 	const reviewedInboxFiles = new Set(previousCursor?.inboxFiles ?? []);
+	const inboxLifecycle = await readInboxLifecycleStates(paths);
 	const nextInboxFiles = new Set(previousCursor?.inboxFiles ?? []);
 	const nextSessionSequences: Record<string, number> = { ...(previousCursor?.sessionSequences ?? {}) };
 	const sessionIds = new Set<string>();
@@ -377,63 +447,86 @@ export async function collectEvidenceCorpus(
 		}
 	}
 
-	try {
-		const lines = (await readFile(paths.history, "utf8"))
-			.split("\n")
-			.map((line) => line.trim())
-			.filter(Boolean)
-			.reverse();
-		for (const [index, line] of lines.entries()) {
-			let entry: unknown;
-			try {
-				entry = JSON.parse(line);
-			} catch {
-				throw new Error(`Registry history line ${lines.length - index} is invalid JSON`);
+	for (const [path, heading] of [
+		[paths.history, "Registry history"],
+		[paths.inboxHistory, "Inbox lifecycle"],
+	] as const) {
+		try {
+			const lines = (await readFile(path, "utf8"))
+				.split("\n")
+				.map((line) => line.trim())
+				.filter(Boolean)
+				.reverse();
+			for (const [index, line] of lines.entries()) {
+				let entry: unknown;
+				try {
+					entry = JSON.parse(line);
+				} catch {
+					throw new Error(`${heading} line ${lines.length - index} is invalid JSON`);
+				}
+				collectors.history.append(`## ${heading} entry ${lines.length - index}`, entry);
 			}
-			collectors.history.append(`## Registry history entry ${lines.length - index}`, entry);
+		} catch (error) {
+			if (!isMissingFile(error)) throw error;
 		}
-	} catch (error) {
-		if (!isMissingFile(error)) throw error;
 	}
 
-	for (const file of await listRecentFiles(paths.inbox, ".json")) {
-		if (reviewedInboxFiles.has(file.name)) continue;
+	for (const file of await listEvidenceFiles(paths.inbox, ".json", mode === "incremental" ? "oldest" : "newest")) {
+		const lifecycle = inboxLifecycle.get(file.name);
+		if (
+			lifecycle?.status === "materialized" ||
+			lifecycle?.status === "fulfilled" ||
+			lifecycle?.status === "dismissed" ||
+			lifecycle?.status === "superseded"
+		) {
+			continue;
+		}
+		if (!lifecycle && reviewedInboxFiles.has(file.name)) continue;
 		const entry = await readInboxEntry(paths, file.name);
-		if (collectors.inbox.append(`## Explicit request ${file.name}`, entry)) {
-			inboxFiles.push(file.name);
-			nextInboxFiles.add(file.name);
-		}
+		if (!collectors.inbox.append(`## Explicit input ${file.name}`, { entry, lifecycle: lifecycle ?? null })) break;
+		inboxFiles.push(file.name);
+		nextInboxFiles.add(file.name);
 	}
 
-	for (const file of await listRecentFiles(paths.log, ".jsonl")) {
-		const sessionId = file.name.slice(0, -".jsonl".length);
-		const reviewedSequence = previousCursor?.sessionSequences[sessionId] ?? 0;
+	const allDigests = await listSessionDigests(paths);
+	const digests = options.completedSessionsOnly ? allDigests.filter((digest) => digest.complete) : allDigests;
+	const orderedDigests = mode === "incremental" ? digests : [...digests].reverse();
+	let sessionBudgetFull = false;
+	for (const digest of orderedDigests) {
+		const reviewedSequence = previousCursor?.sessionSequences[digest.sessionId] ?? 0;
+		if (digest.lastSequence <= reviewedSequence) continue;
 		let events: RecordedEvent[];
 		try {
-			events = await readSessionLog(paths, sessionId);
+			events = await readSessionLog(paths, digest.sessionId);
 		} catch (error) {
-			throw new Error(`Cannot collect session log ${file.name}`, { cause: error });
+			throw new Error(`Cannot collect session log ${digest.sessionId}.jsonl`, { cause: error });
+		}
+		if (reviewedSequence === 0) {
+			if (!collectors.sessions.append(`## Session digest ${digest.sessionId}`, compactSessionDigest(digest))) break;
+			sessionIds.add(digest.sessionId);
 		}
 		for (const event of events) {
 			if (event.sequence <= reviewedSequence) continue;
 			const restored = await restoreEvent(event, paths);
-			if (collectors.sessions.append(`## Session ${sessionId}, sequence ${event.sequence}`, restored)) {
-				sessionIds.add(sessionId);
-				nextSessionSequences[sessionId] = event.sequence;
+			if (collectors.sessions.append(`## Session ${digest.sessionId}, sequence ${event.sequence}`, restored)) {
+				sessionIds.add(digest.sessionId);
+				nextSessionSequences[digest.sessionId] = event.sequence;
 				continue;
 			}
 			if (
 				collectors.sessions.append(
-					`## Session ${sessionId}, sequence ${event.sequence} (artifact omitted by budget)`,
+					`## Session ${digest.sessionId}, sequence ${event.sequence} (artifact omitted by budget)`,
 					event,
 				)
 			) {
-				sessionIds.add(sessionId);
-				nextSessionSequences[sessionId] = event.sequence;
+				sessionIds.add(digest.sessionId);
+				nextSessionSequences[digest.sessionId] = event.sequence;
 				continue;
 			}
+			sessionBudgetFull = true;
 			break;
 		}
+		if (sessionBudgetFull) break;
 	}
 
 	const sourceOrder = Object.keys(SOURCE_WEIGHTS) as EvidenceSource[];
@@ -449,16 +542,21 @@ export async function collectEvidenceCorpus(
 		inboxFiles: [...nextInboxFiles],
 		sessionSequences: nextSessionSequences,
 	});
-	const evidenceDigest = sha256(
-		canonicalJson({
-			bundleDigest: bundleDigest ?? null,
-			cutoff: {
-				inboxFiles: nextReviewCursor.inboxFiles,
-				sessionSequences: nextReviewCursor.sessionSequences,
-			},
-			sourceDigests: Object.fromEntries(sourceOrder.map((source) => [source, sha256(collectors[source].text())])),
-		}),
-	);
+	const evidenceDigest =
+		mode === "full"
+			? await fullEvidenceStateDigest(paths, bundleDigest, digests)
+			: sha256(
+					canonicalJson({
+						bundleDigest: bundleDigest ?? null,
+						cutoff: {
+							inboxFiles: nextReviewCursor.inboxFiles,
+							sessionSequences: nextReviewCursor.sessionSequences,
+						},
+						sourceDigests: Object.fromEntries(
+							sourceOrder.map((source) => [source, sha256(collectors[source].text())]),
+						),
+					}),
+				);
 	return {
 		text,
 		bytes: Buffer.byteLength(text, "utf8"),
@@ -540,10 +638,14 @@ export async function validateDraftGrounding(paths: EvoPaths, draft: DraftPropos
 	}
 
 	for (const scenario of draft.replayScenarios) await findEvent(scenario);
-	let hasExplicitInboxRequest = false;
+	let hasExplicitInboxInput = false;
 	for (const fileName of draft.inboxReferences) {
 		const entry = await readInboxEntry(paths, fileName);
-		hasExplicitInboxRequest ||= entry.text.trimStart().startsWith("REQUEST:");
+		hasExplicitInboxInput ||=
+			entry.kind === "request" ||
+			entry.kind === "preference" ||
+			entry.text.trimStart().startsWith("REQUEST:") ||
+			entry.text.trimStart().startsWith("PREFERENCE:");
 	}
 
 	if (draft.source === "pattern") {
@@ -565,7 +667,7 @@ export async function validateDraftGrounding(paths: EvoPaths, draft: DraftPropos
 			});
 		}
 		if (!independent) throw new Error("Pattern proposals require at least two independent evidence references");
-	} else if (!hasExplicitInboxRequest && !hasExplicitFeedbackEvidence && !hasExplicitUserRequestEvidence) {
+	} else if (!hasExplicitInboxInput && !hasExplicitFeedbackEvidence && !hasExplicitUserRequestEvidence) {
 		throw new Error("Explicit-request proposals require a REQUEST inbox entry or quoted user request");
 	}
 	return verified;

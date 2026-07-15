@@ -71,8 +71,10 @@ v1 中的 Supervisor 职责退化为：CLI 里的几个确定性函数（校验�
 
 ### 2.1 原则
 
-- **只记录，不判断**。实时路径上没有 feedback classifier、episode linker、opportunity detector；所有解读推迟到 Reflector 分析时进行，且分析产物（annotation）与原始记录分开存放，永不覆写原始记录。这是从 v1 保留的"raw fact append-only"原则，但去掉了协议机器。
-- **session 即边界**。MVP 用 session 近似 episode，不做 linker。跨 session 的目标归属由 Reflector 阅读时自行判断。
+- **只记录，不做模型判断**。实时路径只做确定性事件记录、持久偏好措辞标记和指标汇总，没有 feedback classifier、episode linker、opportunity detector；所有语义解读推迟到 Reflector，派生 digest 与原始记录分开存放，永不覆写原始记录。这是从 v1 保留的"raw fact append-only"原则，但去掉了协议机器。
+- **session 即边界**。MVP 用 session 近似 episode，不做 linker。每个正常前台 session 默认进入学习池；session 结束时生成带原始 sequence 引用的 digest，跨 session 的目标归属由 Reflector 阅读时自行判断。
+- **严格 FIFO 消化**。Reflector 从最老的未审 inbox/session 证据开始，成功后才推进持久 cursor；语料预算只决定本批大小，不决定哪些证据被永久丢弃。
+- **隐私排除是逃生口**。默认记录所有正常前台 session；只有项目根目录显式存在 `.pi/evo-private` 时整段跳过记录，不把逐 session 选择变成常规交互。
 
 ### 2.2 记录内容
 
@@ -85,7 +87,8 @@ v1 中的 Supervisor 职责退化为：CLI 里的几个确定性函数（校验�
 - session 结束时的 git diff（若在 repo 内）
 - provider usage（input/output/cache tokens，仅观测）
 - 当前生效的 bundle digest
-- 显式反馈：/evo note、用户说"以后都这样"之类被 extension 捕获的指令 → 追加到 inbox/
+- 显式反馈：/evo note、用户说"以后都这样"之类被 extension 捕获的指令 → 以 `PREFERENCE:` 追加到 inbox/
+- session digest：任务类型、轮次、工具错误、验证结果、token、偏好信号、比较资格与原始 sequence 范围
 ```
 
 ### 2.3 实现接入点
@@ -229,9 +232,10 @@ bundle schema 校验、编译、尺寸上限（借 Hermes 的经验值：单 ski
 **L3 试用期回顾（T1/T2；T0 不设）**
 真实使用本来就要花 token，因此这是**零边际成本的评价**——T1 的主要评价就是它：
 
-- 批准后新 digest 带 trial 标记上线，正常使用 1 周或 K 个 session（`trialPlan` 指定）；
-- 到期 Reflector 写 `retrospective.md`：对比试用前后的纠正次数、显式抱怨、revert、任务完成体感——**有数字用数字，没数字用引用记录的判断**，不硬造统计量；
-- 人一条命令 keep 或 rollback；试用期内任何时候 `/evo rollback` 立即生效。
+- 批准后新 digest 带 trial 标记上线，正常使用 7 天或 10 个完成 session（可配置）；
+- 系统按 `parentBundleDigest` / `candidateDigest` 自动划分 before/after cohort，以候选任务类型过滤 baseline，并排除未完成或无任务 session；
+- 到期后台自动写不可覆盖的 `comparisons/<evidence-digest>.{json,md}` 和证据绑定的 `retrospective.md`。确定性指标覆盖工具错误率、验证通过率、轮次、follow-up 与 token；样本不足必须显式标记，语义判断仍引用原始记录，不硬造成功率；
+- 人只需 keep 或 rollback；试用期内任何时候 `/evo rollback` 立即生效，且最终 history 引用 comparison/evidence digest。
 - T0 不设试用期：效果确定性可测（cache 指标），指标不对直接回滚。
 
 LLM-as-judge 在这套设计里的定位：**备忘录作者，是给人的顾问，不是自动 gate**。唯一的自动 gate 是 L1；唯一的最终 gate 是人。
@@ -286,6 +290,26 @@ LLM-as-judge 在这套设计里的定位：**备忘录作者，是给人的顾�
 
 结论：业界已验证"trace 反思 + 确定性门 + 人审"的组合可以工作，且同样是 data-first。v2 的增量是试用期回顾和指针回滚，这来自我们"个人日常 agent、没有 benchmark"的场景。
 
+### 4.9 固定自主进化工作流与组件 ABI
+
+实现不再让单个 Reflector 从 trace 直接跳到 patch，也不引入模型生成的动态 DAG。每次周期固定执行：
+
+```text
+真实 evidence / REQUEST（可选）
+  → Sol Ultra ResearchPlanner：research + plan + 冻结 experiment
+  → Terra Max Builder：一个 data、已有 ABI component 或 code candidate
+  → Terra XHigh Evaluator：evaluation + fresh-context adversarial review
+  → 确定性 standing policy：stable / trial / review / reject
+```
+
+用户可以编辑 `${PI_CODING_AGENT_DIR}/evo/workflow.md` 来修改各阶段原则；模型不能在运行中修改该文件、`config.json`、ABI Registry 或 release/rollback 路径。无 REQUEST 时 ResearchPlanner 从 FIFO session evidence、效率信号和 allowlisted 外部来源自行选一个方向；没有安全可测候选时允许只保存 plan 并结束。
+
+可插拔组件必须实现宿主预先定义的 surface ABI，而不是自行声明任意 hook。通用 manifest 固定组件 ID、版本、artifact digest、ABI、activation boundary、capability 和 entrypoint；每个 ABI 再固定输入、输出和 config schema。当前首个 ABI 为 `compaction/v1`。Bundle 只保存 `{surface → id, abi, artifactDigest, config}`；编译时拒绝未知 ABI、缺失 artifact、越权 capability 和不兼容 activation boundary。
+
+自动生成的组件以不可变 `.mjs` artifact 保存，并通过 JSONL RPC 在无凭据、Linux 下无网络的子进程执行。输入输出每次经过 ABI runtime validation。新 ABI 代表扩张宿主控制面：Evo 可以 research、写 plan、生成 T2 基础设施 patch 和测试，但不能在同一轮自行注册并激活；必须先经过显式人工审查，后续周期才能实现该 ABI。
+
+自然语言里的“每次”“始终”等只产生未分类 inbox candidate，Recorder 不在实时路径判断它是长期偏好还是功能请求。ResearchPlanner 将 ambiguous active inbox 分类为 preference、request、note 或 task-local；看过但未解决的条目保持 open。用户通过可信 `/evo preference` 明确给出的偏好是配置写入，不跑 ResearchPlanner/Builder/Evaluator：宿主验证 exact quote，确定性生成 append-only T0 bundle 并切换指针。真正生效的偏好进入 bundle 的 `memory/preferences.json`，由可信 runtime 只渲染其中的 instruction 到 system prompt；来源、ID 和生命周期元数据不进入模型上下文。请求在 proposal keep 后 fulfilled，rollback 时 reopen。materialized/fulfilled/dismissed/superseded 的 inbox payload 写入 digest tombstone 后 GC，长期偏好则继续由 bundle 持有。
+
 ## 5. 安全底线
 
 只保六条，全部是机制而非协议：
@@ -302,13 +326,17 @@ LLM-as-judge 在这套设计里的定位：**备忘录作者，是给人的顾�
 ```text
 ${PI_CODING_AGENT_DIR:-~/.pi/agent}/evo/
   log/<session-id>.jsonl        # Recorder 原始记录
+  session-digests/<session-id>.json # 确定性派生指标与原始 sequence 范围
   artifacts/sha256/<digest>     # 大对象
-  inbox/                        # 显式反馈、手动喂的研究材料
+  inbox/                        # 自动偏好、显式反馈、手动喂的研究材料
   bundles/<digest>/             # 不可变 bundle
   registry/stable               # 指针
   registry/trial.json
-  registry/history.jsonl        # journal（发布 + 提案结论）
-  proposals/<id>/               # proposal.json + observations.md + review.md + retrospective.md
+  registry/history.jsonl        # journal（发布 + 提案结论 + 最终证据 digest）
+  registry/review-cursor.json   # FIFO 证据消费位置
+  proposals/<id>/revisions/<n>/change.json
+  proposals/<id>/revisions/<n>/comparisons/<evidence-digest>.{json,md}
+  proposals/<id>/revisions/<n>/retrospectives/<evidence-digest>.md
   worktrees/                    # code 提案的隔离 worktree
   locks/
 ```
