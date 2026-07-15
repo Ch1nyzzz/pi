@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { ThinkingLevel } from "@ch1nyzzz/pi-agent-core";
 import { loadCompiledBundle } from "../bundle/compile.ts";
 import type { CodeValidationExecutor } from "../code/worktree.ts";
 import type { EvoPaths } from "../paths.ts";

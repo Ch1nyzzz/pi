@@ -1,5 +1,5 @@
 import { createInterface } from "node:readline/promises";
-import type { ExtensionCommandContext, ExtensionContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import type { ExtensionCommandContext, ExtensionContext, ExtensionFactory } from "@ch1nyzzz/pi-coding-agent";
 import { loadCompiledBundle } from "./bundle/compile.ts";
 import { buildTrialComparison, renderTrialComparisonMarkdown, type TrialComparison } from "./comparison.ts";
 import { canUseEvoComponentSandbox } from "./components/process-runtime.ts";

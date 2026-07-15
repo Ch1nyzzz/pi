@@ -4,7 +4,7 @@ import type {
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcResponse,
-} from "@earendil-works/pi-coding-agent";
+} from "@ch1nyzzz/pi-coding-agent";
 import type {
 	ErrorResponse,
 	InstanceSummary,

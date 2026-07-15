@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { ThinkingLevel } from "@ch1nyzzz/pi-agent-core";
 import { loadCompiledBundle } from "../bundle/compile.ts";
 import type { EvoPaths } from "../paths.ts";
 import { parseReflectorOutput } from "../proposal.ts";

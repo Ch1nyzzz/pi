@@ -7,7 +7,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 	loadSkills,
-} from "@earendil-works/pi-coding-agent";
+} from "@ch1nyzzz/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import { compileBundle } from "../src/bundle/compile.ts";
 import { createPolicyRuntimeExtension } from "../src/bundle/runtime.ts";

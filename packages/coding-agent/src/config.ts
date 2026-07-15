@@ -510,7 +510,7 @@ const productPackageDir = productPackage ? entrypointPackageDir : undefined;
 const pkg = productPackage ?? hostPackage;
 
 const piConfigName: string | undefined = pkg.piConfig?.name;
-export const PACKAGE_NAME: string = pkg.name || "@earendil-works/pi-coding-agent";
+export const PACKAGE_NAME: string = pkg.name || "@ch1nyzzz/pi-coding-agent";
 export const APP_NAME: string = piConfigName || "pi";
 export const APP_DISPLAY_NAME: string = pkg.piConfig?.displayName || APP_NAME;
 export const APP_TITLE: string = pkg.piConfig?.displayName ? APP_DISPLAY_NAME : piConfigName ? APP_NAME : "π";

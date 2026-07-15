@@ -1,4 +1,4 @@
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { ThinkingLevel } from "@ch1nyzzz/pi-agent-core";
 import { Type } from "typebox";
 import { loadCompiledBundle } from "../bundle/compile.ts";
 import { publishEvoComponentArtifact } from "../components/artifact.ts";

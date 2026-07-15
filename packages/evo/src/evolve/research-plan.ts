@@ -1,6 +1,6 @@
 import { join } from "node:path";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { StringEnum } from "@earendil-works/pi-ai";
+import type { ThinkingLevel } from "@ch1nyzzz/pi-agent-core";
+import { StringEnum } from "@ch1nyzzz/pi-ai";
 import { Type } from "typebox";
 import { isTrialMetricName, parseTrialDurationDays, TRIAL_METRIC_DIRECTIONS } from "../comparison.ts";
 import { createDefaultEvoAbiRegistry } from "../components/registry.ts";

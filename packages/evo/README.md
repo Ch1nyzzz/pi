@@ -1,4 +1,4 @@
-# @earendil-works/pi-evo
+# @ch1nyzzz/pi-evo
 
 Evo-Pi is a self-evolving Pi coding-agent workflow. It records session evidence, runs a fixed research-plan → experiment → candidate cycle, evaluates candidates independently, and activates only through a deterministic standing release policy or explicit human decision.
 
@@ -7,7 +7,7 @@ The implementation covers T0/T1/T2 risk tiers, revision-bound approval, trials a
 ## Install
 
 ```bash
-pi install npm:@earendil-works/pi-evo
+pi install npm:@ch1nyzzz/pi-evo
 ```
 
 The package installs a Pi extension with one `/evo` command. The standalone Evo-Pi distribution exposes the same state-management operations through `evo-pi-admin`.
@@ -221,7 +221,7 @@ The pinned bundle may select `enabledTools`, `components`, and `modelRouting.wor
 Code merged into the package can remain dormant by registering it through `createEvoExtension({ codeFeatures })`. Each definition receives a restricted `EvoCodeFeatureAPI` containing only guarded `on` and `registerTool` methods:
 
 ```ts
-import { createEvoExtension } from "@earendil-works/pi-evo";
+import { createEvoExtension } from "@ch1nyzzz/pi-evo";
 
 export default createEvoExtension({
 	codeFeatures: [

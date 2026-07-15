@@ -14,7 +14,7 @@ describe("shouldRunFirstTimeSetup", () => {
 
 	const shouldRunForOfficialDistribution = () =>
 		shouldRunFirstTimeSetup(settingsPath, {
-			packageName: "@earendil-works/pi-coding-agent",
+			packageName: "@ch1nyzzz/pi-coding-agent",
 			appName: "pi",
 			configDirName: ".pi",
 		});

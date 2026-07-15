@@ -1,6 +1,6 @@
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "@ch1nyzzz/pi-agent-core";
 import { loadCompiledBundle } from "../bundle/compile.ts";
 import { readInboxLifecycleStates } from "../inbox.ts";
 import { type EvoPaths, ensureEvoLayout } from "../paths.ts";

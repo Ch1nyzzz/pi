@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { Theme } from "@earendil-works/pi-coding-agent";
-import { type Component, Key, matchesKey, type TUI, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import type { Theme } from "@ch1nyzzz/pi-coding-agent";
+import { type Component, Key, matchesKey, type TUI, wrapTextWithAnsi } from "@ch1nyzzz/pi-tui";
 import type { EvoPaths } from "../paths.ts";
 import { loadProposal } from "../proposal.ts";
 import type { EvolutionRun, EvolutionRunStatus, Proposal } from "../types.ts";

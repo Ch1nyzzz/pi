@@ -1,6 +1,6 @@
 import { access } from "node:fs/promises";
 import { join } from "node:path";
-import type { ExtensionContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, ExtensionFactory } from "@ch1nyzzz/pi-coding-agent";
 import { resolveSessionBundleDigest } from "../bundle/runtime.ts";
 import { initializeInboxLifecycle } from "../inbox.ts";
 import { type EvoPaths, getEvoPaths } from "../paths.ts";

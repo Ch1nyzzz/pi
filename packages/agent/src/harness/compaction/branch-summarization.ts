@@ -1,4 +1,4 @@
-import type { Model, Models } from "@earendil-works/pi-ai";
+import type { Model, Models } from "@ch1nyzzz/pi-ai";
 
 import type { AgentMessage } from "../../types.ts";
 import {

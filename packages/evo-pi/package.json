@@ -1,5 +1,5 @@
 {
-	"name": "@earendil-works/evo-pi",
+	"name": "@ch1nyzzz/evo-pi",
 	"version": "0.80.6",
 	"description": "Local-first, self-evolving coding agent based on Pi",
 	"type": "module",
@@ -12,7 +12,7 @@
 		"upstreamName": "Pi",
 		"onboardingMessage": "Evo-Pi learns from local session evidence. Use /evo init once, then /evo help to inspect or control evolution.",
 		"selfUpdate": true,
-		"versionCheckUrl": "https://registry.npmjs.org/@earendil-works%2fevo-pi/latest",
+		"versionCheckUrl": "https://registry.npmjs.org/@ch1nyzzz%2fevo-pi/latest",
 		"changelogUrl": null,
 		"changelogEnabled": false,
 		"installTelemetryUrl": null
@@ -51,8 +51,8 @@
 		"node": ">=22.19.0"
 	},
 	"dependencies": {
-		"@earendil-works/pi-coding-agent": "^0.80.6",
-		"@earendil-works/pi-evo": "^0.80.6"
+		"@ch1nyzzz/pi-coding-agent": "^0.80.6",
+		"@ch1nyzzz/pi-evo": "^0.80.6"
 	},
 	"devDependencies": {
 		"shx": "0.4.0",

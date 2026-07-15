@@ -1,4 +1,4 @@
-import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import type { ExtensionFactory } from "@ch1nyzzz/pi-coding-agent";
 import { refreshEvoStatusIndicator } from "./cli.ts";
 import {
 	buildTrialComparison,

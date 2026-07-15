@@ -1,5 +1,5 @@
 {
-	"name": "@earendil-works/pi-evo",
+	"name": "@ch1nyzzz/pi-evo",
 	"version": "0.80.6",
 	"description": "Self-evolving coding agent workflows for pi",
 	"type": "module",
@@ -50,14 +50,14 @@
 		"node": ">=22.19.0"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-agent-core": "*",
-		"@earendil-works/pi-ai": "*",
-		"@earendil-works/pi-coding-agent": "*"
+		"@ch1nyzzz/pi-agent-core": "*",
+		"@ch1nyzzz/pi-ai": "*",
+		"@ch1nyzzz/pi-coding-agent": "*"
 	},
 	"devDependencies": {
-		"@earendil-works/pi-agent-core": "0.80.7",
-		"@earendil-works/pi-ai": "0.80.7",
-		"@earendil-works/pi-coding-agent": "0.80.7",
+		"@ch1nyzzz/pi-agent-core": "0.80.7",
+		"@ch1nyzzz/pi-ai": "0.80.7",
+		"@ch1nyzzz/pi-coding-agent": "0.80.7",
 		"@types/node": "24.12.4",
 		"shx": "0.4.0",
 		"typescript": "5.9.3",

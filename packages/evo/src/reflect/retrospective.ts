@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { StringEnum } from "@earendil-works/pi-ai";
+import type { ThinkingLevel } from "@ch1nyzzz/pi-agent-core";
+import { StringEnum } from "@ch1nyzzz/pi-ai";
 import { Type } from "typebox";
 import { loadCompiledBundle } from "../bundle/compile.ts";
 import { storeTrialComparison, type TrialComparison, trialEvidenceDigest } from "../comparison.ts";

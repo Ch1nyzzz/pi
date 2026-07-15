@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@ch1nyzzz/pi-coding-agent";
 
 const ENTRY_TYPE = "turn-timing";
 const UPDATE_INTERVAL_MS = 250;

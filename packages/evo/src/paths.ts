@@ -1,6 +1,6 @@
 import { chmod, mkdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@ch1nyzzz/pi-coding-agent";
 
 export interface EvoPaths {
 	root: string;

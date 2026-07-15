@@ -7,7 +7,7 @@ Evo-Pi is a local-first, self-evolving coding agent based on Pi. The `evo-pi` co
 Requires Node.js 22.19 or newer.
 
 ```bash
-npm install -g --ignore-scripts @earendil-works/evo-pi
+npm install -g --ignore-scripts @ch1nyzzz/evo-pi
 evo-pi
 ```
 

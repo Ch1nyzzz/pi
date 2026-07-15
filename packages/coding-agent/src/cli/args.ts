@@ -2,7 +2,7 @@
  * CLI argument parsing and help display
  */
 
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { ThinkingLevel } from "@ch1nyzzz/pi-agent-core";
 import chalk from "chalk";
 import {
 	APP_DISPLAY_NAME,

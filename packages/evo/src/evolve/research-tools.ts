@@ -1,5 +1,5 @@
-import { StringEnum } from "@earendil-works/pi-ai";
-import { type ToolDefinition, truncateHead } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@ch1nyzzz/pi-ai";
+import { type ToolDefinition, truncateHead } from "@ch1nyzzz/pi-coding-agent";
 import { Type } from "typebox";
 
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;

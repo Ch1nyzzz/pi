@@ -1,5 +1,5 @@
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { type BuildSystemPromptOptions, buildSystemPrompt } from "@earendil-works/pi-coding-agent";
+import type { ThinkingLevel } from "@ch1nyzzz/pi-agent-core";
+import { type BuildSystemPromptOptions, buildSystemPrompt } from "@ch1nyzzz/pi-coding-agent";
 import { loadCompiledBundle } from "../bundle/compile.ts";
 import { replaceManagedHostResources } from "../bundle/managed-sources.ts";
 import { renderRuntimeBundle, renderRuntimeBundlePrompt, replaceRuntimeBundlePrompt } from "../bundle/runtime.ts";

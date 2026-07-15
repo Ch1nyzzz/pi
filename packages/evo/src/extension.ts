@@ -1,4 +1,4 @@
-import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import type { ExtensionFactory } from "@ch1nyzzz/pi-coding-agent";
 import { createEvoAutoImproveExtension } from "./auto-improve.ts";
 import { createEvoCodeFeatureExtension, type EvoCodeFeatureDefinition } from "./bundle/code-feature.ts";
 import { createPolicyRuntimeExtension } from "./bundle/runtime.ts";

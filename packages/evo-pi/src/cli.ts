@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { main } from "@earendil-works/pi-coding-agent";
-import { createEvoExtension } from "@earendil-works/pi-evo";
+import { main } from "@ch1nyzzz/pi-coding-agent";
+import { createEvoExtension } from "@ch1nyzzz/pi-evo";
 
 process.title = "evo-pi";
 process.env.PI_CODING_AGENT = "true";

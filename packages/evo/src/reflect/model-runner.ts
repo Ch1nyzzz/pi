@@ -1,4 +1,4 @@
-import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, ThinkingLevel } from "@ch1nyzzz/pi-agent-core";
 import {
 	type AuthStorage,
 	createAgentSessionFromServices,
@@ -8,7 +8,7 @@ import {
 	SessionManager,
 	type SessionStats,
 	type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
+} from "@ch1nyzzz/pi-coding-agent";
 
 export type ModelRunStreamEvent =
 	| { type: "text" | "thinking" | "tool-arguments"; delta: string }

@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type BuildSystemPromptOptions, buildSystemPrompt } from "@earendil-works/pi-coding-agent";
+import { type BuildSystemPromptOptions, buildSystemPrompt } from "@ch1nyzzz/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import { compileBundle } from "../src/bundle/compile.ts";
 import { replaceManagedHostResources } from "../src/bundle/managed-sources.ts";

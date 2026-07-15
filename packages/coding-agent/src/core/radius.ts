@@ -12,7 +12,7 @@
  * instance with its own credentials and catalog.
  */
 
-import { createRadiusOAuthProvider, registerOAuthProvider } from "@earendil-works/pi-ai/oauth";
+import { createRadiusOAuthProvider, registerOAuthProvider } from "@ch1nyzzz/pi-ai/oauth";
 
 export const RADIUS_PROVIDER_ID = "radius";
 

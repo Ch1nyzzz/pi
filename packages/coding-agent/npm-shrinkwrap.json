@@ -1,17 +1,17 @@
 {
-	"name": "@earendil-works/pi-coding-agent",
+	"name": "@ch1nyzzz/pi-coding-agent",
 	"version": "0.80.7",
 	"lockfileVersion": 3,
 	"requires": true,
 	"packages": {
 		"": {
-			"name": "@earendil-works/pi-coding-agent",
+			"name": "@ch1nyzzz/pi-coding-agent",
 			"version": "0.80.7",
 			"license": "MIT",
 			"dependencies": {
-				"@earendil-works/pi-agent-core": "^0.80.7",
-				"@earendil-works/pi-ai": "^0.80.7",
-				"@earendil-works/pi-tui": "^0.80.7",
+				"@ch1nyzzz/pi-agent-core": "^0.80.7",
+				"@ch1nyzzz/pi-ai": "^0.80.7",
+				"@ch1nyzzz/pi-tui": "^0.80.7",
 				"@silvia-odwyer/photon-node": "0.3.4",
 				"chalk": "5.6.2",
 				"cross-spawn": "7.0.6",
@@ -473,12 +473,12 @@
 				"node": ">=6.9.0"
 			}
 		},
-		"node_modules/@earendil-works/pi-agent-core": {
+		"node_modules/@ch1nyzzz/pi-agent-core": {
 			"version": "0.80.7",
-			"resolved": "https://registry.npmjs.org/@earendil-works/pi-agent-core/-/pi-agent-core-0.80.7.tgz",
+			"resolved": "https://registry.npmjs.org/@ch1nyzzz/pi-agent-core/-/pi-agent-core-0.80.7.tgz",
 			"license": "MIT",
 			"dependencies": {
-				"@earendil-works/pi-ai": "^0.80.7",
+				"@ch1nyzzz/pi-ai": "^0.80.7",
 				"ignore": "7.0.5",
 				"typebox": "1.1.38",
 				"yaml": "2.9.0"
@@ -487,9 +487,9 @@
 				"node": ">=22.19.0"
 			}
 		},
-		"node_modules/@earendil-works/pi-ai": {
+		"node_modules/@ch1nyzzz/pi-ai": {
 			"version": "0.80.7",
-			"resolved": "https://registry.npmjs.org/@earendil-works/pi-ai/-/pi-ai-0.80.7.tgz",
+			"resolved": "https://registry.npmjs.org/@ch1nyzzz/pi-ai/-/pi-ai-0.80.7.tgz",
 			"license": "MIT",
 			"dependencies": {
 				"@anthropic-ai/sdk": "0.91.1",
@@ -511,9 +511,9 @@
 				"node": ">=22.19.0"
 			}
 		},
-		"node_modules/@earendil-works/pi-tui": {
+		"node_modules/@ch1nyzzz/pi-tui": {
 			"version": "0.80.7",
-			"resolved": "https://registry.npmjs.org/@earendil-works/pi-tui/-/pi-tui-0.80.7.tgz",
+			"resolved": "https://registry.npmjs.org/@ch1nyzzz/pi-tui/-/pi-tui-0.80.7.tgz",
 			"license": "MIT",
 			"dependencies": {
 				"get-east-asian-width": "1.6.0",

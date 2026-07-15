@@ -4,7 +4,7 @@
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/@earendil-works/evo-pi"><img alt="npm" src="https://img.shields.io/npm/v/@earendil-works/evo-pi?style=flat-square" /></a>
+  <a href="https://www.npmjs.com/package/@ch1nyzzz/evo-pi"><img alt="npm" src="https://img.shields.io/npm/v/@ch1nyzzz/evo-pi?style=flat-square" /></a>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
 </p>
 
@@ -15,7 +15,7 @@ Evo-Pi combines the Pi terminal coding agent with a built-in evolution engine. I
 Requires Node.js 22.19 or newer.
 
 ```bash
-npm install -g --ignore-scripts @earendil-works/evo-pi
+npm install -g --ignore-scripts @ch1nyzzz/evo-pi
 evo-pi
 ```
 
@@ -90,12 +90,12 @@ Use `evo-pi-admin <command>` for non-interactive local administration and extern
 
 | Package | Purpose |
 |---|---|
-| [`@earendil-works/evo-pi`](packages/evo-pi) | One-command product distribution and `evo-pi` entry point |
-| [`@earendil-works/pi-evo`](packages/evo) | Evolution engine and embedded Pi extension |
-| [`@earendil-works/pi-coding-agent`](packages/coding-agent) | Pi terminal coding-agent runtime and SDK |
-| [`@earendil-works/pi-agent-core`](packages/agent) | Agent loop and state management |
-| [`@earendil-works/pi-ai`](packages/ai) | Multi-provider model API |
-| [`@earendil-works/pi-tui`](packages/tui) | Terminal UI library |
+| [`@ch1nyzzz/evo-pi`](packages/evo-pi) | One-command product distribution and `evo-pi` entry point |
+| [`@ch1nyzzz/pi-evo`](packages/evo) | Evolution engine and embedded Pi extension |
+| [`@ch1nyzzz/pi-coding-agent`](packages/coding-agent) | Pi terminal coding-agent runtime and SDK |
+| [`@ch1nyzzz/pi-agent-core`](packages/agent) | Agent loop and state management |
+| [`@ch1nyzzz/pi-ai`](packages/ai) | Multi-provider model API |
+| [`@ch1nyzzz/pi-tui`](packages/tui) | Terminal UI library |
 
 See [`packages/evo/README.md`](packages/evo/README.md) for the complete evolution architecture, approval tiers, command reference, and current limitations.
 

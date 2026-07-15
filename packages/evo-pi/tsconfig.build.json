@@ -3,8 +3,8 @@
 	"compilerOptions": {
 		"outDir": "./dist",
 		"paths": {
-			"@earendil-works/pi-coding-agent": ["../coding-agent/dist/index.d.ts"],
-			"@earendil-works/pi-evo": ["../evo/dist/index.d.ts"]
+			"@ch1nyzzz/pi-coding-agent": ["../coding-agent/dist/index.d.ts"],
+			"@ch1nyzzz/pi-evo": ["../evo/dist/index.d.ts"]
 		},
 		"rootDir": "./src"
 	},

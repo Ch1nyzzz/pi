@@ -1,5 +1,5 @@
 import { join, resolve } from "node:path";
-import { setKeybindings, Text, type TUI } from "@earendil-works/pi-tui";
+import { setKeybindings, Text, type TUI } from "@ch1nyzzz/pi-tui";
 import { Type } from "typebox";
 import { beforeAll, describe, expect, test } from "vitest";
 import { getReadmePath } from "../src/config.ts";

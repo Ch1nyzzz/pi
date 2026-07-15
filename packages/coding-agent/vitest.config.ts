@@ -22,11 +22,11 @@ export default defineConfig({
 	},
 	resolve: {
 		alias: [
-			{ find: /^@earendil-works\/pi-ai$/, replacement: aiSrcIndex },
-			{ find: /^@earendil-works\/pi-ai\/compat$/, replacement: aiSrcCompat },
-			{ find: /^@earendil-works\/pi-ai\/oauth$/, replacement: aiSrcOAuth },
-			{ find: /^@earendil-works\/pi-agent-core$/, replacement: agentSrcIndex },
-			{ find: /^@earendil-works\/pi-tui$/, replacement: tuiSrcIndex },
+			{ find: /^@ch1nyzzz\/pi-ai$/, replacement: aiSrcIndex },
+			{ find: /^@ch1nyzzz\/pi-ai\/compat$/, replacement: aiSrcCompat },
+			{ find: /^@ch1nyzzz\/pi-ai\/oauth$/, replacement: aiSrcOAuth },
+			{ find: /^@ch1nyzzz\/pi-agent-core$/, replacement: agentSrcIndex },
+			{ find: /^@ch1nyzzz\/pi-tui$/, replacement: tuiSrcIndex },
 			{ find: /^@mariozechner\/pi-ai$/, replacement: aiSrcIndex },
 			{ find: /^@mariozechner\/pi-ai\/oauth$/, replacement: aiSrcOAuth },
 			{ find: /^@mariozechner\/pi-agent-core$/, replacement: agentSrcIndex },

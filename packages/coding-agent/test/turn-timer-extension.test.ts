@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@ch1nyzzz/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import turnTimerExtension, { formatTurnDuration, type TurnTimingEntry } from "../examples/extensions/turn-timer.ts";
 

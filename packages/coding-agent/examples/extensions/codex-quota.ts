@@ -1,5 +1,5 @@
-import type { Api, Model } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { Api, Model } from "@ch1nyzzz/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@ch1nyzzz/pi-coding-agent";
 
 const CODEX_PROVIDER = "openai-codex";
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/codex/usage";

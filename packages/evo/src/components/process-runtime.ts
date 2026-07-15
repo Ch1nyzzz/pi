@@ -5,6 +5,15 @@ import type { EvoAbiDefinition } from "./registry.ts";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 const MAX_STDERR_BYTES = 64 * 1024;
+const DOCKER_PROBE_TIMEOUT_MS = 10_000;
+const DOCKER_PULL_TIMEOUT_MS = 180_000;
+
+/** Major version pinned to the supported host runtime; override for air-gapped hosts. */
+function dockerImage(): string {
+	return process.env.PI_EVO_DOCKER_IMAGE || "node:22-slim";
+}
+
+export type EvoComponentSandboxKind = "bwrap" | "docker";
 
 interface ProcessRequest {
 	id: number;
@@ -52,43 +61,88 @@ function parseResponse(value: string): ProcessResponse {
 	return response as unknown as ProcessResponse;
 }
 
-export async function canUseEvoComponentSandbox(): Promise<boolean> {
-	if (process.platform !== "linux") return false;
+function probeCommand(command: string, args: string[], timeoutMs: number): Promise<boolean> {
 	return new Promise((resolve) => {
-		const child = spawn(
-			"bwrap",
-			[
-				"--die-with-parent",
-				"--new-session",
-				"--unshare-net",
-				"--unshare-pid",
-				"--unshare-ipc",
-				"--unshare-uts",
-				"--proc",
-				"/proc",
-				"--dev",
-				"/dev",
-				"--ro-bind",
-				"/usr",
-				"/usr",
-				"--ro-bind",
-				"/bin",
-				"/bin",
-				"--",
-				"/bin/true",
-			],
-			{ stdio: "ignore" },
-		);
-		child.once("error", () => resolve(false));
-		child.once("close", (code) => resolve(code === 0));
+		const child = spawn(command, args, { stdio: "ignore" });
+		const timer = setTimeout(() => {
+			child.kill("SIGTERM");
+			resolve(false);
+		}, timeoutMs);
+		timer.unref?.();
+		child.once("error", () => {
+			clearTimeout(timer);
+			resolve(false);
+		});
+		child.once("close", (code) => {
+			clearTimeout(timer);
+			resolve(code === 0);
+		});
 	});
 }
 
-function sandboxCommand(artifact: LoadedEvoComponentArtifact): {
+async function probeBwrapSandbox(): Promise<boolean> {
+	if (process.platform !== "linux") return false;
+	return probeCommand(
+		"bwrap",
+		[
+			"--die-with-parent",
+			"--new-session",
+			"--unshare-net",
+			"--unshare-pid",
+			"--unshare-ipc",
+			"--unshare-uts",
+			"--proc",
+			"/proc",
+			"--dev",
+			"/dev",
+			"--ro-bind",
+			"/usr",
+			"/usr",
+			"--ro-bind",
+			"/bin",
+			"/bin",
+			"--",
+			"/bin/true",
+		],
+		DOCKER_PROBE_TIMEOUT_MS,
+	);
+}
+
+async function probeDockerSandbox(): Promise<boolean> {
+	const image = dockerImage();
+	if (await probeCommand("docker", ["image", "inspect", image], DOCKER_PROBE_TIMEOUT_MS)) return true;
+	// A missing image is fetched once; a dead daemon or offline host fails here too.
+	return probeCommand("docker", ["pull", "--quiet", image], DOCKER_PULL_TIMEOUT_MS);
+}
+
+let sandboxProbe: Promise<EvoComponentSandboxKind | undefined> | undefined;
+
+/**
+ * Resolve the strongest available component sandbox: bwrap when unprivileged user
+ * namespaces work, otherwise an equally isolated Docker container (hosts that
+ * restrict userns via AppArmor typically still run Docker). The probe result is
+ * cached per process.
+ */
+export function resolveEvoComponentSandbox(): Promise<EvoComponentSandboxKind | undefined> {
+	sandboxProbe ??= (async () => {
+		if (await probeBwrapSandbox()) return "bwrap";
+		if (await probeDockerSandbox()) return "docker";
+		return undefined;
+	})();
+	return sandboxProbe;
+}
+
+export async function canUseEvoComponentSandbox(): Promise<boolean> {
+	return (await resolveEvoComponentSandbox()) !== undefined;
+}
+
+interface ComponentLaunch {
 	command: string;
 	args: string[];
 	env: NodeJS.ProcessEnv;
-} {
+}
+
+function bwrapCommand(artifact: LoadedEvoComponentArtifact): ComponentLaunch {
 	if (process.platform !== "linux") {
 		throw new Error(`Sandboxed Evo component processes are unsupported on ${process.platform}`);
 	}
@@ -142,11 +196,46 @@ function sandboxCommand(artifact: LoadedEvoComponentArtifact): {
 	};
 }
 
-function directCommand(artifact: LoadedEvoComponentArtifact): {
-	command: string;
-	args: string[];
-	env: NodeJS.ProcessEnv;
-} {
+/** Isolation equivalent to the bwrap profile: no network, read-only rootfs, no capabilities. */
+export function dockerSandboxCommand(artifact: LoadedEvoComponentArtifact): ComponentLaunch {
+	const user =
+		typeof process.getuid === "function" && typeof process.getgid === "function"
+			? [`--user=${process.getuid()}:${process.getgid()}`]
+			: [];
+	return {
+		command: "docker",
+		args: [
+			"run",
+			"--rm",
+			"--interactive",
+			"--init",
+			"--network=none",
+			"--read-only",
+			"--cap-drop=ALL",
+			"--security-opt=no-new-privileges",
+			"--pids-limit=256",
+			...user,
+			"--tmpfs",
+			"/tmp",
+			"--volume",
+			`${artifact.directory}:/component:ro`,
+			"--workdir",
+			"/component",
+			"--env",
+			"HOME=/tmp",
+			"--env",
+			"LANG=C.UTF-8",
+			dockerImage(),
+			"node",
+			`/component/${artifact.manifest.entrypoint}`,
+		],
+		// The docker CLI itself needs the caller's environment (DOCKER_HOST and
+		// friends); the container only sees the --env flags above.
+		env: process.env,
+	};
+}
+
+function directCommand(artifact: LoadedEvoComponentArtifact): ComponentLaunch {
 	return {
 		command: process.execPath,
 		args: [artifact.entrypoint],
@@ -160,6 +249,7 @@ export class EvoComponentProcess<TInput = unknown, TOutput = unknown, TConfig = 
 	private readonly pending = new Map<number, PendingRequest>();
 	private stderr = "";
 	private stopped = false;
+	private launchedSandbox?: EvoComponentSandboxKind | "direct";
 	private readonly artifact: LoadedEvoComponentArtifact;
 	private readonly abi: EvoAbiDefinition<TInput, TOutput, TConfig>;
 	private readonly config: TConfig;
@@ -177,10 +267,29 @@ export class EvoComponentProcess<TInput = unknown, TOutput = unknown, TConfig = 
 		this.options = options;
 	}
 
+	/** The execution boundary this process actually launched under. */
+	get sandboxKind(): EvoComponentSandboxKind | "direct" | undefined {
+		return this.launchedSandbox;
+	}
+
 	async start(): Promise<void> {
 		if (this.child) return;
 		if (this.stopped) throw new Error("Component process cannot be restarted after shutdown");
-		const launch = this.options.sandbox === false ? directCommand(this.artifact) : sandboxCommand(this.artifact);
+		let launch: ComponentLaunch;
+		if (this.options.sandbox === false) {
+			this.launchedSandbox = "direct";
+			launch = directCommand(this.artifact);
+		} else {
+			const kind = await resolveEvoComponentSandbox();
+			if (!kind) {
+				throw new Error(
+					"No component sandbox is available: bwrap cannot create unprivileged namespaces on this host " +
+						"and Docker is not usable. Fix either, or retry with explicit one-time direct permission.",
+				);
+			}
+			this.launchedSandbox = kind;
+			launch = kind === "bwrap" ? bwrapCommand(this.artifact) : dockerSandboxCommand(this.artifact);
+		}
 		const child = spawn(launch.command, launch.args, {
 			cwd: this.artifact.directory,
 			env: launch.env,

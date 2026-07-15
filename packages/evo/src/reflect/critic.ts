@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { ThinkingLevel } from "@ch1nyzzz/pi-agent-core";
 import type { EvoPaths } from "../paths.ts";
 import { attachProposalArtifact, proposalApproval } from "../proposal.ts";
 import type { Proposal } from "../types.ts";

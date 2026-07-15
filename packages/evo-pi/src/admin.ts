@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { runEvoCli } from "@earendil-works/pi-evo";
+import { runEvoCli } from "@ch1nyzzz/pi-evo";
 
 try {
 	await runEvoCli(process.argv.slice(2));

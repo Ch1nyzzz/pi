@@ -7,7 +7,7 @@ import {
 	buildSystemPrompt,
 	loadSkills,
 	type Skill,
-} from "@earendil-works/pi-coding-agent";
+} from "@ch1nyzzz/pi-coding-agent";
 import { sha256 } from "../storage.ts";
 import type { BundleManagedSource, CompiledBundle } from "../types.ts";
 

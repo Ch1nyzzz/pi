@@ -87,9 +87,14 @@ export async function validateComponentCandidate(
 			tokensBefore: 4096,
 			reason: "threshold" as const,
 		};
+		// The ABI declares metrics as observational telemetry (wall-clock timing);
+		// determinism binds the semantic effect, not the observation of producing it.
+		const semanticEffect = ({ metrics: _telemetry, ...effect }: CompactionV1Output) => effect;
 		const first = (await process.invoke(initialInput)) as CompactionV1Output;
 		const repeated = (await process.invoke(initialInput)) as CompactionV1Output;
-		if (canonicalJson(first) !== canonicalJson(repeated)) throw new Error("Component output is not deterministic");
+		if (canonicalJson(semanticEffect(first)) !== canonicalJson(semanticEffect(repeated))) {
+			throw new Error("Component output is not deterministic");
+		}
 		if (first.firstKeptEntryId !== initialInput.firstKeptEntryId) {
 			throw new Error("Component changed firstKeptEntryId");
 		}
@@ -107,6 +112,7 @@ export async function validateComponentCandidate(
 			"",
 			`- artifact: ${artifact.manifest.artifactDigest}`,
 			`- ABI: ${abi.id}`,
+			`- execution boundary: ${process.sandboxKind ?? "unknown"}`,
 			"- initialize: passed",
 			"- health: passed",
 			"- deterministic repeated invoke: passed",

@@ -7,7 +7,7 @@ import type {
 	ExtensionContext,
 	ExtensionFactory,
 	RegisteredCommand,
-} from "@earendil-works/pi-coding-agent";
+} from "@ch1nyzzz/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import { compileBundle } from "../src/bundle/compile.ts";
 import { createEvoCommandExtension, refreshEvoStatusIndicator, runEvoCli } from "../src/cli.ts";

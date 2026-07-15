@@ -1,7 +1,7 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { generateUnifiedPatch } from "@earendil-works/pi-coding-agent";
+import { generateUnifiedPatch } from "@ch1nyzzz/pi-coding-agent";
 import { compileBundle, loadCompiledBundle, materializeBundle } from "./bundle/compile.ts";
 import { assertAssetPath } from "./bundle/schema.ts";
 import {

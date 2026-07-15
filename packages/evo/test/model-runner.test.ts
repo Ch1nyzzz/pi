@@ -1,7 +1,7 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { StringEnum } from "@earendil-works/pi-ai";
-import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
-import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { AgentMessage } from "@ch1nyzzz/pi-agent-core";
+import { StringEnum } from "@ch1nyzzz/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@ch1nyzzz/pi-ai/compat";
+import { AuthStorage, ModelRegistry } from "@ch1nyzzz/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import { createPiModelRunner } from "../src/reflect/model-runner.ts";

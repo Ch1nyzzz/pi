@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionFactory, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionFactory, ToolDefinition } from "@ch1nyzzz/pi-coding-agent";
 import { getEvoPaths } from "../paths.ts";
 import { isEvoFeatureEnabled } from "./feature-gate.ts";
 

@@ -1,6 +1,6 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
-import { Container, setKeybindings, Text, type TUI } from "@earendil-works/pi-tui";
+import type { AgentMessage } from "@ch1nyzzz/pi-agent-core";
+import type { AssistantMessage, Usage } from "@ch1nyzzz/pi-ai";
+import { Container, setKeybindings, Text, type TUI } from "@ch1nyzzz/pi-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { SessionEntry } from "../src/core/session-manager.ts";

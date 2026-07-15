@@ -6,7 +6,7 @@ import {
 	type ExtensionFactory,
 	type SessionStartEvent,
 	serializeConversation,
-} from "@earendil-works/pi-coding-agent";
+} from "@ch1nyzzz/pi-coding-agent";
 import { validateEvoComponentSelection } from "../components/artifact.ts";
 import { canUseEvoComponentSandbox, EvoComponentProcess } from "../components/process-runtime.ts";
 import {

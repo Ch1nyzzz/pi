@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
-import { loadSkills } from "@earendil-works/pi-coding-agent";
+import { loadSkills } from "@ch1nyzzz/pi-coding-agent";
 import { assertAssetPath } from "./bundle/schema.ts";
 import { atomicWriteFile, sha256 } from "./storage.ts";
 import type { BundleManagedSource, BundleManagedSourceKind } from "./types.ts";
