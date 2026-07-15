@@ -9,6 +9,7 @@ const packages = [
 	{ directory: "packages/agent", name: "@ch1nyzzz/pi-agent-core" },
 	{ directory: "packages/tui", name: "@ch1nyzzz/pi-tui" },
 	{ directory: "packages/coding-agent", name: "@ch1nyzzz/pi-coding-agent" },
+	{ directory: "packages/orchestrator", name: "@ch1nyzzz/pi-orchestrator" },
 	{ directory: "packages/evo", name: "@ch1nyzzz/pi-evo" },
 	{ directory: "packages/evo-pi", name: "@ch1nyzzz/evo-pi" },
 ];
@@ -122,6 +123,6 @@ for (const pkg of packageStates) {
 		continue;
 	}
 
-	run("npm", ["publish", "--access", "public", "--provenance", "--ignore-scripts"], { cwd: pkg.directory });
+	run("npm", ["publish", "--access", "public", "--ignore-scripts"], { cwd: pkg.directory });
 	console.log();
 }
