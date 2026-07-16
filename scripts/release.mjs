@@ -23,11 +23,17 @@ import { readFileSync, writeFileSync, readdirSync, existsSync } from "fs";
 import { join } from "path";
 
 const RELEASE_TARGET = process.argv[2];
+const RELEASE_REMOTE = process.env.PI_RELEASE_REMOTE ?? "origin";
 const BUMP_TYPES = new Set(["major", "minor", "patch"]);
 const SEMVER_RE = /^\d+\.\d+\.\d+$/;
+const GIT_REMOTE_RE = /^[A-Za-z0-9._-]+$/;
 
 if (!RELEASE_TARGET || (!BUMP_TYPES.has(RELEASE_TARGET) && !SEMVER_RE.test(RELEASE_TARGET))) {
 	console.error("Usage: node scripts/release.mjs <major|minor|patch|x.y.z>");
+	process.exit(1);
+}
+if (!GIT_REMOTE_RE.test(RELEASE_REMOTE)) {
+	console.error("PI_RELEASE_REMOTE must be a Git remote name");
 	process.exit(1);
 }
 
@@ -200,9 +206,9 @@ run(`git commit -m "Add [Unreleased] section for next cycle"`);
 console.log();
 
 // 9. Push
-console.log("Pushing to remote...");
-run("git push origin main");
-run(`git push origin v${version}`);
+console.log(`Pushing to remote ${RELEASE_REMOTE}...`);
+run(`git push ${RELEASE_REMOTE} main`);
+run(`git push ${RELEASE_REMOTE} v${version}`);
 console.log();
 
 console.log(`=== Prepared release v${version}; CI publishing starts after the tag push ===`);
