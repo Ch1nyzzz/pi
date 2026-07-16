@@ -56,9 +56,6 @@
 		"@ch1nyzzz/pi-tui": "*"
 	},
 	"devDependencies": {
-		"@ch1nyzzz/pi-agent-core": "^0.80.8",
-		"@ch1nyzzz/pi-ai": "^0.80.8",
-		"@ch1nyzzz/pi-coding-agent": "^0.80.8",
 		"@types/node": "24.12.4",
 		"shx": "0.4.0",
 		"typescript": "5.9.3",
