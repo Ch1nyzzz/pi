@@ -168,8 +168,157 @@ export const COMPACTION_V1_ABI: EvoAbiDefinition<CompactionV1Input, CompactionV1
 	},
 };
 
+// context/v1 — the conversation-history axis. Two modes discriminated by `mode`:
+// `transform` (ephemeral view recomputed each turn) and `checkpoint` (durable
+// summary, byte-compatible with compaction/v1's contract). Empty ceiling for
+// prune/redact/summarize; retrieve/infer are added later for RAG and abstractive
+// summaries. See docs/host-abis.md.
+
+export interface ContextV1TransformInput {
+	mode: "transform";
+	messages: unknown[];
+	tokenEstimate?: number;
+	contextWindow?: number;
+	model?: string;
+	reason: "turn";
+}
+
+export interface ContextV1CheckpointInput {
+	mode: "checkpoint";
+	conversation: string;
+	previousSummary?: string;
+	firstKeptEntryId: string;
+	tokensBefore: number;
+	reason: "manual" | "threshold" | "overflow";
+	customInstructions?: string;
+}
+
+export type ContextV1Input = ContextV1TransformInput | ContextV1CheckpointInput;
+
+export interface ContextV1TransformOutput {
+	messages: unknown[];
+}
+
+export interface ContextV1CheckpointOutput {
+	summary: string;
+	firstKeptEntryId: string;
+	details?: unknown;
+	metrics?: {
+		durationMs?: number;
+		inputTokens?: number;
+		outputTokens?: number;
+	};
+}
+
+export type ContextV1Output = ContextV1TransformOutput | ContextV1CheckpointOutput;
+
+export interface ContextV1Config {
+	maxSummaryTokens?: number;
+	style?: "structured" | "narrative";
+}
+
+function assertJsonMessageArray(value: unknown, label: string): unknown[] {
+	if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+	for (const [index, entry] of value.entries()) {
+		if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+			throw new Error(`${label}[${index}] must be a message object`);
+		}
+	}
+	jsonValue(value, label);
+	return value;
+}
+
+export const CONTEXT_V1_ABI: EvoAbiDefinition<ContextV1Input, ContextV1Output, ContextV1Config> = {
+	id: "context/v1",
+	surface: "context",
+	activationBoundary: "session",
+	capabilityCeiling: [],
+	validateConfig(value) {
+		const config = asRecord(jsonValue(value, "context/v1 config"), "context/v1 config");
+		for (const key of Object.keys(config)) {
+			if (key !== "maxSummaryTokens" && key !== "style") {
+				throw new Error(`context/v1 config has unknown key: ${key}`);
+			}
+		}
+		if (
+			config.maxSummaryTokens !== undefined &&
+			(!Number.isSafeInteger(config.maxSummaryTokens) ||
+				(config.maxSummaryTokens as number) <= 0 ||
+				(config.maxSummaryTokens as number) > 32_768)
+		) {
+			throw new Error("context/v1 config.maxSummaryTokens must be an integer from 1 to 32768");
+		}
+		if (config.style !== undefined && config.style !== "structured" && config.style !== "narrative") {
+			throw new Error("context/v1 config.style is invalid");
+		}
+		return {
+			...(config.maxSummaryTokens === undefined ? {} : { maxSummaryTokens: config.maxSummaryTokens as number }),
+			...(config.style === undefined ? {} : { style: config.style as "structured" | "narrative" }),
+		};
+	},
+	validateInput(value) {
+		const input = asRecord(value, "context/v1 input");
+		if (input.mode === "transform") {
+			assertJsonMessageArray(input.messages, "context/v1 transform input.messages");
+			if (input.reason !== "turn") throw new Error("context/v1 transform input.reason must be 'turn'");
+			for (const key of ["tokenEstimate", "contextWindow"] as const) {
+				const metric = input[key];
+				if (metric !== undefined && (typeof metric !== "number" || !Number.isFinite(metric) || metric < 0)) {
+					throw new Error(`context/v1 transform input.${key} must be a non-negative number`);
+				}
+			}
+			if (input.model !== undefined && typeof input.model !== "string") {
+				throw new Error("context/v1 transform input.model must be a string");
+			}
+			return input as unknown as ContextV1Input;
+		}
+		if (input.mode === "checkpoint") {
+			if (
+				typeof input.conversation !== "string" ||
+				typeof input.firstKeptEntryId !== "string" ||
+				!input.firstKeptEntryId ||
+				typeof input.tokensBefore !== "number" ||
+				!Number.isFinite(input.tokensBefore) ||
+				input.tokensBefore < 0 ||
+				(input.reason !== "manual" && input.reason !== "threshold" && input.reason !== "overflow") ||
+				(input.previousSummary !== undefined && typeof input.previousSummary !== "string") ||
+				(input.customInstructions !== undefined && typeof input.customInstructions !== "string")
+			) {
+				throw new Error("context/v1 checkpoint input is invalid");
+			}
+			return input as unknown as ContextV1Input;
+		}
+		throw new Error("context/v1 input.mode must be 'transform' or 'checkpoint'");
+	},
+	validateOutput(value) {
+		const output = asRecord(value, "context/v1 output");
+		if (Array.isArray(output.messages)) {
+			assertJsonMessageArray(output.messages, "context/v1 transform output.messages");
+			return output as unknown as ContextV1Output;
+		}
+		if (typeof output.summary === "string") {
+			if (!output.summary.trim() || typeof output.firstKeptEntryId !== "string" || !output.firstKeptEntryId) {
+				throw new Error("context/v1 checkpoint output must contain a summary and firstKeptEntryId");
+			}
+			if (output.details !== undefined) jsonValue(output.details, "context/v1 details");
+			if (output.metrics !== undefined) {
+				const metrics = asRecord(output.metrics, "context/v1 metrics");
+				for (const key of ["durationMs", "inputTokens", "outputTokens"] as const) {
+					const metric = metrics[key];
+					if (metric !== undefined && (typeof metric !== "number" || !Number.isFinite(metric) || metric < 0)) {
+						throw new Error(`context/v1 metrics.${key} must be non-negative`);
+					}
+				}
+			}
+			return output as unknown as ContextV1Output;
+		}
+		throw new Error("context/v1 output must contain messages (transform) or a summary (checkpoint)");
+	},
+};
+
 export function createDefaultEvoAbiRegistry(): EvoAbiRegistry {
 	const registry = new EvoAbiRegistry();
 	registry.register(COMPACTION_V1_ABI);
+	registry.register(CONTEXT_V1_ABI);
 	return registry;
 }
