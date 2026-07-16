@@ -16,8 +16,10 @@
 
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { DraftChange } from "../proposal.ts";
-import type { EvoPackManifest } from "./pack.ts";
+import type { EvoPaths } from "../paths.ts";
+import { type DraftChange, type DraftProposal, stageProposal } from "../proposal.ts";
+import type { Proposal } from "../types.ts";
+import { type EvoPackManifest, loadEvoPack } from "./pack.ts";
 
 const ASSET_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
@@ -82,5 +84,80 @@ export async function buildPackDataChanges(packDir: string, manifest: EvoPackMan
 		addedPromptPaths,
 		addedSkillPaths,
 		skippedMemory: manifest.contents.memory.length,
+	};
+}
+
+export interface PackImportResult {
+	manifest: EvoPackManifest;
+	/** The staged data proposal, or undefined when the pack has no data-type parts. */
+	proposal: Proposal | undefined;
+	addedSkillPaths: string[];
+	addedPromptPaths: string[];
+	/** Memory parts skipped (structured merge deferred). */
+	skippedMemory: number;
+	/** Code-type parts (components + workflows) not handled by the data path. */
+	skippedCode: number;
+}
+
+/**
+ * Import a pack's data-type parts against the current stable bundle: verify
+ * integrity, map skills/prompts to bundle changes, and stage a reversible data
+ * proposal (T0/T1) via the existing proposal pipeline. Skills load from the
+ * bundle `skills/` directory and prompts from `prompts/` automatically, so no
+ * policy edit is required. Code-type parts (components/workflows) are counted
+ * and left to the ABI activation path.
+ */
+export async function importPackData(options: {
+	paths: EvoPaths;
+	parentDigest: string;
+	packDir: string;
+}): Promise<PackImportResult> {
+	const { manifest, integrity } = await loadEvoPack(options.packDir);
+	if (!integrity.ok) {
+		throw new Error(
+			`pack integrity check failed: expected ${integrity.expected ?? "(none declared)"}, got ${integrity.actual}`,
+		);
+	}
+	const data = await buildPackDataChanges(options.packDir, manifest);
+	const skippedCode = manifest.contents.components.length + manifest.contents.workflows.length;
+
+	if (data.changes.length === 0) {
+		return {
+			manifest,
+			proposal: undefined,
+			addedSkillPaths: [],
+			addedPromptPaths: [],
+			skippedMemory: data.skippedMemory,
+			skippedCode,
+		};
+	}
+
+	const draft: DraftProposal = {
+		motivation: `Import optimization pack "${manifest.name}"`,
+		expectedEffect: `Add ${data.addedSkillPaths.length} skill(s) and ${data.addedPromptPaths.length} prompt(s) from pack ${manifest.name}@${manifest.version}`,
+		risk: "Data-only bundle additions (skills/prompts); reversible via trial/rollback.",
+		verifyPlan: "bundle-compile",
+		trialPlan: "Activate in a reversible data trial, then keep or rollback.",
+		source: "explicit-request",
+		evidence: [],
+		inboxReferences: [],
+		replayScenarios: [],
+		changes: data.changes,
+	};
+
+	const proposal = await stageProposal({
+		paths: options.paths,
+		parentDigest: options.parentDigest,
+		draft,
+		observationsMarkdown: `Imported from optimization pack ${manifest.name}@${manifest.version}.`,
+	});
+
+	return {
+		manifest,
+		proposal,
+		addedSkillPaths: data.addedSkillPaths,
+		addedPromptPaths: data.addedPromptPaths,
+		skippedMemory: data.skippedMemory,
+		skippedCode,
 	};
 }
