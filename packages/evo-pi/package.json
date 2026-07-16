@@ -1,6 +1,6 @@
 {
 	"name": "@ch1nyzzz/evo-pi",
-	"version": "0.80.8",
+	"version": "0.80.9",
 	"description": "Local-first, self-evolving coding agent based on Pi",
 	"type": "module",
 	"piConfig": {
@@ -51,8 +51,8 @@
 		"node": ">=22.19.0"
 	},
 	"dependencies": {
-		"@ch1nyzzz/pi-coding-agent": "^0.80.8",
-		"@ch1nyzzz/pi-evo": "^0.80.8"
+		"@ch1nyzzz/pi-coding-agent": "^0.80.9",
+		"@ch1nyzzz/pi-evo": "^0.80.9"
 	},
 	"devDependencies": {
 		"shx": "0.4.0",
