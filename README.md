@@ -8,26 +8,44 @@
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
 </p>
 
-Evo-Pi combines the Pi terminal coding agent with a built-in evolution engine. It records local session evidence, proposes narrow improvements, evaluates them independently, and activates them through deterministic policy or explicit review. Every active personal configuration is an immutable local bundle with rollback history.
+Evo-Pi is an AI coding agent you run in your terminal — like Claude Code or a similar assistant — that reads, edits, and runs code through conversation. What sets it apart: it also learns from how you actually work and proposes narrow, reviewable improvements to its own prompts, skills, and configuration over time.
+
+Under the hood it combines the Pi terminal coding agent with a built-in evolution engine. It records local session evidence, proposes narrow improvements, evaluates them independently, and activates them through deterministic policy or explicit review. Every active personal configuration is an immutable local bundle with rollback history.
 
 ## Install
 
-Requires Node.js 22.19 or newer.
+Requires Node.js 22.19 or newer (check with `node --version`).
 
 ```bash
 npm install -g --ignore-scripts @ch1nyzzz/evo-pi
 evo-pi
 ```
 
-Authenticate and initialize once:
-
-```text
-/login
-/evo init
-/evo status
-```
+`--ignore-scripts` skips optional native post-install steps; the `evo-pi` CLI itself needs no build step and works without them.
 
 The `evo-pi` executable includes the coding agent and loads Evo automatically. There is no separate Pi installation or `pi install` step. Upgrade later with `evo-pi update --self`.
+
+## First run
+
+Evo-Pi needs a model provider. On first launch, run `/login` to connect one — it supports **Anthropic, OpenAI, Google, xAI, Groq, DeepSeek, OpenRouter, GitHub Copilot** and many others, through OAuth or your own API key. Use whichever account or key you already have; Evo-Pi does not resell model access.
+
+Then initialize the evolution engine once:
+
+```text
+/login          connect a model provider (OAuth or API key)
+/evo init       set up local evolution state
+/evo status     confirm everything is ready
+```
+
+Now just talk to it — ask it to explain code, fix a bug, or build something. From inside a project directory:
+
+```text
+> explain what src/cli.ts does
+> add a --verbose flag to the CLI and update the tests
+> run the tests and fix whatever fails
+```
+
+The evolution engine works quietly in the background from there; see below for how to inspect and control it.
 
 ## Product and personal-data boundary
 
