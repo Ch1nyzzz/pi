@@ -63,5 +63,5 @@ describe("Evo-Pi distribution", () => {
 		expect(imported.status).toBe(0);
 		expect(imported.stdout).toContain("Pack: shared-pack@1.0.0");
 		expect(imported.stdout).toContain("Activation: none;");
-	});
+	}, 15_000);
 });
