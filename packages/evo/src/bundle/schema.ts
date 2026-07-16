@@ -1,4 +1,6 @@
 import { isAbsolute, normalize } from "node:path";
+import type { EvoCapabilityGrant } from "../components/capabilities/broker.ts";
+import { EVO_CAPABILITY_NAMES } from "../components/capabilities/protocol.ts";
 import type {
 	BundleManagedSource,
 	BundleManagedSourceKind,
@@ -9,6 +11,7 @@ import type {
 	BundleValidationPolicy,
 	DeterministicCheck,
 	EvoComponentSelection,
+	EvoWorkflowSelection,
 } from "../types.ts";
 
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
@@ -24,15 +27,18 @@ const POLICY_KEYS = new Set([
 	"limits",
 	"modelRouting",
 	"components",
+	"tools",
+	"workflows",
 	"validation",
 	"managedSources",
 ]);
 const LIMIT_KEYS = new Set(["promptBytes", "skillBytes", "totalBytes"]);
 const MODEL_ROUTING_KEYS = new Set(["worker", "reflector", "critic"]);
-const COMPONENT_SELECTION_KEYS = new Set(["id", "abi", "artifactDigest", "config"]);
+const COMPONENT_SELECTION_KEYS = new Set(["id", "abi", "artifactDigest", "config", "grants"]);
 const COMPONENT_SURFACE_PATTERN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 const COMPONENT_ID_PATTERN = COMPONENT_SURFACE_PATTERN;
 const COMPONENT_ABI_PATTERN = /^[a-z][a-z0-9-]*\/v[1-9][0-9]*$/;
+const WORKFLOW_TRIGGER_PATTERN = /^\/[a-z0-9][a-z0-9-]*$/;
 const VALIDATION_KEYS = new Set(["requiredChecks"]);
 const MANAGED_SOURCE_KEYS = new Set(["kind", "sourceRoot", "relativePath", "targetPath", "sourceSha256"]);
 const MANAGED_SOURCE_KINDS = new Set<BundleManagedSourceKind>([
@@ -45,6 +51,7 @@ const MANAGED_SOURCE_KINDS = new Set<BundleManagedSourceKind>([
 	"preference",
 ]);
 const DETERMINISTIC_CHECKS = new Set<DeterministicCheck>(["bundle-compile"]);
+const CAPABILITY_NAMES = new Set<string>(EVO_CAPABILITY_NAMES);
 
 function asRecord(value: unknown, label: string): Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -73,6 +80,87 @@ function parsePositiveInteger(value: unknown, label: string): number | undefined
 	if (value === undefined) return undefined;
 	if (!Number.isSafeInteger(value) || (value as number) <= 0) throw new Error(`${label} must be a positive integer`);
 	return value as number;
+}
+
+function requirePositiveInteger(value: unknown, label: string): number {
+	const parsed = parsePositiveInteger(value, label);
+	if (parsed === undefined) throw new Error(`${label} is required`);
+	return parsed;
+}
+
+function requirePositiveNumber(value: unknown, label: string): number {
+	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+		throw new Error(`${label} must be a positive finite number`);
+	}
+	return value;
+}
+
+function requireStringArray(value: unknown, label: string, allowEmpty: boolean): string[] {
+	const parsed = parseStringArray(value, label);
+	if (!parsed || (!allowEmpty && parsed.length === 0)) {
+		throw new Error(`${label} must be ${allowEmpty ? "an" : "a non-empty"} array of non-empty strings`);
+	}
+	return [...parsed].sort();
+}
+
+function parseCapabilityGrant(value: unknown, label: string): EvoCapabilityGrant {
+	const grant = asRecord(value, label);
+	if (typeof grant.capability !== "string" || !CAPABILITY_NAMES.has(grant.capability)) {
+		throw new Error(`${label}.capability is unsupported`);
+	}
+	if (grant.capability !== "infer" && grant.capability !== "spawn-agent") {
+		rejectUnknownKeys(grant, new Set(["capability", "maxCalls"]), label);
+		return {
+			capability: grant.capability,
+			maxCalls: requirePositiveInteger(grant.maxCalls, `${label}.maxCalls`),
+		} as EvoCapabilityGrant;
+	}
+	rejectUnknownKeys(
+		grant,
+		new Set([
+			"capability",
+			"maxCalls",
+			"models",
+			"maxInputTokens",
+			"maxOutputTokens",
+			"maxTotalTokens",
+			"maxCostUsd",
+			"maxOutputTokensPerCall",
+			"tools",
+		]),
+		label,
+	);
+	if (grant.capability === "infer" && grant.tools !== undefined) {
+		throw new Error(`${label}.tools is only supported for spawn-agent`);
+	}
+	const parsed: EvoCapabilityGrant = {
+		capability: grant.capability,
+		maxCalls: requirePositiveInteger(grant.maxCalls, `${label}.maxCalls`),
+		models: requireStringArray(grant.models, `${label}.models`, false),
+		maxInputTokens: requirePositiveInteger(grant.maxInputTokens, `${label}.maxInputTokens`),
+		maxOutputTokens: requirePositiveInteger(grant.maxOutputTokens, `${label}.maxOutputTokens`),
+		maxTotalTokens: requirePositiveInteger(grant.maxTotalTokens, `${label}.maxTotalTokens`),
+		maxCostUsd: requirePositiveNumber(grant.maxCostUsd, `${label}.maxCostUsd`),
+		maxOutputTokensPerCall: requirePositiveInteger(grant.maxOutputTokensPerCall, `${label}.maxOutputTokensPerCall`),
+		...(grant.tools === undefined ? {} : { tools: requireStringArray(grant.tools, `${label}.tools`, true) }),
+	};
+	if (parsed.maxTotalTokens < parsed.maxInputTokens || parsed.maxTotalTokens < parsed.maxOutputTokens) {
+		throw new Error(`${label}.maxTotalTokens must cover each token sub-budget`);
+	}
+	if (parsed.maxOutputTokensPerCall > parsed.maxOutputTokens) {
+		throw new Error(`${label}.maxOutputTokensPerCall exceeds maxOutputTokens`);
+	}
+	return parsed;
+}
+
+function parseCapabilityGrants(value: unknown, label: string): EvoCapabilityGrant[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+	const grants = value.map((grant, index) => parseCapabilityGrant(grant, `${label}[${index}]`));
+	if (new Set(grants.map((grant) => grant.capability)).size !== grants.length) {
+		throw new Error(`${label} must not contain duplicate capabilities`);
+	}
+	return grants.sort((left, right) => left.capability.localeCompare(right.capability));
 }
 
 function parseLimits(value: unknown): BundlePolicyLimits | undefined {
@@ -121,6 +209,33 @@ function assertJsonData(value: unknown, label: string): void {
 	}
 }
 
+function parseComponentSelection(value: unknown, label: string): EvoComponentSelection {
+	const selection = asRecord(value, label);
+	rejectUnknownKeys(selection, COMPONENT_SELECTION_KEYS, label);
+	if (typeof selection.id !== "string" || !COMPONENT_ID_PATTERN.test(selection.id) || selection.id.length > 128) {
+		throw new Error(`${label}.id is invalid`);
+	}
+	if (typeof selection.abi !== "string" || !COMPONENT_ABI_PATTERN.test(selection.abi) || selection.abi.length > 128) {
+		throw new Error(`${label}.abi is invalid`);
+	}
+	if (typeof selection.artifactDigest !== "string" || !isDigest(selection.artifactDigest)) {
+		throw new Error(`${label}.artifactDigest must be a digest`);
+	}
+	let config: Record<string, unknown> | undefined;
+	if (selection.config !== undefined) {
+		config = asRecord(selection.config, `${label}.config`);
+		assertJsonData(config, `${label}.config`);
+	}
+	const grants = parseCapabilityGrants(selection.grants, `${label}.grants`);
+	return {
+		id: selection.id,
+		abi: selection.abi,
+		artifactDigest: selection.artifactDigest,
+		...(config ? { config } : {}),
+		...(grants ? { grants } : {}),
+	};
+}
+
 function parseComponents(value: unknown): Record<string, EvoComponentSelection> | undefined {
 	if (value === undefined) return undefined;
 	const record = asRecord(value, "policy.components");
@@ -129,34 +244,58 @@ function parseComponents(value: unknown): Record<string, EvoComponentSelection> 
 		if (!COMPONENT_SURFACE_PATTERN.test(surface) || surface.length > 128) {
 			throw new Error(`policy.components has an invalid surface: ${surface}`);
 		}
-		const selection = asRecord(record[surface], `policy.components.${surface}`);
-		rejectUnknownKeys(selection, COMPONENT_SELECTION_KEYS, `policy.components.${surface}`);
-		if (typeof selection.id !== "string" || !COMPONENT_ID_PATTERN.test(selection.id) || selection.id.length > 128) {
-			throw new Error(`policy.components.${surface}.id is invalid`);
+		if (surface === "tool" || surface === "workflow") {
+			throw new Error(`policy.components.${surface} must use the plural policy field`);
 		}
-		if (
-			typeof selection.abi !== "string" ||
-			!COMPONENT_ABI_PATTERN.test(selection.abi) ||
-			selection.abi.length > 128
-		) {
-			throw new Error(`policy.components.${surface}.abi is invalid`);
-		}
-		if (typeof selection.artifactDigest !== "string" || !isDigest(selection.artifactDigest)) {
-			throw new Error(`policy.components.${surface}.artifactDigest must be a digest`);
-		}
-		let config: Record<string, unknown> | undefined;
-		if (selection.config !== undefined) {
-			config = asRecord(selection.config, `policy.components.${surface}.config`);
-			assertJsonData(config, `policy.components.${surface}.config`);
-		}
-		result[surface] = {
-			id: selection.id,
-			abi: selection.abi,
-			artifactDigest: selection.artifactDigest,
-			...(config ? { config } : {}),
-		};
+		result[surface] = parseComponentSelection(record[surface], `policy.components.${surface}`);
 	}
 	return result;
+}
+
+function parseTools(value: unknown): EvoComponentSelection[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) throw new Error("policy.tools must be an array");
+	const tools = value.map((entry, index) => {
+		const tool = parseComponentSelection(entry, `policy.tools[${index}]`);
+		if (tool.abi !== "tool/v1") throw new Error(`policy.tools[${index}].abi must be tool/v1`);
+		return tool;
+	});
+	if (new Set(tools.map((tool) => tool.id)).size !== tools.length) {
+		throw new Error("policy.tools must not contain duplicate ids");
+	}
+	return tools;
+}
+
+function parseWorkflows(value: unknown): EvoWorkflowSelection[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) throw new Error("policy.workflows must be an array");
+	const workflows = value.map((entry, index): EvoWorkflowSelection => {
+		const label = `policy.workflows[${index}]`;
+		const record = asRecord(entry, label);
+		rejectUnknownKeys(record, new Set([...COMPONENT_SELECTION_KEYS, "trigger"]), label);
+		if (typeof record.trigger !== "string" || !WORKFLOW_TRIGGER_PATTERN.test(record.trigger)) {
+			throw new Error(`${label}.trigger must look like /name`);
+		}
+		const selection = parseComponentSelection(
+			{
+				id: record.id,
+				abi: record.abi,
+				artifactDigest: record.artifactDigest,
+				...(record.config === undefined ? {} : { config: record.config }),
+				...(record.grants === undefined ? {} : { grants: record.grants }),
+			},
+			label,
+		);
+		if (selection.abi !== "workflow/v1") throw new Error(`${label}.abi must be workflow/v1`);
+		return { ...selection, trigger: record.trigger };
+	});
+	if (new Set(workflows.map((workflow) => workflow.id)).size !== workflows.length) {
+		throw new Error("policy.workflows must not contain duplicate ids");
+	}
+	if (new Set(workflows.map((workflow) => workflow.trigger)).size !== workflows.length) {
+		throw new Error("policy.workflows must not contain duplicate triggers");
+	}
+	return workflows;
 }
 
 function parseValidation(value: unknown): BundleValidationPolicy | undefined {
@@ -283,6 +422,8 @@ export function parseBundlePolicy(value: unknown): BundlePolicy {
 		limits: parseLimits(record.limits),
 		modelRouting: parseModelRouting(record.modelRouting),
 		components: parseComponents(record.components),
+		tools: parseTools(record.tools),
+		workflows: parseWorkflows(record.workflows),
 		validation: parseValidation(record.validation),
 		managedSources: parseManagedSources(record.managedSources),
 	};
@@ -297,6 +438,14 @@ export function parseBundlePolicy(value: unknown): BundlePolicy {
 	const stable = new Set(policy.stablePromptPaths ?? []);
 	if (policy.dynamicPromptPaths?.some((path) => stable.has(path))) {
 		throw new Error("A prompt cannot be both stable and dynamic");
+	}
+	const codePartIds = [
+		...Object.values(policy.components ?? {}).map((selection) => selection.id),
+		...(policy.tools ?? []).map((selection) => selection.id),
+		...(policy.workflows ?? []).map((selection) => selection.id),
+	];
+	if (new Set(codePartIds).size !== codePartIds.length) {
+		throw new Error("policy code selections must not contain duplicate ids");
 	}
 	return policy;
 }

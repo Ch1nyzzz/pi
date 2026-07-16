@@ -27,6 +27,7 @@ const RUN_TRANSITIONS: Record<EvolutionRunStatus, ReadonlySet<EvolutionRunStatus
 		"evaluating",
 		"awaiting-canary-approval",
 		"awaiting-evidence",
+		"awaiting-decision",
 		"paused",
 		"failed",
 		"cancelled",

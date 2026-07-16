@@ -357,6 +357,27 @@ export interface EvolutionResearchPlanResult {
 	state: EvolutionRun;
 }
 
+export async function persistEvolutionResearchPlan(options: {
+	paths: EvoPaths;
+	run: EvolutionRun;
+	plan: unknown;
+}): Promise<{ plan: EvolutionResearchPlan; state: EvolutionRun }> {
+	const plan = parseEvolutionResearchPlanValue(options.plan);
+	const directory = evolutionRunDirectory(options.paths, options.run.id);
+	await atomicWriteFile(join(directory, "plan.md"), `${plan.planMarkdown.trim()}\n`);
+	await atomicWriteJson(join(directory, "experiment.json"), plan.experiment);
+	// The full plan object enables evidence resumption and deterministic Builder
+	// inputs without re-running research.
+	await atomicWriteJson(join(directory, "plan.json"), plan);
+	const state = await updateEvolutionRun(options.paths, options.run.id, {
+		status: "planned",
+		planFile: "plan.md",
+		experimentFile: "experiment.json",
+		experimentDigest: sha256(canonicalJson(plan.experiment)),
+	});
+	return { plan, state };
+}
+
 export async function runEvolutionResearchPlan(
 	options: RunEvolutionResearchPlanOptions,
 ): Promise<EvolutionResearchPlanResult> {
@@ -431,17 +452,10 @@ export async function runEvolutionResearchPlan(
 		throw error;
 	}
 	await recordModelUsage(options.paths, "research-plan", modelRun);
-	const plan = modelRun.submission as EvolutionResearchPlan;
-	const directory = evolutionRunDirectory(options.paths, options.run.id);
-	await atomicWriteFile(join(directory, "plan.md"), `${plan.planMarkdown.trim()}\n`);
-	await atomicWriteJson(join(directory, "experiment.json"), plan.experiment);
-	// The full plan object enables evidence resumption without re-running research.
-	await atomicWriteJson(join(directory, "plan.json"), plan);
-	const state = await updateEvolutionRun(options.paths, options.run.id, {
-		status: "planned",
-		planFile: "plan.md",
-		experimentFile: "experiment.json",
-		experimentDigest: sha256(canonicalJson(plan.experiment)),
+	const persisted = await persistEvolutionResearchPlan({
+		paths: options.paths,
+		run: options.run,
+		plan: modelRun.submission,
 	});
-	return { plan, run: modelRun, state };
+	return { ...persisted, run: modelRun };
 }

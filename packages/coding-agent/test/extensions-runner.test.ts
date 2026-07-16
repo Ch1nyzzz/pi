@@ -5,6 +5,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fauxAssistantMessage } from "@ch1nyzzz/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { createExtensionRuntime, discoverAndLoadExtensions, loadExtensions } from "../src/core/extensions/loader.ts";
@@ -779,6 +780,7 @@ describe("ExtensionRunner", () => {
 						return {
 							content: [{ type: "text", text: "first" }],
 							details: { source: "ext1" },
+							terminate: true,
 						};
 					});
 				}
@@ -812,6 +814,7 @@ describe("ExtensionRunner", () => {
 				content: [{ type: "text", text: "first" }],
 				details: { source: "ext1" },
 				isError: true,
+				terminate: true,
 			});
 		});
 	});
@@ -926,6 +929,61 @@ describe("ExtensionRunner", () => {
 
 			expect(runner.hasHandlers("tool_call")).toBe(true);
 			expect(runner.hasHandlers("agent_end")).toBe(false);
+		});
+	});
+
+	describe("message_end redo", () => {
+		it("chains replacements and ORs redo across handlers", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("message_end", async (event) => ({
+						message: { ...event.message, content: [{ type: "text", text: "first" }] },
+						redo: true,
+					}));
+					pi.on("message_end", async (event) => ({
+						message: { ...event.message, content: [{ type: "text", text: "second" }] },
+						redo: false,
+					}));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "message-end.ts"), extCode);
+			const loaded = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+
+			const result = await runner.emitMessageEnd({
+				type: "message_end",
+				message: fauxAssistantMessage("base"),
+			});
+
+			expect(result?.redo).toBe(true);
+			expect(result?.message?.role === "assistant" ? result.message.content : undefined).toEqual([
+				{ type: "text", text: "second" },
+			]);
+			expect(errors).toEqual([]);
+		});
+
+		it("rejects redo when a later handler makes the final message unsafe", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("message_end", async () => ({ redo: true }));
+					pi.on("message_end", async (event) => ({
+						message: { ...event.message, stopReason: "error" },
+					}));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "unsafe-message-end.ts"), extCode);
+			const loaded = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, tempDir, sessionManager, modelRegistry);
+
+			const result = await runner.emitMessageEnd({
+				type: "message_end",
+				message: fauxAssistantMessage("base"),
+			});
+
+			expect(result?.redo).toBeUndefined();
+			expect(result?.message?.role === "assistant" ? result.message.stopReason : undefined).toBe("error");
 		});
 	});
 

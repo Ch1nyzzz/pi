@@ -37,6 +37,8 @@ describe("docker component sandbox", () => {
 			]),
 		);
 		expect(launch.args).toContain(`${artifact.directory}:/component:ro`);
+		expect(launch.dockerContainerName).toMatch(/^pi-evo-[0-9]+-[a-f0-9]{32}$/);
+		expect(launch.args.slice(0, 5)).toEqual(["run", "--rm", "--name", launch.dockerContainerName, "--interactive"]);
 		expect(launch.args.at(-2)).toBe("node");
 		expect(launch.args.at(-1)).toBe("/component/component.mjs");
 	});

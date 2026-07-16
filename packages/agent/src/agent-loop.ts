@@ -22,6 +22,12 @@ import type {
 	StreamFn,
 } from "./types.ts";
 
+const MAX_ASSISTANT_REDOS_PER_TURN = 1;
+
+function isAborted(signal: AbortSignal | undefined): boolean {
+	return signal?.aborted === true;
+}
+
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
 /**
@@ -189,8 +195,35 @@ async function runLoop(
 				pendingMessages = [];
 			}
 
-			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+			// Stream assistant response. A host may discard one finalized draft and
+			// retry in-place before tools or message queues observe the turn result.
+			let message: AssistantMessage;
+			let redoCount = 0;
+			while (true) {
+				message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+				if (
+					message.stopReason === "error" ||
+					message.stopReason === "aborted" ||
+					isAborted(signal) ||
+					redoCount >= MAX_ASSISTANT_REDOS_PER_TURN ||
+					!config.shouldRedoAssistantResponse
+				) {
+					break;
+				}
+				const shouldRedo = await config.shouldRedoAssistantResponse({
+					message,
+					context: currentContext,
+					redoCount,
+				});
+				if (isAborted(signal) || !shouldRedo) break;
+
+				if (currentContext.messages[currentContext.messages.length - 1] !== message) {
+					throw new Error("Cannot redo assistant response: finalized message is not last in context");
+				}
+				currentContext.messages.pop();
+				redoCount++;
+				await emit({ type: "message_redo", message });
+			}
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -229,19 +262,23 @@ async function runLoop(
 				context: currentContext,
 				newMessages,
 			};
-			const nextTurnSnapshot = await config.prepareNextTurn?.(nextTurnContext);
-			if (nextTurnSnapshot) {
-				currentContext = nextTurnSnapshot.context ?? currentContext;
+			const nextTurnResult = await config.prepareNextTurn?.(nextTurnContext);
+			if (nextTurnResult) {
+				currentContext = nextTurnResult.context ?? currentContext;
 				config = {
 					...config,
-					model: nextTurnSnapshot.model ?? config.model,
+					model: nextTurnResult.model ?? config.model,
 					reasoning:
-						nextTurnSnapshot.thinkingLevel === undefined
+						nextTurnResult.thinkingLevel === undefined
 							? config.reasoning
-							: nextTurnSnapshot.thinkingLevel === "off"
+							: nextTurnResult.thinkingLevel === "off"
 								? undefined
-								: nextTurnSnapshot.thinkingLevel,
+								: nextTurnResult.thinkingLevel,
 				};
+			}
+			if (nextTurnResult?.stop) {
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
 			}
 
 			if (
@@ -617,7 +654,7 @@ async function prepareToolCall(
 
 	try {
 		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
-		const validatedArgs = validateToolArguments(tool, preparedToolCall);
+		let validatedArgs = validateToolArguments(tool, preparedToolCall);
 		if (config.beforeToolCall) {
 			const beforeResult = await config.beforeToolCall(
 				{
@@ -642,6 +679,10 @@ async function prepareToolCall(
 					isError: true,
 				};
 			}
+			validatedArgs = validateToolArguments(tool, {
+				...preparedToolCall,
+				arguments: validatedArgs as Record<string, unknown>,
+			});
 		}
 		if (signal?.aborted) {
 			return {

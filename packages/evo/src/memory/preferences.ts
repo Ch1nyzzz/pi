@@ -9,11 +9,20 @@ const MAX_PREFERENCES = 100;
 const MAX_INSTRUCTION_CHARACTERS = 2_000;
 const MAX_TOTAL_INSTRUCTION_CHARACTERS = 16_000;
 
-export interface DurablePreferenceSource {
+export interface SessionPreferenceSource {
 	sessionId: string;
 	sequence: number;
 	quote: string;
 }
+
+export interface PackPreferenceSource {
+	packName: string;
+	packVersion: string;
+	integrity: string;
+	file: string;
+}
+
+export type DurablePreferenceSource = SessionPreferenceSource | PackPreferenceSource;
 
 export interface DurablePreference {
 	id: string;
@@ -64,29 +73,11 @@ export function parsePreferenceMemory(value: unknown): PreferenceMemory {
 		if (typeof entry.addedAt !== "string" || !Number.isFinite(Date.parse(entry.addedAt))) {
 			throw new Error(`${label}.addedAt is invalid`);
 		}
-		const source = asRecord(entry.source, `${label}.source`);
-		exactKeys(source, ["sessionId", "sequence", "quote"], `${label}.source`);
-		if (typeof source.sessionId !== "string" || !SESSION_ID_PATTERN.test(source.sessionId)) {
-			throw new Error(`${label}.source.sessionId is invalid`);
-		}
-		if (!Number.isSafeInteger(source.sequence) || (source.sequence as number) <= 0) {
-			throw new Error(`${label}.source.sequence must be a positive integer`);
-		}
-		if (
-			typeof source.quote !== "string" ||
-			!source.quote.includes(entry.instruction) ||
-			source.quote.length > 16_000
-		) {
-			throw new Error(`${label}.source.quote must contain the exact instruction`);
-		}
+		const source = parsePreferenceSource(entry.source, entry.instruction, `${label}.source`);
 		return {
 			id: entry.id,
 			instruction: entry.instruction,
-			source: {
-				sessionId: source.sessionId,
-				sequence: source.sequence as number,
-				quote: source.quote,
-			},
+			source,
 			addedAt: entry.addedAt,
 		};
 	});
@@ -100,6 +91,52 @@ export function parsePreferenceMemory(value: unknown): PreferenceMemory {
 		throw new Error(`${PREFERENCES_PATH} active instructions exceed ${MAX_TOTAL_INSTRUCTION_CHARACTERS} characters`);
 	}
 	return { schemaVersion: 1, preferences };
+}
+
+function parsePreferenceSource(value: unknown, instruction: string, label: string): DurablePreferenceSource {
+	const source = asRecord(value, label);
+	if ("sessionId" in source) {
+		exactKeys(source, ["sessionId", "sequence", "quote"], label);
+		if (typeof source.sessionId !== "string" || !SESSION_ID_PATTERN.test(source.sessionId)) {
+			throw new Error(`${label}.sessionId is invalid`);
+		}
+		if (!Number.isSafeInteger(source.sequence) || (source.sequence as number) <= 0) {
+			throw new Error(`${label}.sequence must be a positive integer`);
+		}
+		if (typeof source.quote !== "string" || !source.quote.includes(instruction) || source.quote.length > 16_000) {
+			throw new Error(`${label}.quote must contain the exact instruction`);
+		}
+		return {
+			sessionId: source.sessionId,
+			sequence: source.sequence as number,
+			quote: source.quote,
+		};
+	}
+	exactKeys(source, ["packName", "packVersion", "integrity", "file"], label);
+	if (typeof source.packName !== "string" || !/^[a-z0-9][a-z0-9._-]{0,127}$/.test(source.packName)) {
+		throw new Error(`${label}.packName is invalid`);
+	}
+	if (typeof source.packVersion !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/.test(source.packVersion)) {
+		throw new Error(`${label}.packVersion is invalid`);
+	}
+	if (typeof source.integrity !== "string" || !/^sha256:[0-9a-f]{64}$/.test(source.integrity)) {
+		throw new Error(`${label}.integrity is invalid`);
+	}
+	if (
+		typeof source.file !== "string" ||
+		!source.file ||
+		source.file.startsWith("/") ||
+		source.file.startsWith("\\") ||
+		source.file.split(/[/\\]/).includes("..")
+	) {
+		throw new Error(`${label}.file is invalid`);
+	}
+	return {
+		packName: source.packName,
+		packVersion: source.packVersion,
+		integrity: source.integrity,
+		file: source.file,
+	};
 }
 
 export async function readBundlePreferenceMemory(bundle: CompiledBundle): Promise<PreferenceMemory> {

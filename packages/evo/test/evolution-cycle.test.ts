@@ -321,8 +321,6 @@ lines.on("line", line => {
 		const runner = new FakeRunner([
 			{ submission: JSON.parse(componentPlan) },
 			{ submission: JSON.parse(componentBuilder) },
-			"Baseline first action",
-			"Candidate first action",
 			{
 				submission: {
 					verdict: "verified",
@@ -354,10 +352,12 @@ lines.on("line", line => {
 		expect(result.run.status).toBe("awaiting-canary-approval");
 		expect(result.proposals[0]).toMatchObject({
 			kind: "data",
-			tier: "T2",
+			tier: "T1",
 			targetAbi: "compaction/v1",
 			status: "pending",
 		});
+		expect(result.proposals[0].artifacts.replay).toBeUndefined();
+		expect(runner.requests).toHaveLength(4);
 		expect(await f.service.registry.readTrial()).toBeUndefined();
 		const componentStrategy = JSON.parse(componentPlan).experiment.evidenceStrategy;
 		expect(

@@ -1,152 +1,140 @@
 # Evo-Pi Sharing System — Implementation Plan & Status
 
-Living status + plan for the shareable optimization-pack system and the host ABI
-set. Design is frozen in `docs/optimization-packs.md` (the pack envelope) and
-`docs/host-abis.md` (the 8 ABIs + capability broker). This document tracks what
-is built, what is in progress, and what remains.
+Implementation status for the shareable optimization-pack system and host ABI
+set. The contracts are defined in `docs/optimization-packs.md` and
+`docs/host-abis.md`.
 
 ## Status at a glance
 
 | Stage | What | State |
 |---|---|---|
-| S0 | Design frozen (pack.json v1 + 8-ABI blueprint) | ✅ done |
-| S1 | Data packs — import skills/prompts (Milestone A) | ✅ done |
-| S2 | Empty-ceiling ABIs on today's runtime | 🔨 in progress (context/v1 defined; wiring next) |
-| S3 | Capability broker + `infer` | ⬜ not started |
-| S4 | Thinking components (memory, tools, workflows) | ⬜ not started |
-| S5 | Discovery / registry | ⬜ not started |
+| S0 | Design frozen (`pack.json` v1 + 8 host ABIs) | implemented |
+| S1 | Data and code pack import/export | implemented |
+| S2 | Turn-loop ABI definitions and runtime wiring | implemented |
+| S3 | Capability broker, `infer`, and `spawn-agent` | implemented |
+| S4 | Memory, tools, workflows, and unknown-ABI Builder | implemented |
+| S5 | Signed discovery registry and install flow | implemented |
 
-Implementation commits so far: `354084f0b` (blueprint) → `e7109d564` (pack
-parser) → `fd7a767c5` (pack data mapping) → `07ecda36a` (Milestone A) →
-`42552cc35` (context/v1 ABI). 27 tests passing across pack + context-abi suites.
+The implementation plan is complete. Verification is performed through the
+repository checks and focused suites; this document does not track transient
+test counts.
 
----
+## Implemented stages
 
-## Completed
+### S0 — Design frozen (#8, #9, #10)
 
-### S0 — Design frozen (`354084f0b`)
-- `pack.json v1` envelope: contents `prompts/skills/memory/components/workflows`,
-  `requiresAbis`, `requiresCapabilities`, content-addressed `integrity`.
-- 8-ABI blueprint in `host-abis.md`: `tool`, `instructions`, `context`, `guard`,
-  `generation`, `control`, `memory`, `workflow` (imperative). Capability broker +
-  `infer`/`spawn-agent` authorization model. Staged landing roadmap.
-- Tasks #8, #9, #10.
+- `pack.json` v1 defines prompts, skills, structured memory, components, and
+  workflows in one content-addressed envelope.
+- The standard sockets are `tool/v1`, `instructions/v1`, `context/v1`,
+  `guard/v1`, `generation/v1`, `control/v1`, `memory/v1`, and `workflow/v1`.
+- Sandboxed components receive no ambient filesystem, network, credentials, or
+  subagents. All authority is explicit and host-brokered.
 
-### S1 — Data packs, Milestone A (`e7109d564`, `fd7a767c5`, `07ecda36a`)
-- `packages/evo/src/pack/pack.ts` — `parseEvoPackManifest` (fail-closed, path-safe)
-  + content-addressed `computeEvoPackIntegrity`/`verifyEvoPackIntegrity` +
-  `loadEvoPack`.
-- `packages/evo/src/pack/import.ts` — `buildPackDataChanges` (skills → `skills/
-  <name>/SKILL.md`, prompts → `prompts/<name>.md`) + `importPackData` (verify
-  integrity → stage a reversible data proposal against stable bundle via the
-  existing proposal/trial/rollback pipeline).
-- **Milestone A proven end-to-end**: seed bundle → import a pack with a skill +
-  prompt → data proposal staged → candidate bundle actually contains the imported
-  assets; tampered pack rejected on integrity mismatch.
-- Key finding: skills/prompts auto-load from the bundle `skills/`/`prompts/`
-  directories, so import needs no policy edit and adds zero new security surface.
-- Tasks #11, #12, #13.
+### S1 — Optimization-pack exchange (#11, #12, #13)
 
-### S2 (part) — `context/v1` ABI defined (`42552cc35`)
-- `packages/evo/src/components/registry.ts` — `CONTEXT_V1_ABI` registered
-  alongside (unchanged) `compaction/v1`. Two modes:
-  - `transform` — ephemeral view rewrite `{messages,…}` → `{messages}`.
-  - `checkpoint` — durable summary, byte-compatible with `compaction/v1`.
-- Empty capability ceiling. 10 tests; compaction untouched (backward compatible).
-- Task #14 (definition portion).
+- Pack parsing is fail-closed: strict manifests, safe relative paths, regular
+  files only, symlink rejection, and canonical sha256 integrity.
+- Import copies referenced content into a private re-verified snapshot and
+  preflights every data/code part before target artifacts or proposals exist.
+- Import stages prompts, skills, and schema-aware memory merges through the
+  reversible proposal/trial pipeline.
+- Registered components and workflows use the same code-import path. Their
+  exact capability grants are previewed before staging and persisted with the
+  candidate selection.
+- Unregistered ABIs are routed to the Builder as T2 host-wiring proposals.
+- `evo-pi import <directory>` and `evo-pi export <directory> [name] [version]`
+  expose the exchange flow without implicit activation.
+- Milestone A is implemented: a prompt-and-skill pack reaches a candidate
+  bundle and remains reversible.
 
----
+### S2 — Turn-loop ABIs and Milestone B (#14–#19)
 
-## In progress
+- The default registry contains the eight standard ABI definitions while
+  retaining `compaction/v1` as a compatibility contract.
+- `context/v1` supports per-turn `transform` and durable `checkpoint` modes.
+  Legacy compaction continues to take precedence when both paths are selected.
+- `context/v1` output is closed to the seven v1 host message roles. Components
+  must map or filter extension-only roles; supporting new roles requires a new
+  ABI version.
+- `guard/v1` is session-lived across before/after tool hooks; rewritten
+  arguments are revalidated against the host tool schema.
+- `instructions/v1` transforms the built system prompt.
+- `generation/v1` can replace final assistant content and `stopReason` while
+  preserving host-owned message metadata, or request one bounded redo without
+  duplicating the visible or persisted response.
+- `control/v1` applies between-turn stop, model, and reasoning decisions.
+- Milestone B is implemented: a shared `context/v1` component can be imported,
+  activated as a Canary trial, and rolled back.
 
-### S2 #14 (rest) — wire `context/v1 transform` into the runtime
-- **Goal:** at the runtime context point (each LLM call), invoke a selected
-  `context/v1` transform component and use its returned messages.
-- **Approach (low-risk):** read the existing `compaction` wiring in
-  `packages/evo/src/bundle/runtime.ts` as the template (select from
-  `policy.components`, spawn `EvoComponentProcess`, `invoke`, validate output).
-  Add the `context` surface *alongside* it without touching the working
-  compaction path.
-- **Acceptance:** a `context/v1` transform component selected in a bundle rewrites
-  the message view for a turn; compaction still works unchanged.
+### S3 — Capability broker (#20, #21, #22)
 
----
+- Component RPC is bidirectional: a component can issue a nested
+  `capability-request` during `invoke`, and the host returns a correlated
+  `capability-result`.
+- The broker enforces declared ABI ceilings and exact per-artifact grants.
+  Deterministic authority IDs isolate concurrently pinned exact grant sets.
+  `infer` and `spawn-agent` additionally reserve and account for call, model,
+  token, output, cost, and tool budgets, charging conservative reservations on
+  failures without exact usage.
+- Grant changes, requests, denials, reservations, results, and usage are
+  append-only audited through a crash-recoverable outbox; orphaned in-flight
+  reservations are reconciled and conservatively charged.
+- Host services cover `read-file`, `write-file`, `list-dir`, `exec`,
+  `http-fetch`, `retrieve`, `memory-read`, `memory-write`, `infer`, and
+  `spawn-agent`.
+- Component JSONL frames and lifetime output are bounded; failed native or
+  Docker components are hard-terminated, and `exec` descendants use bounded
+  process-group teardown.
+- `spawn-agent` runs a real isolated Agent with a fixed host prompt, trusted
+  tool allowlist, explicit model route, bounded turns/output, and abort-aware
+  authentication.
 
-## Remaining
+### S4 — Thinking components (#23–#28)
 
-### S2 — rest of the empty-ceiling ABIs (no broker needed)
-Each reuses the compaction/context wiring pattern; all have an empty ceiling.
+- `memory/v1` implements `recall`, `encode`, and `consolidate` against a
+  host-owned, namespace-isolated store.
+- Memory state follows bundle lifecycle under one shared lock: trial creation,
+  idempotent promotion, ancestor checkpoints, rollback across lineage changes,
+  removal when the target omits an artifact, legacy audit-verified backfill,
+  and same-digest reactivation. A durable transaction outbox keeps namespace
+  pointers and lifecycle audit entries consistent across crashes.
+- `tool/v1` exposes sandboxed tools through the session tool surface.
+- `workflow/v1` exposes trigger-based orchestration through the bounded
+  `spawn-agent` service.
+- `context/v1` supports `retrieve`/`infer`; `control/v1` supports guarded
+  `memoryDeltas`; `generation/v1` supports the bounded critique/redo seam.
+- Unknown ABIs trigger an auto-authored T2 Builder proposal rather than
+  silently widening the host boundary.
 
-- **#15 `guard/v1`** — wire `beforeToolCall`/`afterToolCall`; **session-lived**
-  (state across calls for rate-limit/dedup); host re-validates patched args
-  against the tool schema. Acceptance: a guard blocks/rewrites a tool call and
-  post-processes its result.
-- **#16 `instructions/v1`** — wire `before_agent_start.systemPrompt` (bundle
-  splice exists). Input the pre-read prompt-build options; output text/sections.
-- **#17 `generation/v1`** — wire the existing `message_end.message` replacement.
-  Input the finalized assistant message; output `{message?, redo?}` (redo needs
-  `infer`, deferred to S4).
-- **#18 `control/v1`** (routing/stop) — wire `prepareNextTurn`/post-turn; output
-  `{stop?, model?, reasoning?}`; output contract forbids returning `messages`
-  (keeps it orthogonal to `context/v1`).
-- **#19 Milestone B** — a shared `context/v1` transform component: `evo-pi
-  import` → Canary trial activation → rollback. Proves the full import → sandbox
-  component → activate → revert loop on the real runtime. *Blocked by #14.*
+### S5 — Discovery and trusted install (#29)
 
-### S3 — Capability broker + `infer` (security centerpiece)
-- **#20** Bidirectional RPC frame: mid-`invoke`, a component emits a
-  `capability-request`; the host services + audits it and replies. Sandbox still
-  unshares net and grants no ambient fs/creds.
-- **#21** `infer` authorization/budget/audit model: off by default, granted at
-  approval; per-component budget (calls/tokens/cost), full prompt/response log,
-  optional model restriction. Design against `infer` first — the hardest case.
-- **#22** Derived capabilities on the broker: `read-file`/`write-file`/`list-dir`/
-  `exec`/`http-fetch`/`retrieve`/`memory-read`/`memory-write`/`spawn-agent`.
-  *Blocked by #20.*
+- A strict local discovery config lists registry sources and trusted Ed25519
+  signers.
+- Registry entries are signed and bind pack identity, version, source,
+  integrity, and signer provenance.
+- HTTPS, git-host raw URLs, and gist sources are normalized through a bounded
+  transport with a strict redirect policy plus timeout, file-count, and byte
+  limits.
+- Search reports trust and requirements; trusted inspection verifies the
+  manifest before install.
+- Install pins the inspected integrity through download and import, previews
+  exact grants, and only stages proposals. It never activates a pack.
+- `/evo search`, `/evo install`, `evo-pi search`, and `evo-pi install` expose
+  the discovery flow.
 
-### S4 — Thinking components (on the broker)
-- **#23 `memory/v1`** — full lifecycle `recall`/`encode`/`consolidate`; host owns
-  the store (namespace-isolated, trial/rollback), component owns policy;
-  capabilities `memory-read/write`, `retrieve`, `infer`. *Blocked by #20, #21.*
-- **#24 `tool/v1`** — full fs/exec/net/infer tool class (pure-compute tools can
-  precede the broker). *Blocked by #20, #21.*
-- **#25 `context/v1` RAG + abstractive checkpoint** — add `retrieve`/`infer`.
-- **#26 `control/v1` memory-writing** — add `memoryDeltas` + `write-memory`.
-- **#27 `workflow/v1`** — imperative multi-agent orchestration component;
-  `spawn-agent` capability. Highest ceiling, lands last. *Blocked by #22.*
-- **#28** Import of an unregistered ABI → evo's Builder auto-writes the ABI +
-  wiring as a T2 code proposal (agent writes, human approves, rebuild).
+## Acceptance invariants
 
-### S5 — Discovery
-- **#29** Lightweight registry (git/gist convention) + provenance/signing, once
-  packs are really moving between people.
-
----
-
-## Critical path
-
-```
-#8 pack.json v1  ──►  S1 data import (DONE)
-                 └─►  #14 context/v1 ──► #19 Milestone B
-#20 broker + #21 infer  ──►  S4 all thinking components (#23 #24 #25 #26)
-#22 spawn-agent  ──►  #27 workflow/v1
-```
-
-Two gating investments: `#8` (envelope, done) and `#20+#21` (broker + infer) —
-before the broker, components can only run heuristics; after it, they can think.
-
-## Deferred within completed stages
-
-- **Structured memory merge** in data packs: pack `memory/preferences.json` is
-  currently reported as `skippedMemory` (not written), because merging into
-  active preferences needs schema-aware logic. Follow-up in S1/S4.
-- **`evo-pi export`** and **CLI command wiring** (`evo-pi import <dir>`): the
-  library function `importPackData` exists and is tested; the user-facing CLI
-  command and `export` are not yet wired.
-- **`generation/v1` redo** and **`context/v1` abstractive/RAG**: need `infer`/
-  `retrieve`, deferred to S4.
+- Integrity and trust are verified before staging.
+- Capability grants never exceed the component declaration or ABI ceiling.
+- Sandboxed code receives authority only through the audited broker.
+- Data, component selection, capability grants, and memory state move together
+  through trial, keep, and rollback.
+- Imports and registry installs stage reviewable proposals and never activate
+  code implicitly.
+- Unknown host boundaries remain cold T2 changes requiring explicit review,
+  rebuild, and restart.
 
 ## References
-- `docs/optimization-packs.md` — pack.json v1 envelope + import flow.
-- `docs/host-abis.md` — the 8 ABIs, capability broker, landing roadmap.
-- Project todo (task tracker) — per-task status and dependencies.
+
+- `docs/optimization-packs.md` — pack v1 envelope, exchange, and discovery flow.
+- `docs/host-abis.md` — the eight ABIs and capability broker.

@@ -10,9 +10,10 @@
  * pure (no bundle mutation); import wiring lives elsewhere.
  */
 
-import { readdir, readFile, stat } from "node:fs/promises";
+import { lstat } from "node:fs/promises";
 import { join, sep } from "node:path";
 import { assertEvoAbiId, assertEvoCapability, assertEvoComponentId } from "../components/manifest.ts";
+import { readRegularDirectoryNoFollow, readRegularFileNoFollow, resolveRegularDirectory } from "../secure-file.ts";
 import { canonicalJson, sha256 } from "../storage.ts";
 
 export const EVO_PACK_FORMAT = 1;
@@ -90,6 +91,25 @@ function asString(value: unknown, label: string): string {
 	return value;
 }
 
+function exactKeys(record: Record<string, unknown>, allowed: readonly string[], label: string): void {
+	const allowedKeys = new Set(allowed);
+	for (const key of Object.keys(record)) {
+		if (!allowedKeys.has(key)) throw new Error(`${label} has unknown key: ${key}`);
+	}
+}
+
+function assertUnique(values: readonly string[], label: string): void {
+	if (new Set(values).size !== values.length) throw new Error(`${label} must not contain duplicates`);
+}
+
+function assertSameSet(actual: readonly string[], expected: readonly string[], label: string): void {
+	const sortedActual = [...actual].sort();
+	const sortedExpected = [...new Set(expected)].sort();
+	if (sortedActual.join("\n") !== sortedExpected.join("\n")) {
+		throw new Error(`${label} must exactly match declared code parts: expected [${sortedExpected.join(", ")}]`);
+	}
+}
+
 /**
  * A pack-relative path must be relative, forward-only, and contain no `..`
  * segment, absolute prefix, or NUL. This blocks path traversal out of the pack
@@ -98,12 +118,16 @@ function asString(value: unknown, label: string): string {
 function assertSafeRelPath(value: string, label: string): void {
 	if (typeof value !== "string" || !value) throw new Error(`${label} must be a non-empty path`);
 	if (value.includes("\0")) throw new Error(`${label} contains a NUL byte`);
-	if (value.startsWith("/") || value.startsWith("\\") || /^[A-Za-z]:/.test(value)) {
+	if (value.includes("\\")) throw new Error(`${label} must use forward slashes: ${value}`);
+	if (value.startsWith("/") || /^[A-Za-z]:/.test(value)) {
 		throw new Error(`${label} must be relative, got ${value}`);
 	}
-	const segments = value.split(/[/\\]/);
+	const segments = value.split("/");
 	for (const segment of segments) {
 		if (segment === "..") throw new Error(`${label} must not contain '..': ${value}`);
+		if (segment === "" || segment === ".") {
+			throw new Error(`${label} must be a canonical relative path: ${value}`);
+		}
 	}
 }
 
@@ -125,6 +149,21 @@ function assertCapabilities(value: unknown, label: string): string[] {
  */
 export function parseEvoPackManifest(raw: unknown): EvoPackManifest {
 	const record = asRecord(raw, "pack.json");
+	exactKeys(
+		record,
+		[
+			"packFormat",
+			"name",
+			"version",
+			"author",
+			"description",
+			"contents",
+			"requiresAbis",
+			"requiresCapabilities",
+			"integrity",
+		],
+		"pack.json",
+	);
 
 	if (record.packFormat !== EVO_PACK_FORMAT) {
 		throw new Error(`pack.json packFormat must be ${EVO_PACK_FORMAT}`);
@@ -147,9 +186,11 @@ export function parseEvoPackManifest(raw: unknown): EvoPackManifest {
 	}
 
 	const contentsRecord = asRecord(record.contents ?? {}, "pack.json contents");
+	exactKeys(contentsRecord, ["prompts", "skills", "memory", "components", "workflows"], "pack.json contents");
 
 	const prompts: EvoPackPrompt[] = asArray(contentsRecord.prompts, "contents.prompts").map((entry, i) => {
 		const p = asRecord(entry, `contents.prompts[${i}]`);
+		exactKeys(p, ["target", "file"], `contents.prompts[${i}]`);
 		if (p.target !== "system" && p.target !== "append-system") {
 			throw new Error(`contents.prompts[${i}].target must be 'system' or 'append-system'`);
 		}
@@ -160,6 +201,7 @@ export function parseEvoPackManifest(raw: unknown): EvoPackManifest {
 
 	const skills: EvoPackSkill[] = asArray(contentsRecord.skills, "contents.skills").map((entry, i) => {
 		const s = asRecord(entry, `contents.skills[${i}]`);
+		exactKeys(s, ["name", "dir"], `contents.skills[${i}]`);
 		const skillName = asString(s.name, `contents.skills[${i}].name`);
 		const dir = asString(s.dir, `contents.skills[${i}].dir`);
 		assertSafeRelPath(dir, `contents.skills[${i}].dir`);
@@ -168,6 +210,7 @@ export function parseEvoPackManifest(raw: unknown): EvoPackManifest {
 
 	const memory: EvoPackMemory[] = asArray(contentsRecord.memory, "contents.memory").map((entry, i) => {
 		const m = asRecord(entry, `contents.memory[${i}]`);
+		exactKeys(m, ["file"], `contents.memory[${i}]`);
 		const file = asString(m.file, `contents.memory[${i}].file`);
 		assertSafeRelPath(file, `contents.memory[${i}].file`);
 		return { file };
@@ -175,12 +218,16 @@ export function parseEvoPackManifest(raw: unknown): EvoPackManifest {
 
 	const components: EvoPackComponent[] = asArray(contentsRecord.components, "contents.components").map((entry, i) => {
 		const c = asRecord(entry, `contents.components[${i}]`);
+		exactKeys(c, ["surface", "abi", "id", "artifact", "capabilities"], `contents.components[${i}]`);
 		const id = asString(c.id, `contents.components[${i}].id`);
 		assertEvoComponentId(id, `contents.components[${i}].id`);
 		const abi = asString(c.abi, `contents.components[${i}].abi`);
 		assertEvoAbiId(abi, `contents.components[${i}].abi`);
 		const surface = asString(c.surface, `contents.components[${i}].surface`);
 		assertEvoComponentId(surface, `contents.components[${i}].surface`);
+		if (surface === "workflow") {
+			throw new Error(`contents.components[${i}].surface workflow must use contents.workflows`);
+		}
 		const artifact = asString(c.artifact, `contents.components[${i}].artifact`);
 		assertSafeRelPath(artifact, `contents.components[${i}].artifact`);
 		return {
@@ -194,6 +241,7 @@ export function parseEvoPackManifest(raw: unknown): EvoPackManifest {
 
 	const workflows: EvoPackWorkflow[] = asArray(contentsRecord.workflows, "contents.workflows").map((entry, i) => {
 		const w = asRecord(entry, `contents.workflows[${i}]`);
+		exactKeys(w, ["id", "trigger", "abi", "artifact", "capabilities"], `contents.workflows[${i}]`);
 		const id = asString(w.id, `contents.workflows[${i}].id`);
 		assertEvoComponentId(id, `contents.workflows[${i}].id`);
 		const trigger = asString(w.trigger, `contents.workflows[${i}].trigger`);
@@ -216,7 +264,63 @@ export function parseEvoPackManifest(raw: unknown): EvoPackManifest {
 		assertEvoAbiId(abi, `requiresAbis[${i}]`);
 		return abi;
 	});
+	assertUnique(requiresAbis, "pack.json requiresAbis");
 	const requiresCapabilities = assertCapabilities(record.requiresCapabilities, "pack.json requiresCapabilities");
+	assertUnique(
+		prompts.map((entry) => entry.file),
+		"contents.prompts file references",
+	);
+	assertUnique(
+		skills.map((entry) => entry.name),
+		"contents.skills names",
+	);
+	assertUnique(
+		skills.map((entry) => entry.dir),
+		"contents.skills directory references",
+	);
+	assertUnique(
+		memory.map((entry) => entry.file),
+		"contents.memory file references",
+	);
+	assertUnique(
+		components.filter((entry) => entry.surface !== "tool").map((entry) => entry.surface),
+		"contents.components singleton surfaces",
+	);
+	assertUnique(
+		components.map((entry) => entry.id),
+		"contents.components ids",
+	);
+	assertUnique(
+		components.map((entry) => entry.artifact),
+		"contents.components artifact references",
+	);
+	assertUnique(
+		workflows.map((entry) => entry.id),
+		"contents.workflows ids",
+	);
+	assertUnique(
+		workflows.map((entry) => entry.trigger),
+		"contents.workflows triggers",
+	);
+	assertUnique(
+		workflows.map((entry) => entry.artifact),
+		"contents.workflows artifact references",
+	);
+	const codeParts = [...components, ...workflows];
+	assertUnique(
+		codeParts.map((entry) => entry.id),
+		"pack code part ids",
+	);
+	assertSameSet(
+		requiresAbis,
+		codeParts.map((entry) => entry.abi),
+		"pack.json requiresAbis",
+	);
+	assertSameSet(
+		requiresCapabilities,
+		codeParts.flatMap((entry) => entry.capabilities),
+		"pack.json requiresCapabilities",
+	);
 
 	return {
 		packFormat: EVO_PACK_FORMAT,
@@ -245,9 +349,10 @@ function referencedPaths(manifest: EvoPackManifest): { files: string[]; dirs: st
 
 async function walkFiles(root: string, rel: string, out: string[]): Promise<void> {
 	const abs = join(root, rel);
-	const info = await stat(abs);
+	const info = await lstat(abs);
+	if (info.isSymbolicLink()) throw new Error(`pack path is a symlink: ${rel}`);
 	if (info.isDirectory()) {
-		const entries = await readdir(abs, { withFileTypes: true });
+		const entries = await readRegularDirectoryNoFollow(abs, `pack directory ${rel}`);
 		for (const entry of entries) {
 			if (entry.isSymbolicLink()) throw new Error(`pack path is a symlink: ${rel}/${entry.name}`);
 			await walkFiles(root, rel === "" ? entry.name : `${rel}/${entry.name}`, out);
@@ -265,15 +370,16 @@ async function walkFiles(root: string, rel: string, out: string[]): Promise<void
  * change to the manifest or any referenced byte changes the digest.
  */
 export async function computeEvoPackIntegrity(packDir: string, manifest: EvoPackManifest): Promise<string> {
+	const root = await resolveRegularDirectory(packDir, "pack directory");
 	const { files, dirs } = referencedPaths(manifest);
-	const collected: string[] = [...files];
-	for (const dir of dirs) await walkFiles(packDir, dir, collected);
+	const collected: string[] = [];
+	for (const file of files) await walkFiles(root, file, collected);
+	for (const dir of dirs) await walkFiles(root, dir, collected);
 
 	const digests: Record<string, string> = {};
 	for (const rel of collected) {
-		const normalized = rel.split(/[/\\]/).join("/");
-		if (digests[normalized] !== undefined) continue;
-		digests[normalized] = sha256(await readFile(join(packDir, rel.split("/").join(sep))));
+		if (digests[rel] !== undefined) continue;
+		digests[rel] = sha256(await readRegularFileNoFollow(join(root, rel.split("/").join(sep)), `pack file ${rel}`));
 	}
 
 	const { integrity: _omit, ...manifestWithoutIntegrity } = manifest;
@@ -308,8 +414,11 @@ export async function verifyEvoPackIntegrity(
 export async function loadEvoPack(
 	packDir: string,
 ): Promise<{ manifest: EvoPackManifest; integrity: EvoPackIntegrityResult }> {
-	const raw = JSON.parse(await readFile(join(packDir, "pack.json"), "utf8")) as unknown;
+	const root = await resolveRegularDirectory(packDir, "pack directory");
+	const raw = JSON.parse(
+		(await readRegularFileNoFollow(join(root, "pack.json"), "pack.json")).toString("utf8"),
+	) as unknown;
 	const manifest = parseEvoPackManifest(raw);
-	const integrity = await verifyEvoPackIntegrity(packDir, manifest);
+	const integrity = await verifyEvoPackIntegrity(root, manifest);
 	return { manifest, integrity };
 }

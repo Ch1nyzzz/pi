@@ -1,3 +1,5 @@
+import type { EvoCapabilityGrant } from "./components/capabilities/broker.ts";
+
 export const RECORDER_SCHEMA_VERSION = 1;
 
 export type ProposalKind = "data" | "code";
@@ -31,7 +33,7 @@ export interface BundleModelRouting {
 	critic?: string;
 }
 
-export type EvoComponentActivationBoundary = "turn" | "session" | "process";
+export type EvoComponentActivationBoundary = "turn" | "session" | "process" | "invocation";
 
 export interface EvoComponentManifest {
 	schemaVersion: 1;
@@ -50,6 +52,14 @@ export interface EvoComponentSelection {
 	abi: string;
 	artifactDigest: string;
 	config?: Record<string, unknown>;
+	/** Explicit, artifact-bound broker grants approved with this selection. */
+	grants?: EvoCapabilityGrant[];
+}
+
+export type EvoToolSelection = EvoComponentSelection;
+
+export interface EvoWorkflowSelection extends EvoComponentSelection {
+	trigger: string;
 }
 
 export type DeterministicCheck = "bundle-compile";
@@ -85,8 +95,12 @@ export interface BundlePolicy {
 	coreAssets?: string[];
 	limits?: BundlePolicyLimits;
 	modelRouting?: BundleModelRouting;
-	/** Surface id to a content-addressed implementation of a host-defined ABI. */
+	/** Singleton surface id to a content-addressed implementation of a host-defined ABI. */
 	components?: Record<string, EvoComponentSelection>;
+	/** Independently registered tool/v1 implementations. */
+	tools?: EvoToolSelection[];
+	/** Trigger-bound workflow/v1 implementations. */
+	workflows?: EvoWorkflowSelection[];
 	validation?: BundleValidationPolicy;
 	managedSources?: BundleManagedSource[];
 }

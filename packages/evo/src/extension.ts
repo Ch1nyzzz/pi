@@ -1,7 +1,7 @@
 import type { ExtensionFactory } from "@ch1nyzzz/pi-coding-agent";
 import { createEvoAutoImproveExtension } from "./auto-improve.ts";
 import { createEvoCodeFeatureExtension, type EvoCodeFeatureDefinition } from "./bundle/code-feature.ts";
-import { createPolicyRuntimeExtension } from "./bundle/runtime.ts";
+import { createPolicyRuntimeExtension, type EvoPolicyRuntimeOptions } from "./bundle/runtime.ts";
 import { createEvoCommandExtension, type EvoCommandExtensionOptions } from "./cli.ts";
 import { getEvoPaths } from "./paths.ts";
 import { createRecorderExtension } from "./recorder/extension.ts";
@@ -12,17 +12,23 @@ export interface EvoAutoImproveTuning {
 	checkIntervalMs?: number;
 }
 
-export type EvoExtensionOptions = EvoCommandExtensionOptions & {
-	codeFeatures?: readonly EvoCodeFeatureDefinition[];
-	autoImprove?: EvoAutoImproveTuning | false;
-};
+export type EvoExtensionOptions = EvoCommandExtensionOptions &
+	EvoPolicyRuntimeOptions & {
+		codeFeatures?: readonly EvoCodeFeatureDefinition[];
+		autoImprove?: EvoAutoImproveTuning | false;
+	};
 
 export function createEvoExtension(options: EvoExtensionOptions = {}): ExtensionFactory {
 	const paths = options.service?.paths ?? options.paths ?? getEvoPaths(options.root);
 	const service = options.service ?? new EvoService(paths);
-	const policyRuntime = createPolicyRuntimeExtension({ root: paths.root });
+	const policyRuntime = createPolicyRuntimeExtension({ ...options, root: paths.root });
 	const recorder = createRecorderExtension({ paths });
-	const commands = createEvoCommandExtension({ ...options, paths, service });
+	const commands = createEvoCommandExtension({
+		...options,
+		paths,
+		service,
+		spawnAgentToolNames: options.spawnAgentToolNames ?? options.spawnAgentTools?.map((tool) => tool.name),
+	});
 	const autoImprove =
 		options.autoImprove === false
 			? undefined

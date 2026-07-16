@@ -2,7 +2,18 @@ import { createInterface } from "node:readline/promises";
 import type { ExtensionCommandContext, ExtensionContext, ExtensionFactory } from "@ch1nyzzz/pi-coding-agent";
 import { loadCompiledBundle } from "./bundle/compile.ts";
 import { buildTrialComparison, renderTrialComparisonMarkdown, type TrialComparison } from "./comparison.ts";
+import type { EvoBudgetedCapabilityGrant, EvoCapabilityGrant } from "./components/capabilities/broker.ts";
+import { parseEvoCapabilityGrants } from "./components/capabilities/broker.ts";
 import { canUseEvoComponentSandbox } from "./components/process-runtime.ts";
+import type { EvoDiscoveredPack } from "./discovery/client.ts";
+import { getEvoPackDiscoveryConfigPath, readEvoPackDiscoveryConfig } from "./discovery/config.ts";
+import {
+	type EvoPackRegistryInspection,
+	type EvoPackRegistryInstallResult,
+	type EvoPackRegistrySearchResult,
+	EvoPackRegistryService,
+} from "./discovery/service.ts";
+import { type EvoDiscoveryFetch, EvoPackDiscoveryTransport } from "./discovery/transport.ts";
 import {
 	formatEvolutionRuns,
 	inspectBackgroundEvolutions,
@@ -12,12 +23,16 @@ import {
 	startBackgroundEvolution,
 } from "./evolve/background.ts";
 import { readEvolutionWorkflow, resetEvolutionWorkflow } from "./evolve/config.ts";
-import { runEvolutionCycle } from "./evolve/cycle.ts";
+import { runEvolutionCycle, runUnknownAbiBuilderCycle, type UnknownAbiBuilderCycleResult } from "./evolve/cycle.ts";
 import { EvolutionProcessInspector } from "./evolve/inspect-ui.ts";
 import { changesComponentSelection } from "./evolve/release.ts";
 import { retryEvolutionFromValidation } from "./evolve/retry.ts";
 import { listEvolutionRuns, readEvolutionRun, updateEvolutionRun } from "./evolve/run.ts";
+import type { UnknownAbiBuilderRequest } from "./evolve/unknown-abi.ts";
 import { readBundlePreferenceMemory } from "./memory/preferences.ts";
+import { exportEvoPack } from "./pack/export.ts";
+import { type EvoPackImportPreflight, type EvoPackImportResult, importEvoPack } from "./pack/import.ts";
+import { type EvoPackManifest, loadEvoPack } from "./pack/pack.ts";
 import { type EvoPaths, getEvoPaths } from "./paths.ts";
 import { proposalApproval } from "./proposal.ts";
 import { readEvaluationArtifact } from "./proposal-artifacts.ts";
@@ -46,6 +61,10 @@ import type { EvoStatus, Proposal, ProposalArtifactKind } from "./types.ts";
 const SUBCOMMANDS = [
 	"help",
 	"init",
+	"search",
+	"install",
+	"import",
+	"export",
 	"status",
 	"report",
 	"go",
@@ -77,12 +96,17 @@ const SUBCOMMANDS = [
 
 const QUICK_APPROVE_SHORTCUT = "ctrl+alt+e" as const;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const DISCOVERY_SEARCH_LIMIT = 50;
 const SCHEDULE_USAGE = "/evo schedule [daily | 3d | weekly | every <n>d | manual]";
 
 const EVO_HELP = `Usage: /evo <command>
 
   help                         Show this help
   init                         Initialize and migrate Pi data into a bundle
+  search [query]               Search configured optimization-pack registries
+  install <name> [version]     Verify a trusted registry pack and stage proposals
+  import <directory>           Verify a pack and stage proposals; never activate it
+  export <directory>           Export the active bundle as an optimization pack
   status                       Show registry and trial status
   report                       Generate a read-only evidence report
   go [request]                 Start a background research-plan/build/evaluate task
@@ -110,6 +134,7 @@ const EVO_HELP = `Usage: /evo <command>
   retrospect                   Run and show the active-trial retrospective`;
 
 const EVO_CLI_HELP = EVO_HELP.replaceAll("/evo", "evo-pi")
+	.replace("export <directory>", "export <directory> [name] [version]")
 	.replace("note <text>", "note <session-id> <text>")
 	.replace("request <text>", "request <session-id> <text>")
 	.replace("preference <text>", "preference <session-id> <text>")
@@ -122,6 +147,16 @@ interface EvoCommandDependencies {
 	cwd?: string;
 	agentDir?: string;
 	model?: string;
+	spawnAgentToolNames?: readonly string[];
+	getDiscoveryService(): Promise<EvoCommandDiscoveryService>;
+}
+
+export type EvoCommandDiscoveryService = Pick<EvoPackRegistryService, "search" | "inspect" | "install">;
+
+export interface EvoCommandDiscoveryOptions {
+	configPath?: string;
+	fetch?: EvoDiscoveryFetch;
+	service?: EvoCommandDiscoveryService;
 }
 
 export interface EvoCommandExtensionOptions {
@@ -132,6 +167,10 @@ export interface EvoCommandExtensionOptions {
 	cwd?: string;
 	agentDir?: string;
 	model?: string;
+	/** Exact trusted tool names available through the runtime spawn-agent host. */
+	spawnAgentToolNames?: readonly string[];
+	/** Local registry/trust config and injectable discovery dependencies. */
+	discovery?: EvoCommandDiscoveryOptions;
 }
 
 export interface EvoCliIO {
@@ -172,11 +211,24 @@ function requireValue(value: string, usage: string): string {
 	return value.trim();
 }
 
+function requireArgumentCount(args: string[], minimum: number, maximum: number, usage: string): void {
+	if (args.length < minimum || args.length > maximum) throw new Error(`Usage: ${usage}`);
+}
+
 function parseRetryArgs(value: string, usage: string): string {
 	const { first: id, rest } = splitFirst(value);
 	requireValue(id, usage);
 	if (rest && rest !== "--from validating") throw new Error(`Usage: ${usage}`);
 	return id;
+}
+
+function parsePackSelection(value: string, usage: string): { name: string; version?: string } {
+	const { first: name, rest } = splitFirst(value);
+	requireValue(name, usage);
+	if (!rest) return { name };
+	const { first: version, rest: extra } = splitFirst(rest);
+	if (!version || extra) throw new Error(`Usage: ${usage}`);
+	return { name, version };
 }
 
 function formatStatus(status: EvoStatus): string {
@@ -192,6 +244,276 @@ function formatStatus(status: EvoStatus): string {
 
 function formatProposalSummary(proposal: Proposal): string {
 	return `${proposal.id}  r${proposal.revision}  ${proposal.status}  ${proposal.tier}/${proposal.kind}  ${proposal.motivation}`;
+}
+
+function formatPackImportResult(
+	result: EvoPackImportResult,
+	unknownAbiResults: readonly UnknownAbiBuilderCycleResult[] = [],
+): string {
+	const proposalCount = (result.proposal ? 1 : 0) + result.importedComponents.length + unknownAbiResults.length;
+	const lines = [
+		`Pack: ${result.manifest.name}@${result.manifest.version}`,
+		`Integrity: ${result.manifest.integrity ?? "not declared"}`,
+		`Prompt/skill imports: ${result.addedPromptPaths.length} prompt(s), ${result.addedSkillPaths.length} skill(s)`,
+	];
+	if (result.proposal) {
+		lines.push(
+			`Data proposal: ${result.proposal.id} -> ${result.proposal.candidateDigest ?? "candidate unavailable"}`,
+		);
+	}
+	for (const component of result.importedComponents) {
+		lines.push(
+			`Component ${component.id} (${component.abi}): artifact ${component.artifactDigest}; proposal ${component.proposal.id} -> ${component.proposal.candidateDigest ?? "candidate unavailable"}`,
+		);
+	}
+	if (result.unregisteredAbis.length > 0) {
+		lines.push(`Unregistered ABIs: ${result.unregisteredAbis.join(", ")}`);
+	}
+	for (const built of unknownAbiResults) {
+		lines.push(
+			`ABI Builder ${built.request.targetAbi}: run ${built.run.id}; pending T2 proposal ${built.proposal.id}`,
+			`Next: ${built.nextAction}`,
+		);
+	}
+	if (result.pendingWorkflows > 0) lines.push(`Pending workflows: ${result.pendingWorkflows}`);
+	lines.push(`Activation: none; ${proposalCount} proposal(s) staged for review.`);
+	return lines.join("\n");
+}
+
+interface ActivePackExport {
+	bundleDigest: string;
+	targetDirectory: string;
+	manifest: EvoPackManifest;
+}
+
+interface PackCapabilityGrantPreview {
+	manifest: EvoPackManifest;
+	integrity: string;
+	grantsByComponent: Readonly<Record<string, readonly EvoCapabilityGrant[]>>;
+}
+
+const DEFAULT_CALL_CAPABILITY_MAX_CALLS = 100;
+
+function createBudgetedCapabilityGrant(
+	capability: EvoBudgetedCapabilityGrant["capability"],
+	model: string,
+	tools: readonly string[],
+): EvoBudgetedCapabilityGrant {
+	if (capability === "spawn-agent") {
+		return {
+			capability,
+			maxCalls: 8,
+			models: [model],
+			maxInputTokens: 131_072,
+			maxOutputTokens: 32_768,
+			maxTotalTokens: 163_840,
+			maxCostUsd: 10,
+			maxOutputTokensPerCall: 4_096,
+			tools: [...new Set(tools)].sort(),
+		};
+	}
+	return {
+		capability,
+		maxCalls: 16,
+		models: [model],
+		maxInputTokens: 65_536,
+		maxOutputTokens: 16_384,
+		maxTotalTokens: 81_920,
+		maxCostUsd: 5,
+		maxOutputTokensPerCall: 4_096,
+	};
+}
+
+async function previewPackCapabilityGrants(
+	packDirectory: string,
+	model: string | undefined,
+	tools: readonly string[],
+): Promise<PackCapabilityGrantPreview> {
+	const loaded = await loadEvoPack(packDirectory);
+	if (!loaded.integrity.ok) {
+		throw new Error(
+			`pack integrity check failed: expected ${loaded.integrity.expected ?? "(none declared)"}, got ${loaded.integrity.actual}`,
+		);
+	}
+	return createPackCapabilityGrantPreview(loaded.manifest, loaded.integrity.actual, model, tools);
+}
+
+function createPackCapabilityGrantPreview(
+	manifest: EvoPackManifest,
+	integrity: string,
+	model: string | undefined,
+	tools: readonly string[],
+): PackCapabilityGrantPreview {
+	const grantsByComponent: Record<string, readonly EvoCapabilityGrant[]> = {};
+	const codeParts = [...manifest.contents.components, ...manifest.contents.workflows];
+	for (const part of codeParts) {
+		if (part.capabilities.length === 0) continue;
+		const grants: unknown[] = [];
+		for (const capability of part.capabilities) {
+			if (capability === "infer" || capability === "spawn-agent") {
+				if (!model) {
+					throw new Error(
+						`Pack component ${part.id} requests ${capability}; select or configure an allowed provider/model before import`,
+					);
+				}
+				grants.push(createBudgetedCapabilityGrant(capability, model, tools));
+				continue;
+			}
+			grants.push({ capability, maxCalls: DEFAULT_CALL_CAPABILITY_MAX_CALLS });
+		}
+		grantsByComponent[part.id] = parseEvoCapabilityGrants(grants, `grants for ${part.id}`);
+	}
+	return {
+		manifest,
+		integrity,
+		grantsByComponent,
+	};
+}
+
+function formatPackCapabilityGrantPreview(preview: PackCapabilityGrantPreview): string {
+	return [
+		`Pack: ${preview.manifest.name}@${preview.manifest.version}`,
+		`Integrity: ${preview.integrity}`,
+		"Exact persisted grants:",
+		JSON.stringify(preview.grantsByComponent, undefined, 2),
+		"These grants remain inactive until the corresponding code proposal is approved and its trial starts.",
+	].join("\n");
+}
+
+function formatPackSource(source: EvoDiscoveredPack["entry"]["source"]): string {
+	if (source.kind === "https") return `https ${source.rawUrl}`;
+	if (source.kind === "git") {
+		return `git ${source.repository}@${source.revision}:${source.path} (${source.rawUrl})`;
+	}
+	return `gist ${source.gistId}@${source.revision}:${source.file} (${source.rawUrl})`;
+}
+
+function formatPackTrust(trust: EvoDiscoveredPack["trust"]): string {
+	if (trust.status === "trusted") return `trusted (${trust.signer})`;
+	if (trust.status === "untrusted-signer") return `untrusted signer (${trust.signer})`;
+	return "unsigned";
+}
+
+function formatPackRequirements(manifest: EvoPackManifest | undefined): string[] {
+	if (!manifest) return ["Required ABIs: unavailable (entry is not trusted)", "Required capabilities: unavailable"];
+	return [
+		`Required ABIs: ${manifest.requiresAbis.join(", ") || "none"}`,
+		`Required capabilities: ${manifest.requiresCapabilities.join(", ") || "none"}`,
+	];
+}
+
+function formatPackInspection(inspection: EvoPackRegistryInspection): string {
+	return [
+		`Pack: ${inspection.entry.name}@${inspection.entry.version}`,
+		`Trust: ${formatPackTrust(inspection.trust)}`,
+		`Registry: ${formatPackSource(inspection.registrySource)}`,
+		`Source: ${formatPackSource(inspection.packSource)}`,
+		`Integrity: ${inspection.entry.integrity}`,
+		...formatPackRequirements(inspection.manifest),
+	].join("\n");
+}
+
+function formatPackSearchResults(results: readonly EvoPackRegistrySearchResult[]): string {
+	if (results.length === 0) return "No optimization packs found";
+	const cards: string[] = [];
+	for (const result of results) {
+		cards.push(
+			[
+				`Pack: ${result.entry.name}@${result.entry.version}`,
+				`Trust: ${formatPackTrust(result.trust)}`,
+				`Registry: ${formatPackSource(result.registrySource)}`,
+				`Source: ${formatPackSource(result.entry.source)}`,
+				`Integrity: ${result.entry.integrity}`,
+				...formatPackRequirements(result.manifest),
+				...(result.entry.description ? [`Description: ${result.entry.description}`] : []),
+			].join("\n"),
+		);
+	}
+	return cards.join("\n\n");
+}
+
+function formatRegistryPackInstallResult(
+	result: EvoPackRegistryInstallResult,
+	unknownAbiResults: readonly UnknownAbiBuilderCycleResult[],
+): string {
+	return [
+		`Trust: ${formatPackTrust(result.trust)}`,
+		`Registry: ${formatPackSource(result.registrySource)}`,
+		`Source: ${formatPackSource(result.packSource)}`,
+		`Downloaded: ${result.fileCount} file(s), ${result.totalBytes} byte(s)`,
+		formatPackImportResult(result.imported, unknownAbiResults),
+	].join("\n");
+}
+
+async function requireActiveBundleDigest(dependencies: EvoCommandDependencies): Promise<string> {
+	const digest = await dependencies.service.registry.readStableDigest();
+	if (!digest) throw new Error("Evo-Pi is not initialized; run evo-pi init first");
+	return digest;
+}
+
+async function stagePackImport(
+	dependencies: EvoCommandDependencies,
+	packDirectory: string,
+	expectedIntegrity: string,
+	grantsByComponent?: Readonly<Record<string, readonly EvoCapabilityGrant[]>>,
+	parentDigest?: string,
+	beforeStage?: (preflight: EvoPackImportPreflight) => Promise<void>,
+): Promise<EvoPackImportResult> {
+	return importEvoPack({
+		paths: dependencies.paths,
+		parentDigest: parentDigest ?? (await requireActiveBundleDigest(dependencies)),
+		packDir: packDirectory,
+		expectedIntegrity,
+		...(grantsByComponent ? { grantsByComponent } : {}),
+		...(beforeStage ? { beforeStage } : {}),
+	});
+}
+
+async function stageUnknownPackAbis(
+	dependencies: EvoCommandDependencies,
+	parentDigest: string,
+	requests: readonly UnknownAbiBuilderRequest[],
+): Promise<UnknownAbiBuilderCycleResult[]> {
+	const built: UnknownAbiBuilderCycleResult[] = [];
+	for (const request of requests) {
+		built.push(
+			await runUnknownAbiBuilderCycle({
+				paths: dependencies.paths,
+				request,
+				runner: dependencies.runner,
+				service: dependencies.service,
+				parentDigest,
+				...(dependencies.cwd ? { cwd: dependencies.cwd } : {}),
+				...(dependencies.agentDir ? { agentDir: dependencies.agentDir } : {}),
+			}),
+		);
+	}
+	return built;
+}
+
+async function exportActiveBundle(
+	dependencies: EvoCommandDependencies,
+	targetDirectory: string,
+	name?: string,
+	version?: string,
+): Promise<ActivePackExport> {
+	const bundleDigest = await requireActiveBundleDigest(dependencies);
+	const manifest = await exportEvoPack({
+		paths: dependencies.paths,
+		bundleDigest,
+		targetDirectory,
+		name: name ?? `bundle-${bundleDigest.slice(0, 12)}`,
+		version: version ?? "0.0.0",
+	});
+	return { bundleDigest, targetDirectory, manifest };
+}
+
+function formatPackExportResult(result: ActivePackExport): string {
+	return [
+		`Exported active bundle ${result.bundleDigest} to ${result.targetDirectory}`,
+		`Pack: ${result.manifest.name}@${result.manifest.version}`,
+		`Integrity: ${result.manifest.integrity ?? "not declared"}`,
+	].join("\n");
 }
 
 async function formatActivePreferences(dependencies: EvoCommandDependencies): Promise<string> {
@@ -359,6 +681,8 @@ async function formatProposalCard(paths: EvoPaths, proposal: Proposal): Promise<
 
 function createDependencies(options: EvoCommandExtensionOptions): EvoCommandDependencies {
 	const paths = options.service?.paths ?? options.paths ?? getEvoPaths(options.root);
+	let discoveryService = options.discovery?.service;
+	const discoveryFetch: EvoDiscoveryFetch = options.discovery?.fetch ?? ((url, init) => globalThis.fetch(url, init));
 	return {
 		paths,
 		service: options.service ?? new EvoService(paths),
@@ -366,6 +690,19 @@ function createDependencies(options: EvoCommandExtensionOptions): EvoCommandDepe
 		cwd: options.cwd,
 		agentDir: options.agentDir,
 		model: options.model,
+		spawnAgentToolNames: options.spawnAgentToolNames,
+		getDiscoveryService: async () => {
+			if (discoveryService) return discoveryService;
+			const config = await readEvoPackDiscoveryConfig(
+				options.discovery?.configPath ?? getEvoPackDiscoveryConfigPath(paths),
+			);
+			discoveryService = new EvoPackRegistryService({
+				registrySources: config.registrySources,
+				trustedSigners: config.trustedSigners,
+				transport: new EvoPackDiscoveryTransport({ fetch: discoveryFetch }),
+			});
+			return discoveryService;
+		},
 	};
 }
 
@@ -666,6 +1003,109 @@ async function dispatchExtensionCommand(
 		case "init": {
 			const bundle = await dependencies.service.init(pi.getActiveTools());
 			ctx.ui.notify(`Evo-Pi initialized at ${bundle.digest}`, "info");
+			return;
+		}
+		case "search": {
+			const discovery = await dependencies.getDiscoveryService();
+			const results = await discovery.search({
+				...(rest ? { query: rest } : {}),
+				limit: DISCOVERY_SEARCH_LIMIT,
+				includeTrustedManifests: true,
+			});
+			sendCustomCard(pi, "evo.pack-search", formatPackSearchResults(results), {
+				query: rest,
+				count: results.length,
+			});
+			return;
+		}
+		case "install": {
+			const selection = parsePackSelection(rest, "/evo install <name> [version]");
+			const discovery = await dependencies.getDiscoveryService();
+			const inspection = await discovery.inspect(selection.name, selection.version);
+			const preview = createPackCapabilityGrantPreview(
+				inspection.manifest,
+				inspection.entry.integrity,
+				dependencies.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
+				dependencies.spawnAgentToolNames ?? [],
+			);
+			sendCustomCard(pi, "evo.pack-inspect", formatPackInspection(inspection), {
+				pack: inspection.entry.name,
+				version: inspection.entry.version,
+				integrity: inspection.entry.integrity,
+			});
+			const parentDigest = await requireActiveBundleDigest(dependencies);
+			if (
+				Object.keys(preview.grantsByComponent).length > 0 &&
+				!(await confirmExtensionMutation(
+					ctx,
+					"Approve executable pack capability budgets",
+					formatPackCapabilityGrantPreview(preview),
+				))
+			) {
+				ctx.ui.notify("Pack install cancelled before staging", "info");
+				return;
+			}
+			let unknownAbiResults: UnknownAbiBuilderCycleResult[] = [];
+			const result = await discovery.install({
+				name: inspection.entry.name,
+				version: inspection.entry.version,
+				expectedIntegrity: inspection.entry.integrity,
+				paths: dependencies.paths,
+				parentDigest,
+				grantsByComponent: preview.grantsByComponent,
+				beforeStage: async ({ preflight }) => {
+					unknownAbiResults = await stageUnknownPackAbis(dependencies, parentDigest, preflight.unknownAbiRequests);
+				},
+			});
+			sendCustomCard(pi, "evo.pack-install", formatRegistryPackInstallResult(result, unknownAbiResults), {
+				pack: result.imported.manifest.name,
+				version: result.imported.manifest.version,
+				integrity: result.imported.manifest.integrity,
+			});
+			return;
+		}
+		case "import": {
+			const packDirectory = requireValue(rest, "/evo import <directory>");
+			const parentDigest = await requireActiveBundleDigest(dependencies);
+			const preview = await previewPackCapabilityGrants(
+				packDirectory,
+				dependencies.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
+				dependencies.spawnAgentToolNames ?? [],
+			);
+			if (
+				Object.keys(preview.grantsByComponent).length > 0 &&
+				!(await confirmExtensionMutation(
+					ctx,
+					"Approve executable pack capability budgets",
+					formatPackCapabilityGrantPreview(preview),
+				))
+			) {
+				ctx.ui.notify("Pack import cancelled before staging", "info");
+				return;
+			}
+			let unknownAbiResults: UnknownAbiBuilderCycleResult[] = [];
+			const result = await stagePackImport(
+				dependencies,
+				packDirectory,
+				preview.integrity,
+				preview.grantsByComponent,
+				parentDigest,
+				async (preflight) => {
+					unknownAbiResults = await stageUnknownPackAbis(dependencies, parentDigest, preflight.unknownAbiRequests);
+				},
+			);
+			sendCustomCard(pi, "evo.pack-import", formatPackImportResult(result, unknownAbiResults), {
+				pack: result.manifest.name,
+				integrity: result.manifest.integrity,
+			});
+			return;
+		}
+		case "export": {
+			const result = await exportActiveBundle(dependencies, requireValue(rest, "/evo export <directory>"));
+			sendCustomCard(pi, "evo.pack-export", formatPackExportResult(result), {
+				bundleDigest: result.bundleDigest,
+				integrity: result.manifest.integrity,
+			});
 			return;
 		}
 		case "status":
@@ -1198,6 +1638,95 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 		case "init": {
 			const bundle = await dependencies.service.init();
 			io.write(`Initialized ${bundle.digest}`);
+			return;
+		}
+		case "search": {
+			const discovery = await dependencies.getDiscoveryService();
+			const results = await discovery.search({
+				...(rest ? { query: rest } : {}),
+				limit: DISCOVERY_SEARCH_LIMIT,
+				includeTrustedManifests: true,
+			});
+			io.write(formatPackSearchResults(results));
+			return;
+		}
+		case "install": {
+			requireArgumentCount(args, 2, 3, "evo-pi install <name> [version]");
+			const selection = parsePackSelection(args.slice(1).join(" "), "evo-pi install <name> [version]");
+			const discovery = await dependencies.getDiscoveryService();
+			const inspection = await discovery.inspect(selection.name, selection.version);
+			const preview = createPackCapabilityGrantPreview(
+				inspection.manifest,
+				inspection.entry.integrity,
+				dependencies.model,
+				dependencies.spawnAgentToolNames ?? [],
+			);
+			io.write(formatPackInspection(inspection));
+			const parentDigest = await requireActiveBundleDigest(dependencies);
+			if (Object.keys(preview.grantsByComponent).length > 0) {
+				io.write(formatPackCapabilityGrantPreview(preview));
+				if (!(await confirmLocalMutation(io, "Stage this pack with the exact capability grants shown above?"))) {
+					io.write("Pack install cancelled before staging");
+					return;
+				}
+			}
+			let unknownAbiResults: UnknownAbiBuilderCycleResult[] = [];
+			const result = await discovery.install({
+				name: inspection.entry.name,
+				version: inspection.entry.version,
+				expectedIntegrity: inspection.entry.integrity,
+				paths: dependencies.paths,
+				parentDigest,
+				grantsByComponent: preview.grantsByComponent,
+				beforeStage: async ({ preflight }) => {
+					unknownAbiResults = await stageUnknownPackAbis(dependencies, parentDigest, preflight.unknownAbiRequests);
+				},
+			});
+			io.write(formatRegistryPackInstallResult(result, unknownAbiResults));
+			return;
+		}
+		case "import": {
+			requireArgumentCount(args, 2, 2, "evo-pi import <directory>");
+			const packDirectory = requireValue(args[1] ?? "", "evo-pi import <directory>");
+			const parentDigest = await requireActiveBundleDigest(dependencies);
+			const preview = await previewPackCapabilityGrants(
+				packDirectory,
+				dependencies.model,
+				dependencies.spawnAgentToolNames ?? [],
+			);
+			if (Object.keys(preview.grantsByComponent).length > 0) {
+				io.write(formatPackCapabilityGrantPreview(preview));
+				if (!(await confirmLocalMutation(io, "Stage this pack with the exact capability grants shown above?"))) {
+					io.write("Pack import cancelled before staging");
+					return;
+				}
+			}
+			let unknownAbiResults: UnknownAbiBuilderCycleResult[] = [];
+			const result = await stagePackImport(
+				dependencies,
+				packDirectory,
+				preview.integrity,
+				preview.grantsByComponent,
+				parentDigest,
+				async (preflight) => {
+					unknownAbiResults = await stageUnknownPackAbis(dependencies, parentDigest, preflight.unknownAbiRequests);
+				},
+			);
+			io.write(formatPackImportResult(result, unknownAbiResults));
+			return;
+		}
+		case "export": {
+			requireArgumentCount(args, 2, 4, "evo-pi export <directory> [name] [version]");
+			io.write(
+				formatPackExportResult(
+					await exportActiveBundle(
+						dependencies,
+						requireValue(args[1] ?? "", "evo-pi export <directory> [name] [version]"),
+						args[2],
+						args[3],
+					),
+				),
+			);
 			return;
 		}
 		case "status":

@@ -1,8 +1,8 @@
 # Evo-Pi Host ABIs — the evolvable, shareable component interfaces
 
-Status: design blueprint. Companion to `docs/optimization-packs.md` (the sharing
-contract). This document defines the sockets; packs are how components move
-between people.
+Status: **implemented v1**. Companion to `docs/optimization-packs.md` (the
+sharing contract). This document defines the sockets; packs are how components
+move between people.
 
 ## What an ABI is, and how it relates to extensions
 
@@ -50,21 +50,30 @@ one layer above it, orchestrating multiple agents.
 | `context/v1` | the conversation view the model reads | `transform`: `{messages,…}` → `{messages}`; `checkpoint` (== today's compaction): `{conversation,…}` → `{summary,firstKeptEntryId,…}` | session | empty for prune/redact; `retrieve`/`infer` for RAG & abstractive summary |
 | `guard/v1` | the boundary every tool call crosses | `before{toolName,args}` → `{block?,args?}` (host re-validates); `after{result}` → `{content?,isError?,terminate?}` | **session** (state across calls) | empty |
 | `generation/v1` | the assistant message just produced | `{message}` → `{message?,redo?,stopReason?}` | turn | empty; `infer` for critique/redo |
-| `control/v1` | between-turn supervision | `{turnDigest,usage,model}` → `{stop?,model?,reasoning?}` | session | empty for routing/stop |
+| `control/v1` | between-turn supervision | `{turnIndex,message,toolResults,usage?,model?,reasoning?}` → `{stop?,model?,reasoning?,memoryDeltas?}` | session | empty for routing/stop; `memory-write` for deltas |
 | `memory/v1` | the persistent memory subsystem (episodic + semantic) | `recall{query}` → `{fragments}`; `encode{turnDigest}` → `{writes,updates,forgets}`; `consolidate{candidates}` → `{merged,insights,forget}` | session | `memory-read`/`memory-write`, `retrieve`, `infer` |
-| `workflow/v1` | **meta-layer**: imperative multi-agent orchestration (above the turn loop) | `run{trigger, args}` → orchestration result | invocation | `spawn-agent` (transitively `infer`/`tool`) |
+| `workflow/v1` | **meta-layer**: imperative multi-agent orchestration (above the turn loop) | `run{trigger, args}` → orchestration result | invocation | `spawn-agent` with bounded model/tools |
 
 `workflow/v1` is different in kind from the other seven: they replace a
 data-transform point *inside* one agent's turn loop; `workflow/v1` is an
 imperative script (`agent()`/`parallel()`/`pipeline()`) that orchestrates *many*
 agents from *above*. It is user-invoked by a `trigger` (e.g. `/deep-review`),
 runs sandboxed like any component, and reaches subagents only through the
-host-brokered `spawn-agent` capability — which itself consumes `infer` and the
-active tool set. It is the highest-ceiling, latest-to-land ABI.
+host-brokered `spawn-agent` capability. The host constrains the model, turns,
+output, and trusted tool allowlist. It is the highest-ceiling ABI and landed
+last.
 
 Notes:
 - **compaction** is `context/v1` in `checkpoint` mode — one policy on the
   history-view axis, byte-identical to today's `compaction/v1` contract.
+- **context roles are closed in v1:** transformed output may contain only
+  `user`, `assistant`, `toolResult`, `bashExecution`, `custom`,
+  `branchSummary`, and `compactionSummary`. A component must map or filter
+  extension-only roles; adding another pass-through role requires a new ABI
+  version.
+- **generation replacement is bounded:** a component may replace text/thinking
+  content and `stopReason`; the host preserves provider, model, usage, IDs,
+  diagnostics, errors, and timestamp. Generated tool calls are forbidden.
 - **procedural memory** (the agent's own instructions/skills) is *not* `memory/v1`;
   it is what evo already evolves into the bundle. `memory/v1` owns episodic
   (what happened) + semantic (facts/preferences) with a full write→recall→
@@ -76,13 +85,16 @@ Notes:
 
 ## The capability broker (the load-bearing infrastructure)
 
-Today `process-runtime.ts` is a strictly one-way host→component RPC
-(`initialize/invoke/health/shutdown`). Every capability above needs a **new
-bidirectional frame**: mid-`invoke`, the component emits a `capability-request`
-on stdout; the host services and audits it and replies with a `capability-result`.
-The sandbox still binds a read-only `/component` and unshares the network — the
-component never gets ambient fs/net/creds; the host performs and audits each
-brokered call.
+`process-runtime.ts` supports bidirectional RPC. Mid-`invoke`, a component can
+emit a correlated `capability-request`; the host authorizes, services, and
+audits it, then replies with a `capability-result`. The sandbox still binds a
+read-only `/component` and unshares the network — the component never gets
+ambient fs/net/creds; the host performs and audits each brokered call. JSONL
+frames and aggregate process output are byte-bounded, concurrent capability
+requests are capped, and protocol failure tears down the complete execution
+with bounded TERM→KILL escalation. Native and bwrap launches use process-group
+signals; Docker fallback uses a unique container identity plus daemon-side
+kill, wait, and forced removal.
 
 `infer` is the highest-value and hardest capability:
 
@@ -93,14 +105,25 @@ brokered call.
   "the network + my key"); components process untrusted data (conversation, tool
   output → prompt-injection surface), so a trusted-but-buggy component must not
   hold the key; the key never leaves the host and every call is audited.
-- **Authorization model (to design):** `infer` is *off by default*, granted
-  explicitly at approval time (like `exec`). When granted, the host enforces a
-  per-component budget (calls, tokens, cost), logs every prompt/response, and may
-  restrict which model the component may request. This audit/budget model is the
-  single most important safety design in the system.
+- **Authorization model:** `infer` and `spawn-agent` are off by default. Import
+  previews the exact requested grants before staging, and the selected artifact
+  is bound to those grants. A deterministic authority ID binds the artifact
+  digest to its exact canonical grant set, so concurrently pinned sessions
+  cannot overwrite one another's authority.
+- **Budget model:** the broker reserves and accounts for calls, input/output/
+  total tokens, cost, output per call, allowed models, and the `spawn-agent`
+  tool allowlist. Successful budgeted services must report usage within their
+  reservation; failures without exact usage are charged the full reservation.
+- **Audit model:** grant changes, requests, denials, reservations, results, and
+  usage are written to the append-only capability audit.
+
+The `exec` service accepts only configured absolute-command aliases and granted
+working roots, strips the ambient environment, bounds time and output, and
+terminates the full POSIX process group. It is unavailable where process-tree
+teardown cannot be guaranteed.
 
 Grant tiers, restating the trust spectrum:
-- **empty-ceiling component** → light approval (pure data, no new powers).
+- **empty-ceiling component** → light approval (pure compute, no new powers).
 - **brokered-capability component** → you explicitly grant each capability at
   approval; the host mediates and audits it.
 - **full trust** → write a normal extension instead (not sandboxed).
@@ -116,16 +139,17 @@ approves, rebuild).
 
 ## Landing roadmap
 
-Ordered by dependency, value, and risk. Every stage before the broker ships on
-today's runtime with **zero new security surface**.
+Implemented in dependency order. The pre-broker stages landed without granting
+sandboxed components ambient authority.
 
-**Stage 0 — freeze the design.** This doc + `optimization-packs.md`. (done)
+**Stage 0 — freeze the design (implemented).** This doc +
+`optimization-packs.md`.
 
-**Stage 1 — data packs.** `pack.json` + `evo-pi import/export` for
-prompts/skills/memory-data only. No components, no sandbox. Fastest path; the
-community starts moving immediately. ~days.
+**Stage 1 — data packs (implemented).** `pack.json` + `evo-pi import/export` for
+prompts/skills/memory-data only. No components, no sandbox. This established
+the first community exchange path.
 
-**Stage 2 — empty-ceiling ABIs (no broker needed).** Generalize + wire, each
+**Stage 2 — initial empty-ceiling ABIs (implemented).** Generalize + wire, each
 reusing the compaction wiring pattern (select in `policy.components` →
 `validateSelection` → spawn `EvoComponentProcess` → `invoke` at the hook →
 validate → apply):
@@ -135,33 +159,33 @@ validate → apply):
    add arg re-validation. Immediate safety win.
 3. `instructions/v1` — wire `before_agent_start.systemPrompt` (bundle-region
    splice already exists).
-4. `generation/v1` — wire the existing `message_end.message` replacement.
+4. `generation/v1` — safely replace `message_end` content and `stopReason`
+   while preserving host-owned message metadata.
 5. `control/v1` (routing/stop only) — wire `prepareNextTurn`/post-turn.
 
-**Stage 3 — the capability broker + `infer`.** Add the bidirectional RPC frame
-and design its authorization/budget/audit model against `infer` first; then
-`read-file`/`exec`/`retrieve`/`memory-*`/`spawn-agent` fall out cheaply. This is
-the security centerpiece — design before shipping any brokered ceiling.
+**Stage 3 — the capability broker + `infer` (implemented).** The bidirectional
+RPC frame, exact grants, reservation/accounting model, audit log, derived host
+services, and bounded `spawn-agent` host form the security boundary.
 
-**Stage 4 — thinking components (on the broker).**
+**Stage 4 — thinking components (implemented).**
 - `memory/v1` — full lifecycle (`memory-read/write`, `retrieve`, `infer`).
 - `tool/v1` — the fs/exec/net/infer tool class.
 - `context/v1` RAG (`retrieve`) and abstractive checkpoint (`infer`).
 - `control/v1` memory-writing variants (`memory-write`).
 - `workflow/v1` — imperative multi-agent orchestration (`spawn-agent`). Highest
-  ceiling; lands last because it depends on the broker plus `spawn-agent`.
+  ceiling; landed last because it depends on the broker plus `spawn-agent`.
 - Auto-authored ABIs: when a pack needs an unregistered ABI, evo's Builder writes
   the ABI + wiring as a T2 proposal (agent writes, human approves, rebuild).
 
-**Stage 5 — discovery.** Once packs really move between people: a lightweight
-registry (even a git/gist convention) + provenance/signing.
+**Stage 5 — discovery (implemented).** Strict registry configuration, signed
+entries, trusted inspection/install, git/gist/HTTPS provenance, bounded
+transport, and search/install commands.
 
 ## First runnable milestones
 
-- **Milestone A (Stage 1):** `evo-pi import ./pack` installs a prompt + skill into
-  the bundle and it shows up next session. Proves the pack envelope end-to-end
-  with zero sandbox risk.
-- **Milestone B (Stage 2.1):** a shared `context/v1` `transform` component (e.g. a
-  heuristic token-budget pruner) imported and activated via Canary. Proves the
-  full import → sandbox component → activate → rollback loop, reusing the
-  compaction runtime that already works.
+- **Milestone A (Stage 1, implemented):** `evo-pi import ./pack` stages a prompt
+  and skill; after approval, the candidate bundle supplies them next session.
+  This proves the pack envelope end-to-end with zero sandbox risk.
+- **Milestone B (Stage 2.1, implemented):** a shared `context/v1` `transform`
+  component is imported and activated via Canary. This proves the full import →
+  sandbox component → activate → rollback loop.

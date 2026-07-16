@@ -15,14 +15,15 @@ import type {
 	AgentContext,
 	AgentEvent,
 	AgentLoopConfig,
-	AgentLoopTurnUpdate,
 	AgentMessage,
 	AgentState,
 	AgentTool,
 	BeforeToolCallContext,
 	BeforeToolCallResult,
 	PrepareNextTurnContext,
+	PrepareNextTurnResult,
 	QueueMode,
+	ShouldRedoAssistantResponseContext,
 	StreamFn,
 	ToolExecutionMode,
 } from "./types.ts";
@@ -106,11 +107,11 @@ export interface AgentOptions {
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
 	prepareNextTurn?: (
 		signal?: AbortSignal,
-	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
+	) => Promise<PrepareNextTurnResult | undefined> | PrepareNextTurnResult | undefined;
 	prepareNextTurnWithContext?: (
 		context: PrepareNextTurnContext,
 		signal?: AbortSignal,
-	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
+	) => Promise<PrepareNextTurnResult | undefined> | PrepareNextTurnResult | undefined;
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;
 	sessionId?: string;
@@ -190,11 +191,15 @@ export class Agent {
 	) => Promise<AfterToolCallResult | undefined>;
 	public prepareNextTurn?: (
 		signal?: AbortSignal,
-	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
+	) => Promise<PrepareNextTurnResult | undefined> | PrepareNextTurnResult | undefined;
 	public prepareNextTurnWithContext?: (
 		context: PrepareNextTurnContext,
 		signal?: AbortSignal,
-	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
+	) => Promise<PrepareNextTurnResult | undefined> | PrepareNextTurnResult | undefined;
+	public shouldRedoAssistantResponse?: (
+		context: ShouldRedoAssistantResponseContext,
+		signal?: AbortSignal,
+	) => boolean | Promise<boolean>;
 	private activeRun?: ActiveRun;
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
@@ -452,6 +457,9 @@ export class Agent {
 							return await this.prepareNextTurn?.(this.signal);
 						}
 					: undefined,
+			shouldRedoAssistantResponse: this.shouldRedoAssistantResponse
+				? async (context) => (await this.shouldRedoAssistantResponse?.(context, this.signal)) === true
+				: undefined,
 			convertToLlm: this.convertToLlm,
 			transformContext: this.transformContext,
 			getApiKey: this.getApiKey,
@@ -538,6 +546,15 @@ export class Agent {
 				this._state.streamingMessage = undefined;
 				this._state.messages.push(event.message);
 				break;
+
+			case "message_redo": {
+				const messageIndex = this._state.messages.lastIndexOf(event.message);
+				if (messageIndex === -1) {
+					throw new Error("Cannot redo assistant response: message is not present in agent state");
+				}
+				this._state.messages.splice(messageIndex, 1);
+				break;
+			}
 
 			case "tool_execution_start": {
 				const pendingToolCalls = new Set(this._state.pendingToolCalls);

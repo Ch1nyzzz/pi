@@ -3,6 +3,8 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { loadCompiledBundle } from "../bundle/compile.ts";
 import { isDigest } from "../bundle/schema.ts";
+import { loadEvoComponentArtifact } from "../components/artifact.ts";
+import { EvoMemoryStore, usesEvoComponentMemory } from "../components/memory/store.ts";
 import { type EvoPaths, getEvoPaths } from "../paths.ts";
 import { saveProposalRevisionSnapshot, validateEvaluationArtifact } from "../proposal-artifacts.ts";
 import {
@@ -16,7 +18,7 @@ import {
 	truncateIncompleteFinalLine,
 	withFileLock,
 } from "../storage.ts";
-import type { EvoStatus, HistoryEntry, Proposal, ProposalStatus, TrialState } from "../types.ts";
+import type { CompiledBundle, EvoStatus, HistoryEntry, Proposal, ProposalStatus, TrialState } from "../types.ts";
 
 async function readTextIfExists(path: string): Promise<string | undefined> {
 	try {
@@ -53,6 +55,7 @@ export type RegistryTransitionStep =
 	| "proposal-written"
 	| "snapshot-written"
 	| "history-appended"
+	| "memory-rolled-back"
 	| "trial-cleared"
 	| "paused-cleared"
 	| "receipt-appended"
@@ -65,6 +68,12 @@ export interface BundleRegistryOptions {
 export interface RegistryOperationState {
 	digest: string;
 	latestOperationId?: string;
+}
+
+export interface RegistryMemoryLifecycleState {
+	stableDigest: string | undefined;
+	trial: TrialState | undefined;
+	verifiedBundleLineage: readonly string[];
 }
 
 type HistoryTemplate = Omit<HistoryEntry, "eventId" | "timestamp">;
@@ -268,6 +277,85 @@ function sameState(left: unknown, right: unknown): boolean {
 function transitionRequestKey(value: unknown): string {
 	return sha256(canonicalJson(value));
 }
+
+async function rollbackBundleMemory(
+	paths: EvoPaths,
+	sourceBundleDigest: string,
+	targetBundleDigest: string,
+): Promise<void> {
+	const lineage: CompiledBundle[] = [];
+	let digest = sourceBundleDigest;
+	const visited = new Set<string>();
+	while (!visited.has(digest)) {
+		visited.add(digest);
+		const bundle = await loadCompiledBundle(paths, digest);
+		lineage.push(bundle);
+		if (digest === targetBundleDigest) break;
+		if (!bundle.manifest.parentDigest) {
+			throw new Error(`Rollback target ${targetBundleDigest} is not in the source bundle lineage`);
+		}
+		digest = bundle.manifest.parentDigest;
+	}
+	if (lineage.at(-1)?.digest !== targetBundleDigest) {
+		throw new Error(`Rollback target ${targetBundleDigest} is not in the source bundle lineage`);
+	}
+	const targetIndex = lineage.length - 1;
+	const targetAncestorBundleDigests: string[] = [];
+	let ancestorDigest = lineage[targetIndex]?.manifest.parentDigest ?? null;
+	while (ancestorDigest) {
+		if (visited.has(ancestorDigest)) throw new Error("Rollback target ancestor lineage contains a cycle");
+		visited.add(ancestorDigest);
+		const ancestor = await loadCompiledBundle(paths, ancestorDigest);
+		targetAncestorBundleDigests.push(ancestor.digest);
+		ancestorDigest = ancestor.manifest.parentDigest;
+	}
+	const participants = new Map<string, { store: EvoMemoryStore; targetSelected: boolean }>();
+	for (const [index, bundle] of lineage.entries()) {
+		const selections = [
+			...Object.entries(bundle.policy.components ?? {}).map(([surface, selection]) => ({ surface, selection })),
+			...(bundle.policy.tools ?? []).map((selection) => ({ surface: "tool", selection })),
+			...(bundle.policy.workflows ?? []).map((selection) => ({ surface: "workflow", selection })),
+		];
+		for (const { surface, selection } of selections) {
+			const artifact = await loadEvoComponentArtifact(paths, selection.artifactDigest);
+			if (artifact.manifest.id !== selection.id || artifact.manifest.abi !== selection.abi) {
+				throw new Error(`Component selection identity changed before memory rollback: ${selection.id}`);
+			}
+			if (!usesEvoComponentMemory(surface, artifact.manifest.capabilities)) continue;
+			const existing = participants.get(artifact.manifest.artifactDigest);
+			if (existing) {
+				if (index === targetIndex) existing.targetSelected = true;
+				continue;
+			}
+			participants.set(artifact.manifest.artifactDigest, {
+				store: new EvoMemoryStore({
+					paths,
+					componentId: artifact.manifest.id,
+					artifactDigest: artifact.manifest.artifactDigest,
+				}),
+				targetSelected: index === targetIndex,
+			});
+		}
+	}
+	const rolledBackBundleDigests = lineage.slice(0, -1).map((bundle) => bundle.digest);
+	for (const participant of participants.values()) {
+		await participant.store.preflightBundleRollback({
+			rolledBackBundleDigests,
+			targetBundleDigest,
+			targetAncestorBundleDigests,
+			targetSelected: participant.targetSelected,
+		});
+	}
+	for (const participant of participants.values()) {
+		await participant.store.rollbackBundles({
+			rolledBackBundleDigests,
+			targetBundleDigest,
+			targetAncestorBundleDigests,
+			targetSelected: participant.targetSelected,
+		});
+	}
+}
+
 async function assertRequiredApprovalArtifact(
 	paths: EvoPaths,
 	proposal: Proposal,
@@ -319,6 +407,32 @@ export class BundleRegistry {
 		return withFileLock(this.paths, "registry", async () => {
 			await this.recoverPendingUnlocked();
 			return this.readTrialUnlocked();
+		});
+	}
+
+	async withMemoryLifecycle<T>(operation: (state: RegistryMemoryLifecycleState) => Promise<T>): Promise<T> {
+		return withFileLock(this.paths, "registry", async () => {
+			await this.recoverPendingUnlocked();
+			const stableDigest = await this.readStableDigestUnlocked();
+			const trial = await this.readTrialUnlocked();
+			const verifiedBundleLineage: string[] = [];
+			const visited = new Set<string>();
+			let digest = stableDigest;
+			while (digest) {
+				if (visited.has(digest)) throw new Error("Active bundle lineage contains a cycle");
+				visited.add(digest);
+				const bundle = await loadCompiledBundle(this.paths, digest);
+				verifiedBundleLineage.push(bundle.digest);
+				digest = bundle.manifest.parentDigest ?? undefined;
+			}
+			if (trial && (verifiedBundleLineage[0] !== trial.digest || verifiedBundleLineage[1] !== trial.parent)) {
+				throw new Error("Active trial does not match the verified bundle lineage");
+			}
+			return operation({
+				stableDigest,
+				trial,
+				verifiedBundleLineage,
+			});
 		});
 	}
 
@@ -551,6 +665,15 @@ export class BundleRegistry {
 			await this.assertRollbackTargetAllowed(transition.stableBefore, transition.stableAfter);
 		}
 		if (transition.stableAfter) await loadCompiledBundle(this.paths, transition.stableAfter);
+		if (
+			(transition.action === "rollback" || transition.action === "rollback-proposal") &&
+			transition.stableBefore &&
+			transition.stableAfter &&
+			transition.stableBefore !== transition.stableAfter
+		) {
+			await rollbackBundleMemory(this.paths, transition.stableBefore, transition.stableAfter);
+			await this.afterStep("memory-rolled-back", transition.action);
+		}
 		const [stable, trial, paused, proposal] = await Promise.all([
 			this.readStableDigestUnlocked(),
 			this.readTrialUnlocked(),

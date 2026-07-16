@@ -3,7 +3,7 @@ import { fauxAssistantMessage, fauxToolCall, type Model } from "@ch1nyzzz/pi-ai"
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import type { BuildSystemPromptOptions, ExtensionAPI } from "../../src/index.ts";
-import { createHarness, getAssistantTexts, type Harness } from "./harness.ts";
+import { createHarness, getAssistantTexts, getMessageText, type Harness } from "./harness.ts";
 
 describe("AgentSession model and extension characterization", () => {
 	const harnesses: Harness[] = [];
@@ -199,6 +199,155 @@ describe("AgentSession model and extension characterization", () => {
 		expect(
 			harness.session.messages.find((message) => message.role === "toolResult" && message.details?.patched === true),
 		).toBeDefined();
+	});
+
+	it("retries one assistant draft from message_end without persisting or emitting it", async () => {
+		const extensionMessageEnds: string[] = [];
+		const replacementContextRoles: string[][] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_end", async (event) => {
+						if (event.message.role !== "assistant") return undefined;
+						extensionMessageEnds.push(getMessageText(event.message));
+						return { redo: true };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("draft"),
+			(context) => {
+				replacementContextRoles.push(context.messages.map((message) => message.role));
+				return fauxAssistantMessage("final");
+			},
+		]);
+
+		await harness.session.prompt("redo once");
+
+		expect(extensionMessageEnds).toEqual(["draft", "final"]);
+		expect(replacementContextRoles).toEqual([["user"]]);
+		expect(getAssistantTexts(harness)).toEqual(["final"]);
+		expect(
+			harness.sessionManager
+				.getBranch()
+				.filter((entry) => entry.type === "message")
+				.map((entry) => entry.message)
+				.filter((message) => message.role === "assistant")
+				.map(getMessageText),
+		).toEqual(["final"]);
+		expect(harness.eventsOfType("message_start").filter((event) => event.message.role === "assistant")).toHaveLength(
+			1,
+		);
+		expect(harness.eventsOfType("message_end").filter((event) => event.message.role === "assistant")).toHaveLength(1);
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it("persists the finalized assistant response when redo is cancelled by abort", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_end", async (event, ctx) => {
+						if (event.message.role !== "assistant") return undefined;
+						ctx.abort();
+						return { redo: true };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("kept after abort")]);
+
+		await harness.session.prompt("do not redo after abort");
+
+		expect(getAssistantTexts(harness)).toEqual(["kept after abort"]);
+		expect(
+			harness.sessionManager
+				.getBranch()
+				.filter((entry) => entry.type === "message")
+				.map((entry) => entry.message)
+				.filter((message) => message.role === "assistant")
+				.map(getMessageText),
+		).toEqual(["kept after abort"]);
+		expect(harness.eventsOfType("message_end").filter((event) => event.message.role === "assistant")).toHaveLength(1);
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it("propagates extension tool_result terminate to the agent loop", async () => {
+		const echoTool: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo text back",
+			parameters: Type.Object({ text: Type.String() }),
+			execute: async () => ({
+				content: [{ type: "text", text: "done" }],
+				details: {},
+			}),
+		};
+		const harness = await createHarness({
+			tools: [echoTool],
+			extensionFactories: [
+				(pi) => {
+					pi.on("tool_result", async () => ({ terminate: true }));
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("echo", { text: "hello" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("unexpected second response"),
+		]);
+
+		await harness.session.prompt("hi");
+
+		expect(harness.getPendingResponseCount()).toBe(1);
+		const toolEnd = harness.eventsOfType("tool_execution_end")[0];
+		expect(toolEnd?.result.terminate).toBe(true);
+		expect(harness.session.messages.filter((message) => message.role === "assistant")).toHaveLength(1);
+	});
+
+	it("ORs prepare_next_turn stop results and prevents the next provider request", async () => {
+		const eventOrder: string[] = [];
+		const echoTool: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo text back",
+			parameters: Type.Object({ text: Type.String() }),
+			execute: async () => ({
+				content: [{ type: "text", text: "done" }],
+				details: {},
+			}),
+		};
+		const harness = await createHarness({
+			tools: [echoTool],
+			extensionFactories: [
+				(pi) => {
+					pi.on("turn_end", async (event) => {
+						eventOrder.push(`turn_end:${event.turnIndex}`);
+					});
+					pi.on("prepare_next_turn", async (event) => {
+						eventOrder.push(`prepare_false:${event.turnIndex}`);
+						return { stop: false };
+					});
+					pi.on("prepare_next_turn", async (event) => {
+						eventOrder.push(`prepare_true:${event.turnIndex}`);
+						return { stop: true };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("echo", { text: "hello" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("unexpected second response"),
+		]);
+
+		await harness.session.prompt("hi");
+
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(eventOrder).toEqual(["turn_end:0", "prepare_false:0", "prepare_true:0"]);
+		expect(harness.session.messages.filter((message) => message.role === "assistant")).toHaveLength(1);
 	});
 
 	it("allows extension context handlers to modify messages before the LLM call", async () => {

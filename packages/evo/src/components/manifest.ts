@@ -5,7 +5,7 @@ import type { EvoComponentActivationBoundary, EvoComponentManifest } from "../ty
 const COMPONENT_ID_PATTERN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 const ABI_ID_PATTERN = /^[a-z][a-z0-9-]*\/v[1-9][0-9]*$/;
 const CAPABILITY_PATTERN = /^[a-z][a-z0-9]*(?:[._:-][a-z0-9]+)*$/;
-const ACTIVATION_BOUNDARIES = new Set<EvoComponentActivationBoundary>(["turn", "session", "process"]);
+const ACTIVATION_BOUNDARIES = new Set<EvoComponentActivationBoundary>(["turn", "session", "process", "invocation"]);
 
 function asRecord(value: unknown, label: string): Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {

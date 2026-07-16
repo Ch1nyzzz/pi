@@ -2,6 +2,7 @@ import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { loadCompiledBundle } from "../bundle/compile.ts";
 import type { CodeValidationExecutor } from "../code/worktree.ts";
+import { createDefaultEvoAbiRegistry } from "../components/registry.ts";
 import {
 	applyInboxDecisions,
 	garbageCollectInbox,
@@ -23,8 +24,8 @@ import type { ModelRunner } from "../reflect/model-runner.ts";
 import { type CounterfactualReplayResult, runCounterfactualReplay } from "../reflect/replay.ts";
 import { EvoService } from "../service.ts";
 import { atomicWriteFile, atomicWriteJson, canonicalJson, sha256, withFileLock } from "../storage.ts";
-import type { EvoControlConfig, EvolutionRun, Proposal } from "../types.ts";
-import { runEvolutionBuilder } from "./builder.ts";
+import type { EvoControlConfig, EvolutionResearchPlan, EvolutionRun, Proposal } from "../types.ts";
+import { runEvolutionBuilder, runUnknownAbiBuilder } from "./builder.ts";
 import { readProfileReceipts, writeProfileReceipt } from "./check-profiles.ts";
 import { readEvoControlConfig } from "./config.ts";
 import { type EvolutionEvaluationResult, runEvolutionEvaluator } from "./evaluator.ts";
@@ -35,9 +36,14 @@ import {
 	RELEASE_ACTION_RUN_STATUS,
 } from "./release.ts";
 import { materializeEvidenceCorpus } from "./research-corpus.ts";
-import { runEvolutionResearchPlan } from "./research-plan.ts";
+import { persistEvolutionResearchPlan, runEvolutionResearchPlan } from "./research-plan.ts";
 import { validateComponentCandidate } from "./retry.ts";
 import { createEvolutionRun, evolutionRunDirectory, readEvolutionRun, updateEvolutionRun } from "./run.ts";
+import {
+	assertUnknownAbiCodePatch,
+	parseUnknownAbiBuilderRequest,
+	type UnknownAbiBuilderRequest,
+} from "./unknown-abi.ts";
 
 export interface RunEvolutionCycleOptions {
 	paths: EvoPaths;
@@ -64,6 +70,28 @@ export interface EvolutionCycleResult {
 	release?: EvolutionReleaseResult;
 }
 
+export interface RunUnknownAbiBuilderCycleOptions {
+	paths: EvoPaths;
+	request: unknown;
+	runner: ModelRunner;
+	service?: EvoService;
+	/** Stable bundle observed by pack import; drift fails before a run is created. */
+	parentDigest?: string;
+	cwd?: string;
+	agentDir?: string;
+	config?: EvoControlConfig;
+	codeValidationExecutor?: CodeValidationExecutor;
+	signal?: AbortSignal;
+}
+
+export interface UnknownAbiBuilderCycleResult {
+	run: EvolutionRun;
+	proposal: Proposal;
+	request: UnknownAbiBuilderRequest;
+	plan: EvolutionResearchPlan;
+	nextAction: string;
+}
+
 async function assertFrozenExperiment(paths: EvoPaths, run: EvolutionRun, experiment: unknown): Promise<void> {
 	if (run.experimentFile !== "experiment.json" || !run.experimentDigest) {
 		throw new Error(`Evolution task ${run.id} has no frozen experiment`);
@@ -74,6 +102,22 @@ async function assertFrozenExperiment(paths: EvoPaths, run: EvolutionRun, experi
 	const digest = sha256(canonicalJson(stored));
 	if (digest !== run.experimentDigest || canonicalJson(stored) !== canonicalJson(experiment)) {
 		throw new Error(`Evolution task ${run.id} frozen experiment changed`);
+	}
+}
+
+async function assertFrozenUnknownAbiRequest(
+	paths: EvoPaths,
+	run: EvolutionRun,
+	request: UnknownAbiBuilderRequest,
+): Promise<void> {
+	const stored = parseUnknownAbiBuilderRequest(
+		JSON.parse(
+			await readFile(join(evolutionRunDirectory(paths, run.id), "unknown-abi-request.json"), "utf8"),
+		) as unknown,
+	);
+	const digest = sha256(canonicalJson(stored));
+	if (digest !== run.evidenceDigest || canonicalJson(stored) !== canonicalJson(request)) {
+		throw new Error(`Evolution task ${run.id} frozen unknown ABI request changed`);
 	}
 }
 
@@ -306,6 +350,198 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 
 export async function runEvolutionCycle(options: RunEvolutionCycleOptions): Promise<EvolutionCycleResult> {
 	return withFileLock(options.paths, "evolution-cycle", () => runEvolutionCycleUnlocked(options), {
+		timeoutMs: 24 * 60 * 60_000,
+		staleAfterMs: 24 * 60 * 60_000,
+	});
+}
+
+function unknownAbiResearchPlan(request: UnknownAbiBuilderRequest, parentDigest: string): EvolutionResearchPlan {
+	const selections = request.parts.map((part) => {
+		const capabilities = part.manifest.capabilities.join(", ") || "(none)";
+		return `- ${part.selection.id}: artifact ${part.selection.artifactDigest}; capabilities ${capabilities}; explicit grants ${canonicalJson(part.selection.grants)}`;
+	});
+	const trialPlan =
+		"Do not activate a component in this run. Await explicit T2 code review; after approval, commit the staged patch, rebuild and restart the host, then retry the same integrity-pinned pack import to create the component-selection proposal.";
+	return {
+		topic: `Add host ABI ${request.targetAbi} for optimization pack ${request.source.name}`,
+		reason: `Pack ${request.source.name}@${request.source.version} declares ${request.targetAbi}, which is not registered in this host.`,
+		planMarkdown: [
+			`# Add unregistered ABI ${request.targetAbi}`,
+			"",
+			`Pack: ${request.source.name}@${request.source.version}`,
+			`Integrity: ${request.source.integrity}`,
+			`Surface: ${request.surface}`,
+			`Activation boundary: ${request.activationBoundary}`,
+			`Capability ceiling: ${request.capabilityCeiling.join(", ") || "(empty)"}`,
+			"",
+			"## Frozen future selections",
+			"",
+			...selections,
+			"",
+			"These selections are audit input only. This plan must not write policy or broker state. After the ABI patch is approved and the host is rebuilt, retry import to stage them through the registered-ABI path.",
+		].join("\n"),
+		experiment: {
+			baseline: `Stable bundle ${parentDigest}; ${request.targetAbi} absent from the default ABI registry.`,
+			hypothesis:
+				"A narrowly scoped ABI definition, strict validators, host wiring, and focused tests can safely expose the requested surface without widening component authority.",
+			checkProfiles: ["repo-check", "related-tests"],
+			evidenceStrategy: {
+				patchClass: "infrastructure",
+				offline: { mode: "required", profiles: ["repo-check", "related-tests"] },
+				historicalReplay: {
+					mode: "not-applicable",
+					reason: "A previously unavailable host ABI has no valid historical runtime baseline to replay.",
+				},
+				online: { mode: "none" },
+				rollout: "direct",
+			},
+			metrics: [],
+			minimumEffect: {},
+			trialPlan,
+			rollbackConditions: [
+				"Generated capability ceiling differs from the exact declared union.",
+				"Host wiring grants ambient authority or mutates broker state.",
+				"Repository check or focused tests fail.",
+			],
+		},
+		targetAbi: request.targetAbi,
+		requiresNewAbi: true,
+		candidateKind: "code",
+		builderInstructions:
+			"Define and register the exact EvoAbiDefinition, make strict config/input/output validators compatible with the pack's default empty config, wire only the declared host surface, and add focused tests. Do not activate or grant the future component selection.",
+		inboxDecisions: [],
+	};
+}
+
+async function runUnknownAbiBuilderCycleUnlocked(
+	options: RunUnknownAbiBuilderCycleOptions,
+): Promise<UnknownAbiBuilderCycleResult> {
+	const request = parseUnknownAbiBuilderRequest(options.request);
+	if (createDefaultEvoAbiRegistry().get(request.targetAbi)) {
+		throw new Error(`ABI is already registered; retry normal pack import instead: ${request.targetAbi}`);
+	}
+	const service = options.service ?? new EvoService(options.paths);
+	if (await service.registry.isPaused()) throw new Error("Evo-Pi is paused");
+	const existing = (await service.listProposals()).find(
+		(proposal) =>
+			proposal.requiresNewAbi === true &&
+			proposal.targetAbi === request.targetAbi &&
+			proposal.status !== "rejected" &&
+			proposal.status !== "rolled-back",
+	);
+	if (existing) {
+		throw new Error(
+			`ABI ${request.targetAbi} already has proposal ${existing.id} in status ${existing.status}; review it or rebuild before retrying import`,
+		);
+	}
+	const stable = await service.registry.readStableDigest();
+	if (!stable) throw new Error("Evo-Pi registry is not initialized");
+	if (options.parentDigest && options.parentDigest !== stable) {
+		throw new Error("Stable bundle changed after pack inspection; inspect the pack again before building its ABI");
+	}
+	await loadCompiledBundle(options.paths, stable);
+	const requestDigest = sha256(canonicalJson(request));
+	const run = await createEvolutionRun({
+		paths: options.paths,
+		trigger: "request",
+		request: `Install ${request.source.name}@${request.source.version}: add unregistered ABI ${request.targetAbi}`,
+		evidenceDigest: requestDigest,
+	});
+	try {
+		const directory = evolutionRunDirectory(options.paths, run.id);
+		await atomicWriteJson(join(directory, "unknown-abi-request.json"), request);
+		await assertFrozenUnknownAbiRequest(options.paths, run, request);
+		const persisted = await persistEvolutionResearchPlan({
+			paths: options.paths,
+			run,
+			plan: unknownAbiResearchPlan(request, stable),
+		});
+		await assertFrozenExperiment(options.paths, persisted.state, persisted.plan.experiment);
+		const config = options.config ?? (await readEvoControlConfig(options.paths));
+		const cwd = options.cwd ?? process.cwd();
+		await updateEvolutionRun(options.paths, run.id, { status: "building" });
+		const built = await runUnknownAbiBuilder({
+			paths: options.paths,
+			plan: persisted.plan,
+			request,
+			runner: options.runner,
+			cwd,
+			...(options.agentDir ? { agentDir: options.agentDir } : {}),
+			model: config.models.builder.model,
+			...(config.models.builder.thinkingLevel ? { thinkingLevel: config.models.builder.thinkingLevel } : {}),
+			sessionIdentity: `evo-unknown-abi-builder-${run.id}`,
+			...(options.signal ? { signal: options.signal } : {}),
+		});
+		await updateEvolutionRun(options.paths, run.id, { status: "validating" });
+		const expectedPaths = assertUnknownAbiCodePatch(request, built.draft.codePatch ?? "");
+		await assertFrozenUnknownAbiRequest(options.paths, await readEvolutionRun(options.paths, run.id), request);
+		const proposal = await stageProposal({
+			paths: options.paths,
+			parentDigest: stable,
+			draft: built.draft,
+			observationsMarkdown: built.observationsMarkdown,
+			repositoryCwd: cwd,
+			...(options.codeValidationExecutor ? { codeValidationExecutor: options.codeValidationExecutor } : {}),
+			...(options.signal ? { signal: options.signal } : {}),
+		});
+		await updateEvolutionRun(options.paths, run.id, {
+			status: "validating",
+			proposalId: proposal.id,
+		});
+		if (canonicalJson(proposal.changedPaths) !== canonicalJson(expectedPaths)) {
+			throw new Error(`Unknown ABI proposal ${proposal.id} staged a path set different from its reviewed patch`);
+		}
+		if (
+			proposal.kind !== "code" ||
+			proposal.tier !== "T2" ||
+			proposal.targetAbi !== request.targetAbi ||
+			proposal.requiresNewAbi !== true
+		) {
+			throw new Error(`Unknown ABI proposal ${proposal.id} lost its mandatory T2 infrastructure classification`);
+		}
+		await writeProfileReceipt(options.paths, run.id, {
+			profile: "repo-check",
+			passed: proposal.l1.passed,
+			summary: "npm run check executed in the sandboxed unknown-ABI worktree",
+		});
+		await writeProfileReceipt(options.paths, run.id, {
+			profile: "related-tests",
+			passed: proposal.l1.passed,
+			summary: "Focused Evo tests executed in the sandboxed unknown-ABI worktree",
+		});
+		if (!proposal.l1.passed) throw new Error(`Unknown ABI proposal ${proposal.id} failed L1`);
+		await assertFrozenExperiment(
+			options.paths,
+			await readEvolutionRun(options.paths, run.id),
+			persisted.plan.experiment,
+		);
+		await assertFrozenUnknownAbiRequest(options.paths, await readEvolutionRun(options.paths, run.id), request);
+		const awaitingDecision = await updateEvolutionRun(options.paths, run.id, {
+			status: "awaiting-decision",
+			proposalId: proposal.id,
+		});
+		return {
+			run: awaitingDecision,
+			proposal,
+			request,
+			plan: persisted.plan,
+			nextAction:
+				"Review and explicitly confirm the T2 patch; commit, rebuild, and restart the host, then retry the same pack import.",
+		};
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		await updateEvolutionRun(options.paths, run.id, {
+			status: options.signal?.aborted ? "cancelled" : "failed",
+			error: message,
+		}).catch(() => undefined);
+		throw error;
+	}
+}
+
+export async function runUnknownAbiBuilderCycle(
+	options: RunUnknownAbiBuilderCycleOptions,
+): Promise<UnknownAbiBuilderCycleResult> {
+	return withFileLock(options.paths, "evolution-cycle", () => runUnknownAbiBuilderCycleUnlocked(options), {
 		timeoutMs: 24 * 60 * 60_000,
 		staleAfterMs: 24 * 60 * 60_000,
 	});

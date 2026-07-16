@@ -724,6 +724,14 @@ export interface TurnEndEvent {
 	message: AgentMessage;
 	toolResults: ToolResultMessage[];
 }
+/** Fired after turn_end and before the loop can start another provider request. */
+export interface PrepareNextTurnEvent {
+	type: "prepare_next_turn";
+	/** Index of the turn that just ended. */
+	turnIndex: number;
+	message: AgentMessage;
+	toolResults: ToolResultMessage[];
+}
 
 /** Fired when a message starts (user, assistant, or toolResult) */
 export interface MessageStartEvent {
@@ -885,7 +893,8 @@ export interface CustomToolCallEvent extends ToolCallEventBase {
  * Fired before a tool executes. Can block.
  *
  * `event.input` is mutable. Mutate it in place to patch tool arguments before execution.
- * Later `tool_call` handlers see earlier mutations. No re-validation is performed after mutation.
+ * Later `tool_call` handlers see earlier mutations. The host re-validates the final input against
+ * the tool schema before execution; an invalid mutation becomes an error tool result.
  */
 export type ToolCallEvent =
 	| BashToolCallEvent
@@ -903,6 +912,7 @@ interface ToolResultEventBase {
 	input: Record<string, unknown>;
 	content: (TextContent | ImageContent)[];
 	isError: boolean;
+	terminate?: boolean;
 }
 
 export interface BashToolResultEvent extends ToolResultEventBase {
@@ -1029,6 +1039,7 @@ export type ExtensionEvent =
 	| AgentSettledEvent
 	| TurnStartEvent
 	| TurnEndEvent
+	| PrepareNextTurnEvent
 	| MessageStartEvent
 	| MessageUpdateEvent
 	| MessageEndEvent
@@ -1048,6 +1059,11 @@ export type ExtensionEvent =
 
 export interface ContextEventResult {
 	messages?: AgentMessage[];
+}
+
+export interface PrepareNextTurnEventResult {
+	/** Stop before polling queues or starting another provider request. */
+	stop?: boolean;
 }
 
 export type BeforeProviderRequestEventResult = unknown;
@@ -1070,11 +1086,17 @@ export interface ToolResultEventResult {
 	content?: (TextContent | ImageContent)[];
 	details?: unknown;
 	isError?: boolean;
+	terminate?: boolean;
 }
 
 export interface MessageEndEventResult {
 	/** Replace the finalized message. The replacement must keep the original message role. */
 	message?: AgentMessage;
+	/**
+	 * Discard a successful assistant message and request one bounded provider retry in the same turn.
+	 * Ignored for non-assistant, failed/aborted, or tool-calling messages.
+	 */
+	redo?: boolean;
 }
 
 export interface BeforeAgentStartEventResult {
@@ -1198,6 +1220,7 @@ export interface ExtensionAPI {
 	on(event: "turn_start", handler: ExtensionHandler<TurnStartEvent>): void;
 	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent>): void;
 	on(event: "message_start", handler: ExtensionHandler<MessageStartEvent>): void;
+	on(event: "prepare_next_turn", handler: ExtensionHandler<PrepareNextTurnEvent, PrepareNextTurnEventResult>): void;
 	on(event: "message_update", handler: ExtensionHandler<MessageUpdateEvent>): void;
 	on(event: "message_end", handler: ExtensionHandler<MessageEndEvent, MessageEndEventResult>): void;
 	on(event: "tool_execution_start", handler: ExtensionHandler<ToolExecutionStartEvent>): void;

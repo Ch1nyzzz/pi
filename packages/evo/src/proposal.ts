@@ -62,7 +62,11 @@ export interface ReflectorOutput {
 }
 
 function assertCodeDraftReplayScenario(draft: DraftProposal): void {
-	if ((draft.codePatch !== undefined || draft.changes === undefined) && !draft.replayScenarios[0]) {
+	if (
+		(draft.codePatch !== undefined || draft.changes === undefined) &&
+		!draft.requiresNewAbi &&
+		!draft.replayScenarios[0]
+	) {
 		throw new Error("Code proposals require at least one replay scenario");
 	}
 }
@@ -265,6 +269,41 @@ function isCoreChange(parentPolicy: BundlePolicy, candidatePolicy: BundlePolicy,
 	return canonicalJson(parentCorePolicy) !== canonicalJson(candidateCorePolicy);
 }
 
+function withoutComponentSurface(policy: BundlePolicy, surface: string): BundlePolicy {
+	const components = { ...(policy.components ?? {}) };
+	delete components[surface];
+	const stripped = { ...policy };
+	if (Object.keys(components).length === 0) delete stripped.components;
+	else stripped.components = components;
+	return stripped;
+}
+
+function isRegisteredComponentSelectionChange(options: {
+	parentPolicy: BundlePolicy;
+	candidatePolicy: BundlePolicy;
+	changedPaths: string[];
+	targetAbi?: string;
+	requiresNewAbi?: boolean;
+}): boolean {
+	if (
+		options.requiresNewAbi !== false ||
+		options.targetAbi === undefined ||
+		options.changedPaths.length !== 1 ||
+		options.changedPaths[0] !== "policy.json"
+	) {
+		return false;
+	}
+	const abi = createDefaultEvoAbiRegistry().get(options.targetAbi);
+	if (!abi) return false;
+	const before = options.parentPolicy.components?.[abi.surface];
+	const after = options.candidatePolicy.components?.[abi.surface];
+	if (!after || after.abi !== abi.id || canonicalJson(before ?? null) === canonicalJson(after)) return false;
+	return (
+		canonicalJson(withoutComponentSurface(options.parentPolicy, abi.surface)) ===
+		canonicalJson(withoutComponentSurface(options.candidatePolicy, abi.surface))
+	);
+}
+
 function containsText(value: unknown, quote: string): boolean {
 	if (typeof value === "string") return value.includes(quote);
 	if (Array.isArray(value)) return value.some((entry) => containsText(entry, quote));
@@ -334,6 +373,7 @@ async function isDirectPreference(
 		if (canonicalJson(preference) !== canonicalJson(next.preferences[index])) return false;
 	}
 	for (const preference of next.preferences.slice(previous.preferences.length)) {
+		if (!("sessionId" in preference.source)) return false;
 		if (!preference.source.quote.includes(preference.instruction)) return false;
 		if (!(await evidenceContainsPreferenceSource(paths, evidence, preference.source))) return false;
 	}
@@ -364,7 +404,15 @@ async function classifyDataTier(options: {
 	changedPaths: string[];
 	before: Map<string, string>;
 	after: Map<string, string>;
+	targetAbi?: string;
+	requiresNewAbi?: boolean;
 }): Promise<{ tier: ProposalTier; reason: string }> {
+	if (isRegisteredComponentSelectionChange(options)) {
+		return {
+			tier: "T1",
+			reason: "The diff selects a sandboxed component on an existing registered ABI for Canary review",
+		};
+	}
 	if (isCoreChange(options.parentPolicy, options.candidatePolicy, options.changedPaths)) {
 		return { tier: "T2", reason: "The diff touches a core asset or core policy field" };
 	}
@@ -400,6 +448,8 @@ async function evaluateDataCandidate(options: {
 	candidate: CompiledBundle;
 	evidence: EvidenceReference[];
 	suggestedTier?: ProposalTier;
+	targetAbi?: string;
+	requiresNewAbi?: boolean;
 }): Promise<DataCandidateEvaluation> {
 	if (options.candidate.manifest.parentDigest !== options.parent.digest) {
 		throw new Error("Candidate bundle parent does not match the proposal parent");
@@ -424,6 +474,8 @@ async function evaluateDataCandidate(options: {
 		changedPaths,
 		before,
 		after,
+		targetAbi: options.targetAbi,
+		requiresNewAbi: options.requiresNewAbi,
 	});
 	const tier = stricterTier(classification.tier, options.suggestedTier);
 	return {
@@ -577,6 +629,8 @@ export async function stageProposal(options: {
 			candidate,
 			evidence: options.draft.evidence,
 			suggestedTier: options.draft.suggestedTier,
+			targetAbi: options.draft.targetAbi,
+			requiresNewAbi: options.draft.requiresNewAbi,
 		});
 		const diffDigest = sha256(evaluation.diff);
 		const proposal: Proposal = {
@@ -778,6 +832,8 @@ async function revalidateDataProposal(
 		candidate,
 		evidence: proposal.evidence,
 		suggestedTier: proposal.suggestedTier,
+		targetAbi: proposal.targetAbi,
+		requiresNewAbi: proposal.requiresNewAbi,
 	});
 	const mismatches: string[] = [];
 	if (proposal.kind !== evaluation.kind) mismatches.push("kind");
@@ -953,6 +1009,8 @@ export async function reviseProposal(options: {
 					candidate,
 					evidence: options.draft.evidence,
 					suggestedTier: options.draft.suggestedTier,
+					targetAbi: options.draft.targetAbi,
+					requiresNewAbi: options.draft.requiresNewAbi,
 				});
 				const diffDigest = sha256(evaluation.diff);
 				proposal = {

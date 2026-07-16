@@ -2,12 +2,19 @@
 
 ## [Unreleased]
 
+### New Features
+
+- **Optimization-pack exchange (Evo-Pi):** Share content-addressed prompts, skills, structured memory, sandboxed components, tools, and workflows through proposal-only imports that never activate code implicitly. See [Optimization Packs](../../docs/optimization-packs.md).
+- **Sandboxed host ABIs (Evo-Pi):** Extend the agent through eight bounded host contracts for instructions, context, guards, generation, control, tools, memory, and workflows while retaining legacy compaction compatibility. See [Host ABIs](../../docs/host-abis.md).
+- **Trusted component installation (Evo-Pi):** Discover signed, integrity-pinned packs, review exact capability grants, and stage reversible trials without enabling local or shared components by default. See the [implementation plan](../../docs/implementation-plan.md).
+
 ### Added
 
 - Added `maxCollapsedToolsPerTurn` to limit visible tool calls per user turn until tool output is expanded.
 - Added `userMessagePaddingY` to configure vertical spacing inside sent user-message backgrounds.
 - Added a background-free `minimal` tool display style and a collapsed summary showing the hidden tool count and expansion shortcut.
 - Added the public `buildSystemPrompt` export for integrations that need to reconstruct a base prompt from `BuildSystemPromptOptions`.
+- Added `message_end` redo support that replaces one finalized assistant draft without persisting or rendering the discarded response.
 
 ### Changed
 
@@ -15,6 +22,7 @@
 
 ### Fixed
 
+- Fixed inherited exact context-window exhaustion reported with a length stop reason to trigger context-overflow recovery.
 - Fixed inherited OpenAI Codex session IDs to stay within the backend's 64-character limit ([#6653](https://github.com/earendil-works/pi/pull/6653) by [@davidbrai](https://github.com/davidbrai)).
 
 ## [0.80.7] - 2026-07-14

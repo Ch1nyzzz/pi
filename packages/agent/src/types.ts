@@ -135,7 +135,23 @@ export interface AgentLoopTurnUpdate {
 	thinkingLevel?: ThinkingLevel;
 }
 
+/** Result returned from `prepareNextTurn`. */
+export interface PrepareNextTurnResult extends AgentLoopTurnUpdate {
+	/** Stop the current run before polling queues or starting another provider request. */
+	stop?: boolean;
+}
+
 export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {}
+
+/** Context passed to `shouldRedoAssistantResponse`. */
+export interface ShouldRedoAssistantResponseContext {
+	/** The finalized assistant message being considered for replacement. */
+	message: AssistantMessage;
+	/** Current context, including `message` as its final entry. */
+	context: AgentContext;
+	/** Number of responses already discarded for this turn. */
+	redoCount: number;
+}
 
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
@@ -219,7 +235,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	prepareNextTurn?: (
 		context: PrepareNextTurnContext,
-	) => AgentLoopTurnUpdate | undefined | Promise<AgentLoopTurnUpdate | undefined>;
+	) => PrepareNextTurnResult | undefined | Promise<PrepareNextTurnResult | undefined>;
+
+	/**
+	 * Called after a successful assistant message is finalized and before tool execution or queue polling.
+	 * Returning true discards the message and retries the provider request once within the same turn.
+	 */
+	shouldRedoAssistantResponse?: (context: ShouldRedoAssistantResponseContext) => boolean | Promise<boolean>;
 
 	/**
 	 * Returns steering messages to inject into the conversation mid-run.
@@ -424,6 +446,7 @@ export type AgentEvent =
 	// Only emitted for assistant messages during streaming
 	| { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
 	| { type: "message_end"; message: AgentMessage }
+	| { type: "message_redo"; message: AssistantMessage }
 	// Tool execution lifecycle
 	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
 	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }

@@ -1,7 +1,7 @@
 # Optimization Packs — a shareable contract for harness improvements
 
-Status: **spec v1** (frozen envelope; implementation staged). Companion to
-`docs/host-abis.md` (the ABI sockets a pack's components plug into).
+Status: **implemented v1**. Companion to `docs/host-abis.md` (the ABI sockets a
+pack's components plug into).
 
 ## Goal
 
@@ -30,15 +30,17 @@ required code; the human only approves.
 3. **Community flows on standard ABIs.** Components declare a *standard* ABI from
    the set in `docs/host-abis.md` (`tool/v1`, `instructions/v1`, `context/v1`,
    `guard/v1`, `generation/v1`, `control/v1`, `memory/v1`, `workflow/v1`). Like
-   USB, shared parts only interoperate against common sockets. Packs that invent a
-   private ABI are installable but need that ABI to exist locally first.
+   USB, shared parts only interoperate against common sockets. A pack that names
+   an unregistered ABI is routed to the Builder for a cold T2 host-wiring
+   proposal.
 4. **Trust-boundary changes get strong review; within-boundary parts get
    light review.** Adding a tool under an existing `tool/v1` does not expand the
    capability ceiling, so it can be a light Canary approval. Introducing a *new*
    ABI opens a new capability boundary and always requires explicit human
    confirmation, even though the agent authored the code.
 5. **Content-addressed integrity.** Every pack and every component artifact is
-   sha256-addressed; import verifies integrity before anything activates.
+   sha256-addressed; import stages only from a private, re-verified snapshot
+   after the complete pack has passed preflight.
 
 ## Pack layout
 
@@ -122,12 +124,16 @@ my-optimization/
 ## `evo-pi import <pack>` flow
 
 ```
-1. Parse pack.json, verify integrity (sha256 over canonical contents).
-2. Split contents into data-type and code-type.
+1. Parse pack.json, verify integrity (sha256 over canonical contents), copy all
+   referenced content into a private snapshot, and verify that snapshot again.
+2. Split contents into data-type and code-type, then preflight every data
+   change, registered artifact, policy transition, and unknown-ABI Builder
+   request before publishing an artifact or staging a target proposal.
 3. Data-type (prompts / skills / memory):
-     → stage as a data proposal on the existing T0/T1 path
-       (prompt/skill = data; append-only preferences may be T0).
-     → activates into the immutable bundle, reversible via trial/rollback.
+     → stage as a data proposal on the existing T0/T1 path.
+     → merge memory through the structured preference schema.
+     → activate into the immutable bundle only after approval; remain
+       reversible via trial/rollback.
 4. Code-type parts (components AND workflows — same path), per part, by ABI status:
      a. ABI already registered locally (e.g. tool/v1, workflow/v1):
           → stage a component-selection proposal.
@@ -144,6 +150,30 @@ my-optimization/
    `spawn-agent` are off by default and always require an explicit grant.
 6. Every activation is reversible (trial → keep / rollback).
 ```
+
+Import and registry install only stage proposals. Neither command implicitly
+activates code. The unknown-ABI Builder callback runs only after full pack
+preflight and before target staging; if it fails, the importer leaves no
+pack-owned artifact or proposal behind.
+
+## Export and discovery
+
+```bash
+evo-pi export <directory> [name] [version]
+evo-pi search [query]
+evo-pi install <name> [version]
+```
+
+- Export writes the active bundle's prompts, skills, structured memory, selected
+  components, tools, and workflows as a new content-addressed v1 pack.
+- Discovery reads strict local registry-source and trusted-signer configuration.
+  Signed entries bind pack identity, version, source, integrity, and signer.
+- Search reports provenance, trust, ABI requirements, and capability
+  requirements. Search can report untrusted metadata, but untrusted entries are
+  not installable.
+- Install downloads through bounded HTTPS/git/gist provenance handling,
+  re-verifies the inspected integrity, previews exact grants, and then runs the
+  same staging path as local import.
 
 ## Approval mapping (reuses existing Evo tiers)
 
@@ -179,8 +209,7 @@ load-bearing capabilities and are always granted explicitly at approval time.
 
 ## Implementation
 
-The pack envelope and its landing sequence are tracked in the project todo and in
-`docs/host-abis.md#landing-roadmap`. In short: data packs first (zero security
-surface), then empty-ceiling ABIs on today's runtime, then the capability broker
-+ `infer`, then the thinking components (memory, full tools, workflows), then a
-discovery/registry layer.
+The v1 envelope, local import/export, all eight host ABIs, capability broker,
+memory/tool/workflow runtimes, unknown-ABI Builder path, and signed discovery
+flow are implemented. `docs/implementation-plan.md` records the completed stage
+and acceptance mapping.

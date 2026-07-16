@@ -14,6 +14,11 @@ export interface LoadedEvoComponentArtifact {
 	manifest: EvoComponentManifest;
 }
 
+export interface InspectedEvoComponentArtifact {
+	manifest: EvoComponentManifest;
+	entrypointContent: Buffer;
+}
+
 export interface PublishEvoComponentArtifactInput {
 	id: string;
 	version: string;
@@ -92,6 +97,85 @@ export async function publishEvoComponentArtifact(
 	} finally {
 		await rm(temporary, { recursive: true, force: true });
 	}
+}
+
+/** Purely inspect an external artifact without publishing it locally. */
+export async function inspectEvoComponentArtifact(
+	sourceDirectory: string,
+	registry: EvoAbiRegistry,
+): Promise<InspectedEvoComponentArtifact> {
+	const directoryMetadata = await lstat(sourceDirectory);
+	if (!directoryMetadata.isDirectory() || directoryMetadata.isSymbolicLink()) {
+		throw new Error("Imported component artifact is not a regular directory");
+	}
+	const entries = (await readdir(sourceDirectory, { withFileTypes: true })).sort((left, right) =>
+		left.name.localeCompare(right.name),
+	);
+	if (entries.some((entry) => !entry.isFile() || entry.isSymbolicLink())) {
+		throw new Error("Imported component artifact contains a non-regular file");
+	}
+	const manifest = parseEvoComponentManifest(
+		JSON.parse(await readFile(join(sourceDirectory, "manifest.json"), "utf8")) as unknown,
+	);
+	const expectedFiles = [manifest.entrypoint, "manifest.json"].sort();
+	if (entries.map((entry) => entry.name).join("\n") !== expectedFiles.join("\n")) {
+		throw new Error("Imported component artifact file set is invalid");
+	}
+	const entrypointPath = join(sourceDirectory, manifest.entrypoint);
+	const entrypointMetadata = await lstat(entrypointPath);
+	if (!entrypointMetadata.isFile() || entrypointMetadata.isSymbolicLink()) {
+		throw new Error("Imported component entrypoint is not a regular file");
+	}
+	const entrypointContent = await readFile(entrypointPath);
+	if (sha256(entrypointContent) !== manifest.entrypointSha256) {
+		throw new Error("Imported component entrypoint digest mismatch");
+	}
+	const abi = registry.require(manifest.abi);
+	if (abi.activationBoundary !== manifest.activationBoundary) {
+		throw new Error(`Imported component activation boundary does not match ABI ${manifest.abi}`);
+	}
+	const ceiling = new Set(abi.capabilityCeiling);
+	for (const capability of manifest.capabilities) {
+		if (!ceiling.has(capability)) throw new Error(`Imported component capability exceeds ABI ceiling: ${capability}`);
+	}
+	return { manifest, entrypointContent };
+}
+
+/** Publish an already inspected artifact into the immutable local store. */
+export async function publishInspectedEvoComponentArtifact(
+	paths: EvoPaths,
+	artifact: InspectedEvoComponentArtifact,
+): Promise<LoadedEvoComponentArtifact> {
+	const manifest = artifact.manifest;
+	const published = await publishEvoComponentArtifact(paths, {
+		id: manifest.id,
+		version: manifest.version,
+		abi: manifest.abi,
+		activationBoundary: manifest.activationBoundary,
+		capabilities: manifest.capabilities,
+		entrypointName: manifest.entrypoint,
+		entrypointContent: artifact.entrypointContent,
+	});
+	if (canonicalJson(published.manifest) !== canonicalJson(manifest)) {
+		throw new Error("Imported component manifest identity mismatch");
+	}
+	return loadEvoComponentArtifact(paths, published.manifest.artifactDigest);
+}
+
+/**
+ * Verify and publish an artifact received outside the local component store.
+ * Only the manifest and its direct entrypoint are accepted; symlinks, support
+ * files, digest drift, unknown ABIs, and capability-ceiling violations fail
+ * before the immutable local copy is published.
+ */
+export async function importEvoComponentArtifact(
+	paths: EvoPaths,
+	sourceDirectory: string,
+	registry: EvoAbiRegistry,
+): Promise<LoadedEvoComponentArtifact> {
+	const inspected = await inspectEvoComponentArtifact(sourceDirectory, registry);
+	const published = await publishInspectedEvoComponentArtifact(paths, inspected);
+	return loadEvoComponentArtifact(paths, published.manifest.artifactDigest, registry);
 }
 
 export async function loadEvoComponentArtifact(

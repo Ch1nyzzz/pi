@@ -7,20 +7,22 @@ describe("context/v1 ABI", () => {
 		expect(registry.require("compaction/v1").surface).toBe("compaction");
 		expect(registry.require("context/v1").surface).toBe("context");
 		expect(registry.require("context/v1").activationBoundary).toBe("session");
-		expect(registry.require("context/v1").capabilityCeiling).toEqual([]);
+		expect(registry.require("context/v1").capabilityCeiling).toEqual(["infer", "retrieve"]);
 	});
 
 	describe("transform mode", () => {
 		it("accepts a valid message-array transform input and output", () => {
 			const input = CONTEXT_V1_ABI.validateInput({
 				mode: "transform",
-				messages: [{ role: "user" }],
+				messages: [{ role: "user", content: "hello", timestamp: 1 }],
 				reason: "turn",
 				tokenEstimate: 10,
 				contextWindow: 1000,
 			});
 			expect(input.mode).toBe("transform");
-			const output = CONTEXT_V1_ABI.validateOutput({ messages: [{ role: "user" }] });
+			const output = CONTEXT_V1_ABI.validateOutput({
+				messages: [{ role: "user", content: "hello", timestamp: 1 }],
+			});
 			expect(Array.isArray((output as { messages: unknown[] }).messages)).toBe(true);
 		});
 

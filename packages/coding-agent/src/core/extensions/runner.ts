@@ -41,6 +41,8 @@ import type {
 	MessageEndEvent,
 	MessageEndEventResult,
 	MessageRenderer,
+	PrepareNextTurnEvent,
+	PrepareNextTurnEventResult,
 	ProjectTrustContext,
 	ProjectTrustEvent,
 	ProjectTrustEventResult,
@@ -125,6 +127,7 @@ type RunnerEmitEvent = Exclude<
 	| ToolCallEvent
 	| ProjectTrustEvent
 	| ToolResultEvent
+	| PrepareNextTurnEvent
 	| UserBashEvent
 	| ContextEvent
 	| BeforeProviderRequestEvent
@@ -786,10 +789,11 @@ export class ExtensionRunner {
 		return result as RunnerEmitResult<TEvent>;
 	}
 
-	async emitMessageEnd(event: MessageEndEvent): Promise<AgentMessage | undefined> {
+	async emitMessageEnd(event: MessageEndEvent): Promise<MessageEndEventResult | undefined> {
 		const ctx = this.createContext();
 		let currentMessage = event.message;
 		let modified = false;
+		let redoRequested = false;
 
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get("message_end");
@@ -799,19 +803,30 @@ export class ExtensionRunner {
 				try {
 					const currentEvent: MessageEndEvent = { ...event, message: currentMessage };
 					const handlerResult = (await handler(currentEvent, ctx)) as MessageEndEventResult | undefined;
-					if (!handlerResult?.message) continue;
+					if (!handlerResult) continue;
 
-					if (handlerResult.message.role !== currentMessage.role) {
+					if (handlerResult.message) {
+						if (handlerResult.message.role !== currentMessage.role) {
+							this.emitError({
+								extensionPath: ext.path,
+								event: "message_end",
+								error: "message_end handlers must return a message with the same role",
+							});
+						} else {
+							currentMessage = handlerResult.message;
+							modified = true;
+						}
+					}
+
+					if (handlerResult.redo !== undefined && typeof handlerResult.redo !== "boolean") {
 						this.emitError({
 							extensionPath: ext.path,
 							event: "message_end",
-							error: "message_end handlers must return a message with the same role",
+							error: "message_end redo must be a boolean",
 						});
-						continue;
+					} else if (handlerResult.redo === true) {
+						redoRequested = true;
 					}
-
-					currentMessage = handlerResult.message;
-					modified = true;
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
@@ -825,7 +840,48 @@ export class ExtensionRunner {
 			}
 		}
 
-		return modified ? currentMessage : undefined;
+		const redo =
+			redoRequested &&
+			currentMessage.role === "assistant" &&
+			currentMessage.stopReason !== "error" &&
+			currentMessage.stopReason !== "aborted" &&
+			Array.isArray(currentMessage.content) &&
+			!currentMessage.content.some((content) => content.type === "toolCall");
+		if (!modified && !redo) return undefined;
+		return {
+			...(modified ? { message: currentMessage } : {}),
+			...(redo ? { redo: true } : {}),
+		};
+	}
+	async emitPrepareNextTurn(event: PrepareNextTurnEvent): Promise<PrepareNextTurnEventResult | undefined> {
+		const ctx = this.createContext();
+		let hasStopResult = false;
+		let stop = false;
+
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get("prepare_next_turn");
+			if (!handlers || handlers.length === 0) continue;
+
+			for (const handler of handlers) {
+				try {
+					const handlerResult = (await handler(event, ctx)) as PrepareNextTurnEventResult | undefined;
+					if (handlerResult?.stop === undefined) continue;
+					hasStopResult = true;
+					stop ||= handlerResult.stop;
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
+					this.emitError({
+						extensionPath: ext.path,
+						event: "prepare_next_turn",
+						error: message,
+						stack,
+					});
+				}
+			}
+		}
+
+		return hasStopResult ? { stop } : undefined;
 	}
 
 	async emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined> {
@@ -854,6 +910,10 @@ export class ExtensionRunner {
 						currentEvent.isError = handlerResult.isError;
 						modified = true;
 					}
+					if (handlerResult.terminate !== undefined) {
+						currentEvent.terminate = handlerResult.terminate;
+						modified = true;
+					}
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
@@ -875,6 +935,7 @@ export class ExtensionRunner {
 			content: currentEvent.content,
 			details: currentEvent.details,
 			isError: currentEvent.isError,
+			terminate: currentEvent.terminate,
 		};
 	}
 

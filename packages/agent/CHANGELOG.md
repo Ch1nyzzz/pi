@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a bounded `shouldRedoAssistantResponse` hook that can discard and regenerate one finalized assistant draft before tools or queued messages observe it.
+
 ## [0.80.7] - 2026-07-14
 
 ### Added

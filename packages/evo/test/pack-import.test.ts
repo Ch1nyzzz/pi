@@ -15,7 +15,24 @@ describe("buildPackDataChanges", () => {
 		await mkdir(join(dir, "memory"), { recursive: true });
 		await writeFile(join(dir, "prompts", "git.md"), "prefer small commits\n");
 		await writeFile(join(dir, "skills", "git-triage", "SKILL.md"), "# git triage\n");
-		await writeFile(join(dir, "memory", "preferences.json"), "{}\n");
+		await writeFile(
+			join(dir, "memory", "preferences.json"),
+			`${JSON.stringify(
+				{
+					schemaVersion: 1,
+					preferences: [
+						{
+							id: "small-commits",
+							instruction: "Prefer small commits.",
+							source: { sessionId: "source-session", sequence: 1, quote: "Prefer small commits." },
+							addedAt: "2026-07-15T00:00:00.000Z",
+						},
+					],
+				},
+				undefined,
+				"\t",
+			)}\n`,
+		);
 	});
 
 	afterEach(async () => {
@@ -53,7 +70,7 @@ describe("buildPackDataChanges", () => {
 		expect(result.changes.find((c) => c.path === p)?.content).toBe("prefer small commits\n");
 	});
 
-	it("defers structured memory (reports skipped, no change emitted)", async () => {
+	it("merges structured memory and replaces foreign session provenance with pack provenance", async () => {
 		const result = await buildPackDataChanges(
 			dir,
 			manifest({
@@ -64,8 +81,40 @@ describe("buildPackDataChanges", () => {
 				},
 			}),
 		);
-		expect(result.skippedMemory).toBe(1);
-		expect(result.changes.some((c) => c.path === "memory/preferences.json")).toBe(false);
+		expect(result.addedMemoryPreferences).toBe(1);
+		const change = result.changes.find((entry) => entry.path === "memory/preferences.json");
+		expect(change?.content).toBeDefined();
+		const memory = JSON.parse(change?.content ?? "") as {
+			preferences: Array<{ instruction: string; source: Record<string, unknown> }>;
+		};
+		expect(memory.preferences).toEqual([
+			expect.objectContaining({
+				instruction: "Prefer small commits.",
+				source: expect.objectContaining({
+					packName: "better-git-workflow",
+					packVersion: "1.0.0",
+					file: "memory/preferences.json",
+					integrity: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+				}),
+			}),
+		]);
+	});
+
+	it("preserves active preferences and rejects conflicting imported ids", async () => {
+		const parent = {
+			schemaVersion: 1 as const,
+			preferences: [
+				{
+					id: "small-commits",
+					instruction: "Use large commits.",
+					source: { sessionId: "active-session", sequence: 1, quote: "Use large commits." },
+					addedAt: "2026-07-14T00:00:00.000Z",
+				},
+			],
+		};
+		await expect(
+			buildPackDataChanges(dir, manifest({ contents: { memory: [{ file: "memory/preferences.json" }] } }), parent),
+		).rejects.toThrow(/id conflicts/);
 	});
 
 	it("produces unique prompt asset names for multiple prompts", async () => {

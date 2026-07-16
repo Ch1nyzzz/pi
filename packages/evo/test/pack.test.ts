@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -84,6 +84,14 @@ describe("parseEvoPackManifest", () => {
 		).toThrow(/\.\./);
 	});
 
+	it("rejects backslashes and non-canonical relative paths", () => {
+		for (const file of ["prompts\\git.md", "prompts/./git.md", "prompts//git.md", "prompts/git.md/"]) {
+			expect(() =>
+				parseEvoPackManifest(baseManifest({ contents: { prompts: [{ target: "system", file }] } })),
+			).toThrow(/forward slashes|canonical relative path/);
+		}
+	});
+
 	it("rejects an absolute artifact path", () => {
 		expect(() =>
 			parseEvoPackManifest(
@@ -128,6 +136,43 @@ describe("parseEvoPackManifest", () => {
 				}),
 			),
 		).toThrow(/duplicate/);
+	});
+
+	it("rejects unknown manifest and content keys", () => {
+		expect(() => parseEvoPackManifest(baseManifest({ surprise: true }))).toThrow(/unknown key/);
+		expect(() =>
+			parseEvoPackManifest(
+				baseManifest({
+					contents: {
+						prompts: [{ target: "system", file: "prompts/git.md", surprise: true }],
+					},
+				}),
+			),
+		).toThrow(/unknown key/);
+	});
+
+	it("requires ABI and capability summaries to exactly match code parts", () => {
+		const contents = {
+			components: [
+				{
+					surface: "context",
+					abi: "context/v1",
+					id: "pruner",
+					artifact: "components/pruner",
+					capabilities: ["infer"],
+				},
+			],
+		};
+		expect(() => parseEvoPackManifest(baseManifest({ contents }))).toThrow(/requiresAbis/);
+		expect(() =>
+			parseEvoPackManifest(
+				baseManifest({
+					contents,
+					requiresAbis: ["context/v1"],
+					requiresCapabilities: [],
+				}),
+			),
+		).toThrow(/requiresCapabilities/);
 	});
 });
 
@@ -178,5 +223,19 @@ describe("pack integrity", () => {
 		const loaded = await loadEvoPack(dir);
 		expect(loaded.manifest.name).toBe("better-git-workflow");
 		expect(loaded.integrity.ok).toBe(true);
+	});
+
+	it("rejects direct-file and directory-root symlinks", async () => {
+		const outside = join(dir, "outside.md");
+		await writeFile(outside, "outside\n");
+		await rm(join(dir, "prompts", "git.md"));
+		await symlink(outside, join(dir, "prompts", "git.md"));
+		await expect(computeEvoPackIntegrity(dir, parseEvoPackManifest(baseManifest()))).rejects.toThrow(/symlink/);
+
+		await rm(join(dir, "prompts", "git.md"));
+		await writeFile(join(dir, "prompts", "git.md"), "restored\n");
+		await rm(join(dir, "skills", "git-triage"), { recursive: true });
+		await symlink(join(dir, "prompts"), join(dir, "skills", "git-triage"));
+		await expect(computeEvoPackIntegrity(dir, parseEvoPackManifest(baseManifest()))).rejects.toThrow(/symlink/);
 	});
 });

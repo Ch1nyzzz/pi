@@ -306,6 +306,10 @@ export class AgentSession {
 	// Extension system
 	private _extensionRunner!: ExtensionRunner;
 	private _turnIndex = 0;
+	private _pendingAssistantRedo: AssistantMessage | undefined;
+	private _provisionalAssistantEnd: AssistantMessage | undefined;
+	private _redoneTurnIndices = new Set<number>();
+	private _reuseAssistantStreamForRedo = false;
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
@@ -359,6 +363,7 @@ export class AgentSession {
 		// (session persistence, extensions, auto-compaction, retry logic)
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 		this._installAgentToolHooks();
+		this._installAgentAssistantRedoHook();
 		this._installAgentNextTurnRefresh();
 
 		this._buildRuntime({
@@ -456,6 +461,7 @@ export class AgentSession {
 				content: result.content,
 				details: result.details,
 				isError,
+				terminate: result.terminate,
 			});
 
 			if (!hookResult) {
@@ -466,8 +472,13 @@ export class AgentSession {
 				content: hookResult.content,
 				details: hookResult.details,
 				isError: hookResult.isError ?? isError,
+				terminate: hookResult.terminate,
 			};
 		};
+	}
+
+	private _installAgentAssistantRedoHook(): void {
+		this.agent.shouldRedoAssistantResponse = async ({ message }) => this._pendingAssistantRedo === message;
 	}
 
 	private _installAgentNextTurnRefresh(): void {
@@ -479,9 +490,18 @@ export class AgentSession {
 		this.agent.prepareNextTurnWithContext = async (turn, signal) => {
 			const previousSnapshot = await previousPrepareNextTurnWithContext?.(turn, signal);
 			const previousContext = previousSnapshot?.context ?? turn.context;
+			const extensionResult = this._extensionRunner.hasHandlers("prepare_next_turn")
+				? await this._extensionRunner.emitPrepareNextTurn({
+						type: "prepare_next_turn",
+						turnIndex: this._turnIndex - 1,
+						message: turn.message,
+						toolResults: turn.toolResults,
+					})
+				: undefined;
 
 			return {
 				...previousSnapshot,
+				stop: previousSnapshot?.stop === true || extensionResult?.stop === true,
 				context: {
 					...previousContext,
 					systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
@@ -531,6 +551,40 @@ export class AgentSession {
 		resolve();
 	}
 
+	private _emitAndPersistAgentEvent(event: AgentEvent): void {
+		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
+
+		if (event.type !== "message_end") return;
+		if (event.message.role === "custom") {
+			this.sessionManager.appendCustomMessageEntry(
+				event.message.customType,
+				event.message.content,
+				event.message.display,
+				event.message.details,
+			);
+		} else if (
+			event.message.role === "user" ||
+			event.message.role === "assistant" ||
+			event.message.role === "toolResult"
+		) {
+			this.sessionManager.appendMessage(event.message);
+		}
+
+		if (event.message.role !== "assistant") return;
+		this._lastAssistantMessage = event.message;
+		if (event.message.stopReason !== "error") {
+			this._overflowRecoveryAttempted = false;
+		}
+		if (event.message.stopReason !== "error" && this._retryAttempt > 0) {
+			this._emit({
+				type: "auto_retry_end",
+				success: true,
+				attempt: this._retryAttempt,
+			});
+			this._retryAttempt = 0;
+		}
+	}
+
 	private async _emitAgentSettled(): Promise<void> {
 		this._isAgentRunActive = false;
 		try {
@@ -546,6 +600,13 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		const provisionalAssistantEnd = this._provisionalAssistantEnd;
+		if (provisionalAssistantEnd && !(event.type === "message_redo" && event.message === provisionalAssistantEnd)) {
+			this._provisionalAssistantEnd = undefined;
+			this._pendingAssistantRedo = undefined;
+			this._emitAndPersistAgentEvent({ type: "message_end", message: provisionalAssistantEnd });
+		}
+
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -571,51 +632,34 @@ export class AgentSession {
 		// Emit to extensions first
 		await this._emitExtensionEvent(event);
 
-		// Notify all listeners
-		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
-
-		// Handle session persistence
-		if (event.type === "message_end") {
-			// Check if this is a custom message from extensions
-			if (event.message.role === "custom") {
-				// Persist as CustomMessageEntry
-				this.sessionManager.appendCustomMessageEntry(
-					event.message.customType,
-					event.message.content,
-					event.message.display,
-					event.message.details,
-				);
-			} else if (
-				event.message.role === "user" ||
-				event.message.role === "assistant" ||
-				event.message.role === "toolResult"
+		if (event.type === "message_redo") {
+			if (
+				this._provisionalAssistantEnd !== event.message ||
+				(this._pendingAssistantRedo !== undefined && this._pendingAssistantRedo !== event.message)
 			) {
-				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+				throw new Error("Assistant redo event did not match the pending finalized message");
 			}
-			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
-
-			// Track assistant message for auto-compaction (checked on agent_end)
-			if (event.message.role === "assistant") {
-				this._lastAssistantMessage = event.message;
-
-				const assistantMsg = event.message as AssistantMessage;
-				if (assistantMsg.stopReason !== "error") {
-					this._overflowRecoveryAttempted = false;
-				}
-
-				// Reset retry counter immediately on successful assistant response
-				// This prevents accumulation across multiple LLM calls within a turn
-				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
-					this._emit({
-						type: "auto_retry_end",
-						success: true,
-						attempt: this._retryAttempt,
-					});
-					this._retryAttempt = 0;
-				}
-			}
+			this._pendingAssistantRedo = undefined;
+			this._provisionalAssistantEnd = undefined;
+			this._redoneTurnIndices.add(this._turnIndex);
+			this._reuseAssistantStreamForRedo = true;
+			return;
 		}
+
+		if (event.type === "message_start" && event.message.role === "assistant" && this._reuseAssistantStreamForRedo) {
+			this._reuseAssistantStreamForRedo = false;
+			return;
+		}
+
+		if (event.type === "message_end" && event.message.role === "assistant") {
+			if (this._provisionalAssistantEnd) {
+				throw new Error("Cannot stage more than one provisional assistant response");
+			}
+			this._provisionalAssistantEnd = event.message;
+			return;
+		}
+
+		this._emitAndPersistAgentEvent(event);
 	};
 
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
@@ -674,6 +718,10 @@ export class AgentSession {
 	private async _emitExtensionEvent(event: AgentEvent): Promise<void> {
 		if (event.type === "agent_start") {
 			this._turnIndex = 0;
+			this._pendingAssistantRedo = undefined;
+			this._provisionalAssistantEnd = undefined;
+			this._redoneTurnIndices.clear();
+			this._reuseAssistantStreamForRedo = false;
 			await this._extensionRunner.emit({ type: "agent_start" });
 		} else if (event.type === "agent_end") {
 			await this._extensionRunner.emit({ type: "agent_end", messages: event.messages });
@@ -711,19 +759,27 @@ export class AgentSession {
 				type: "message_end",
 				message: event.message,
 			};
-			const replacement = await this._extensionRunner.emitMessageEnd(extensionEvent);
-			if (replacement) {
+			const result = await this._extensionRunner.emitMessageEnd(extensionEvent);
+			if (result?.message) {
 				// Untyped extension handlers can return messages with null/missing content;
 				// normalize so it never enters agent state or session history.
 				const normalized =
-					(replacement.role === "user" ||
-						replacement.role === "assistant" ||
-						replacement.role === "toolResult" ||
-						replacement.role === "custom") &&
-					replacement.content == null
-						? ({ ...replacement, content: [] } as AgentMessage)
-						: replacement;
+					(result.message.role === "user" ||
+						result.message.role === "assistant" ||
+						result.message.role === "toolResult" ||
+						result.message.role === "custom") &&
+					result.message.content == null
+						? ({ ...result.message, content: [] } as AgentMessage)
+						: result.message;
 				this._replaceMessageInPlace(event.message, normalized);
+			}
+			if (
+				result?.redo === true &&
+				event.message.role === "assistant" &&
+				this.agent.signal?.aborted !== true &&
+				!this._redoneTurnIndices.has(this._turnIndex)
+			) {
+				this._pendingAssistantRedo = event.message;
 			}
 		} else if (event.type === "tool_execution_start") {
 			const extensionEvent: ToolExecutionStartEvent = {

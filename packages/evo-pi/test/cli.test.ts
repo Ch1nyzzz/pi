@@ -42,4 +42,26 @@ describe("Evo-Pi distribution", () => {
 		expect(stable).toMatch(/^[a-f0-9]{64}$/);
 		expect(result.stdout).toContain(stable);
 	});
+
+	it("routes public pack export and import commands to the administrative CLI", () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "evo-pi-pack-routing-"));
+		roots.push(agentDir);
+		expect(run("src/admin.ts", ["init"], agentDir).status).toBe(0);
+		const packDirectory = join(agentDir, "shared-pack");
+
+		const exported = run("src/cli.ts", ["export", packDirectory, "shared-pack", "1.0.0"], agentDir);
+
+		expect(exported.status).toBe(0);
+		expect(exported.stdout).toContain("Exported active bundle");
+		expect(JSON.parse(readFileSync(join(packDirectory, "pack.json"), "utf8"))).toMatchObject({
+			name: "shared-pack",
+			version: "1.0.0",
+		});
+
+		const imported = run("src/cli.ts", ["import", packDirectory], agentDir);
+
+		expect(imported.status).toBe(0);
+		expect(imported.stdout).toContain("Pack: shared-pack@1.0.0");
+		expect(imported.stdout).toContain("Activation: none;");
+	});
 });
