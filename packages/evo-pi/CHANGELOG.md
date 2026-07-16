@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the workflow SDK and the bundled `/deep-review` workflow pack template: workflow components can now be written with `runWorkflow()`/`agent()`/`parallel()`/`pipeline()` instead of raw JSONL-RPC, and child agents run with the host's real coding tools.
+- Added streaming session triage (cheap-model hypothesis scouting every N sessions), dual-channel research (narrow request runs vs triage-fed scheduled runs), and guardrail-metric rollback for trials.
+- Added `grants.approval: auto` (default): pack import/install auto-approves the previewed capability grants; set `prompt` to restore confirmation.
+
+### Changed
+
+- Changed Evo activity into a dedicated final status line that shows the active Canary component by name and can be entered with Down from the end of a draft without exposing internal IDs.
+
 ## [0.80.9] - 2026-07-16
 
 ### Added

@@ -4,8 +4,10 @@ import type { Theme } from "@ch1nyzzz/pi-coding-agent";
 import { type Component, Key, matchesKey, type TUI, wrapTextWithAnsi } from "@ch1nyzzz/pi-tui";
 import type { EvoPaths } from "../paths.ts";
 import { loadProposal } from "../proposal.ts";
+import type { EvoService } from "../service.ts";
 import type { EvolutionRun, EvolutionRunStatus, Proposal } from "../types.ts";
-import { evolutionRunDirectory, listEvolutionRuns, readEvolutionRun } from "./run.ts";
+import { type EvoActivityItem, listEvoActivityItems } from "./activity.ts";
+import { evolutionRunDirectory, readEvolutionRun } from "./run.ts";
 
 interface TranscriptEvent {
 	timestamp: string;
@@ -173,7 +175,8 @@ function toolEvents(events: TranscriptEvent[]): Array<{ call: TranscriptEvent; r
 
 export class EvolutionProcessInspector implements Component {
 	private timer: NodeJS.Timeout;
-	private runs: EvolutionRun[] = [];
+	private items: EvoActivityItem[] = [];
+	private item?: EvoActivityItem;
 	private run?: EvolutionRun;
 	private events: TranscriptEvent[] = [];
 	private artifacts: RunArtifacts = {};
@@ -186,27 +189,30 @@ export class EvolutionProcessInspector implements Component {
 	private readonly tui: TUI;
 	private readonly theme: Theme;
 	private readonly paths: EvoPaths;
+	private readonly service: EvoService;
 	private readonly close: () => void;
 	private readonly approveCanary: (runId: string) => Promise<void>;
 	private approving = false;
 	private approvalError?: string;
-	private runId?: string;
+	private itemKey?: string;
 
 	constructor(
 		tui: TUI,
 		theme: Theme,
 		paths: EvoPaths,
-		runId: string | undefined,
+		service: EvoService,
+		itemKey: string | undefined,
 		close: () => void,
 		approveCanary: (runId: string) => Promise<void>,
 	) {
 		this.tui = tui;
 		this.theme = theme;
 		this.paths = paths;
-		this.runId = runId;
+		this.service = service;
+		this.itemKey = itemKey;
 		this.close = close;
 		this.approveCanary = approveCanary;
-		this.mode = runId ? "run" : "tasks";
+		this.mode = itemKey ? "run" : "tasks";
 		void this.refresh();
 		this.timer = setInterval(() => void this.refresh(), 250);
 		this.timer.unref?.();
@@ -214,30 +220,42 @@ export class EvolutionProcessInspector implements Component {
 
 	private async refresh(): Promise<void> {
 		try {
-			this.runs = await listEvolutionRuns(this.paths);
-			this.taskIndex = Math.min(this.taskIndex, Math.max(0, this.runs.length - 1));
-			if (this.mode === "run" && this.runId) {
-				this.run = await readEvolutionRun(this.paths, this.runId);
-				const directory = evolutionRunDirectory(this.paths, this.runId);
-				[
-					this.events,
-					this.artifacts.plan,
-					this.artifacts.experiment,
-					this.artifacts.validation,
-					this.artifacts.evaluation,
-					this.proposal,
-				] = await Promise.all([
-					readTranscript(this.paths, this.runId),
-					readOptional(join(directory, "plan.md")),
-					readOptional(join(directory, "experiment.json")),
-					readOptional(join(directory, "validation.md")),
-					readOptional(join(directory, "evaluation.md")),
-					this.run.proposalId ? loadProposal(this.paths, this.run.proposalId) : Promise.resolve(undefined),
-				]);
-				if (!this.artifacts.evaluation && this.proposal?.artifacts.review) {
-					this.artifacts.evaluation = await readOptional(
-						join(this.paths.proposals, this.proposal.id, this.proposal.artifacts.review.file),
-					);
+			this.items = await listEvoActivityItems(
+				{ paths: this.paths, service: this.service },
+				{ includeHistory: true, includeTrialComparison: false },
+			);
+			this.taskIndex = Math.min(this.taskIndex, Math.max(0, this.items.length - 1));
+			if (this.mode === "run" && this.itemKey) {
+				this.item = this.items.find((item) => item.key === this.itemKey);
+				if (!this.item) throw new Error("Evo item is no longer available");
+				if (this.item.kind === "proposal") {
+					this.run = undefined;
+					this.proposal = this.item.proposal;
+					this.events = [];
+					this.artifacts = {};
+				} else {
+					this.run = await readEvolutionRun(this.paths, this.item.run.id);
+					const directory = evolutionRunDirectory(this.paths, this.run.id);
+					[
+						this.events,
+						this.artifacts.plan,
+						this.artifacts.experiment,
+						this.artifacts.validation,
+						this.artifacts.evaluation,
+						this.proposal,
+					] = await Promise.all([
+						readTranscript(this.paths, this.run.id),
+						readOptional(join(directory, "plan.md")),
+						readOptional(join(directory, "experiment.json")),
+						readOptional(join(directory, "validation.md")),
+						readOptional(join(directory, "evaluation.md")),
+						this.run.proposalId ? loadProposal(this.paths, this.run.proposalId) : Promise.resolve(undefined),
+					]);
+					if (!this.artifacts.evaluation && this.proposal?.artifacts.review) {
+						this.artifacts.evaluation = await readOptional(
+							join(this.paths.proposals, this.proposal.id, this.proposal.artifacts.review.file),
+						);
+					}
 				}
 			}
 			this.tui.requestRender();
@@ -264,17 +282,15 @@ export class EvolutionProcessInspector implements Component {
 			"选择任务并按 Enter 查看实时进度：",
 			"",
 		];
-		if (this.runs.length === 0) lines.push(this.theme.fg("muted", "暂无任务"));
-		for (const [index, run] of this.runs.entries()) {
+		if (this.items.length === 0) lines.push(this.theme.fg("muted", "暂无事项"));
+		for (const [index, item] of this.items.entries()) {
 			const selected = index === this.taskIndex;
 			const marker = selected ? this.theme.fg("accent", "›") : " ";
-			const stateColor = TERMINAL_STATUSES.has(run.status)
-				? "muted"
-				: run.status === "paused"
-					? "warning"
-					: "success";
-			lines.push(`${marker} ${this.theme.fg(stateColor, phaseLabel(run.status))}  ${run.request ?? "定时演化"}`);
-			lines.push(`    ${this.theme.fg("dim", `${run.id} · ${elapsed(run.startedAt)}`)}`);
+			const terminal = item.kind === "run" && TERMINAL_STATUSES.has(item.run.status);
+			const paused = item.kind === "run" && item.run.status === "paused";
+			const stateColor = terminal ? "muted" : paused ? "warning" : "success";
+			lines.push(`${marker} ${this.theme.fg(stateColor, item.text)}`);
+			if (item.kind === "run") lines.push(`    ${this.theme.fg("dim", elapsed(item.run.startedAt))}`);
 		}
 		lines.push("", this.theme.fg("dim", "↑↓ 选择 • Enter 查看 • Esc 关闭"));
 		return lines;
@@ -300,12 +316,10 @@ export class EvolutionProcessInspector implements Component {
 		return [
 			this.theme.fg("accent", this.theme.bold("Evo Component Canary 审批")),
 			"",
+			`${this.theme.bold("Component")}  ${this.item?.component ?? "unknown"}`,
 			`${this.theme.bold("目标")}  ${run.request ?? "定时演化"}`,
-			`${this.theme.bold("提案")}  ${proposal?.id ?? run.proposalId ?? "unknown"} · revision ${proposal?.revision ?? "?"}`,
-			`${this.theme.bold("当前 bundle")}  ${run.canaryParentDigest ?? "unknown"}`,
-			`${this.theme.bold("候选 bundle")}  ${run.canaryCandidateDigest ?? "unknown"}`,
+			`${this.theme.bold("Revision")}  ${proposal?.revision ?? "?"}`,
 			`${this.theme.bold("ABI")}  ${run.canaryTargetAbi ?? "unknown"}`,
-			`${this.theme.bold("Diff digest")}  ${proposal?.diffDigest ?? "unknown"}`,
 			`${this.theme.bold("Changed paths")}  ${proposal?.changedPaths.join(", ") || "unknown"}`,
 			"",
 			this.theme.fg("warning", this.theme.bold("风险")),
@@ -313,7 +327,7 @@ export class EvolutionProcessInspector implements Component {
 			"",
 			this.theme.bold("Canary 与回滚计划"),
 			proposal?.trialPlan ?? "unknown",
-			`回滚将恢复 parent bundle：${run.canaryParentDigest ?? "unknown"}`,
+			"回滚将恢复 Canary 启动前的 stable bundle。",
 			"",
 			this.theme.bold("可执行验证"),
 			...validation.split("\n"),
@@ -335,7 +349,35 @@ export class EvolutionProcessInspector implements Component {
 		];
 	}
 
+	private proposalLines(proposal: Proposal): string[] {
+		return [
+			this.theme.fg("accent", this.theme.bold("Evo Proposal")),
+			"",
+			...(this.item?.component ? [`${this.theme.bold("Component")}  ${this.item.component}`] : []),
+			`${this.theme.bold("状态")}  ${proposal.status}`,
+			`${this.theme.bold("风险等级")}  ${proposal.tier}/${proposal.kind}`,
+			"",
+			this.theme.bold("目标"),
+			proposal.motivation,
+			"",
+			this.theme.bold("预期效果"),
+			proposal.expectedEffect,
+			"",
+			this.theme.bold("风险"),
+			proposal.risk,
+			"",
+			this.theme.bold("验证计划"),
+			proposal.verifyPlan,
+			"",
+			this.theme.bold("变更"),
+			...proposal.diff.split("\n"),
+			"",
+			this.theme.fg("dim", "↑↓ 滚动 • Home/End 跳转 • Esc 返回事项列表"),
+		];
+	}
+
 	private runLines(): string[] {
+		if (this.item?.kind === "proposal") return this.proposalLines(this.item.proposal);
 		const run = this.run;
 		if (!run) return [this.theme.fg("warning", "正在连接后台任务……")];
 		if (run.status === "awaiting-canary-approval") return this.canaryLines(run);
@@ -350,8 +392,9 @@ export class EvolutionProcessInspector implements Component {
 		const lines = [
 			this.theme.fg("accent", this.theme.bold("Evo 工作流进度")),
 			"",
+			...(this.item?.component ? [`${this.theme.bold("Component")}  ${this.item.component}`] : []),
 			`${this.theme.bold("目标")}  ${run.request ?? "定时演化"}`,
-			`${this.theme.bold("状态")}  ${phaseLabel(run.status)} · ${elapsed(run.startedAt)} · PID ${run.workerPid ?? "已退出"}`,
+			`${this.theme.bold("状态")}  ${phaseLabel(run.status)} · ${elapsed(run.startedAt)}`,
 			"",
 			stageProgress(this.theme, run.status),
 			"",
@@ -405,7 +448,7 @@ export class EvolutionProcessInspector implements Component {
 					this.theme.fg("success", "  ✓ 冻结实验"),
 					...this.artifacts.experiment.split("\n").map((line) => `    ${line}`),
 				);
-			if (run.proposalId) lines.push(this.theme.fg("success", `  ✓ 候选提案 ${run.proposalId}`));
+			if (run.proposalId) lines.push(this.theme.fg("success", "  ✓ 候选提案"));
 			if (this.artifacts.evaluation)
 				lines.push(
 					this.theme.fg("success", "  ✓ 评估报告"),
@@ -434,7 +477,8 @@ export class EvolutionProcessInspector implements Component {
 		if (matchesKey(data, Key.escape) || data === "q") {
 			if (this.mode === "run") {
 				this.mode = "tasks";
-				this.runId = undefined;
+				this.itemKey = undefined;
+				this.item = undefined;
 				this.scrollFromBottom = 0;
 			} else this.close();
 			this.tui.requestRender();
@@ -442,12 +486,13 @@ export class EvolutionProcessInspector implements Component {
 		}
 		if (this.mode === "tasks") {
 			if (matchesKey(data, Key.up)) this.taskIndex = Math.max(0, this.taskIndex - 1);
-			else if (matchesKey(data, Key.down)) this.taskIndex = Math.min(this.runs.length - 1, this.taskIndex + 1);
+			else if (matchesKey(data, Key.down)) this.taskIndex = Math.min(this.items.length - 1, this.taskIndex + 1);
 			else if (matchesKey(data, Key.enter)) {
-				const selected = this.runs[this.taskIndex];
+				const selected = this.items[this.taskIndex];
 				if (selected) {
-					this.runId = selected.id;
-					this.run = selected;
+					this.itemKey = selected.key;
+					this.item = selected;
+					this.run = selected.kind === "run" ? selected.run : undefined;
 					this.mode = "run";
 					this.sectionIndex = 0;
 					this.expandedSection = undefined;
@@ -456,6 +501,14 @@ export class EvolutionProcessInspector implements Component {
 				}
 			}
 		} else {
+			if (this.item?.kind === "proposal") {
+				if (matchesKey(data, Key.up)) this.scrollFromBottom++;
+				else if (matchesKey(data, Key.down)) this.scrollFromBottom = Math.max(0, this.scrollFromBottom - 1);
+				else if (matchesKey(data, Key.home)) this.scrollFromBottom = Number.MAX_SAFE_INTEGER;
+				else if (matchesKey(data, Key.end)) this.scrollFromBottom = 0;
+				this.tui.requestRender();
+				return;
+			}
 			if (this.run?.status === "awaiting-canary-approval") {
 				if (matchesKey(data, Key.up)) this.scrollFromBottom++;
 				else if (matchesKey(data, Key.down)) this.scrollFromBottom = Math.max(0, this.scrollFromBottom - 1);

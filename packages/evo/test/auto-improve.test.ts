@@ -40,7 +40,8 @@ function createHarness(cwd: string) {
 		},
 		ui: {
 			notify: (message: string, type?: string) => notifications.push({ message, type }),
-			setStatus: (key: string, text: string | undefined) => statuses.push({ key, text }),
+			setStatus: (key: string, text: string | undefined) => void statuses.push({ key, text }),
+			setStatusItems: () => {},
 		},
 	} as unknown as ExtensionCommandContext;
 

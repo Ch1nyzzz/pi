@@ -15,6 +15,7 @@ import {
 import { EvolutionProcessInspector } from "../src/evolve/inspect-ui.ts";
 import { createEvolutionRun, evolutionRunDirectory, readEvolutionRun, updateEvolutionRun } from "../src/evolve/run.ts";
 import { getEvoPaths } from "../src/paths.ts";
+import { EvoService } from "../src/service.ts";
 
 const roots: string[] = [];
 const children: ChildProcess[] = [];
@@ -123,7 +124,8 @@ describe("background evolution tasks", () => {
 			tui as never,
 			theme as never,
 			paths,
-			run.id,
+			new EvoService(paths),
+			`run:${run.id}`,
 			() => {},
 			async () => {},
 		);
@@ -144,7 +146,8 @@ describe("background evolution tasks", () => {
 			tui as never,
 			theme as never,
 			paths,
-			run.id,
+			new EvoService(paths),
+			`run:${run.id}`,
 			() => {},
 			async (runId) => {
 				approvedRun = runId;

@@ -18,6 +18,7 @@ import { publishEvoComponentArtifact } from "../src/components/artifact.ts";
 import { EvoCapabilityBroker, type EvoCapabilityGrant } from "../src/components/capabilities/broker.ts";
 import type { EvoCapabilityService } from "../src/components/capabilities/service.ts";
 import { EvoMemoryStore } from "../src/components/memory/store.ts";
+import { composeDeepReviewEntrypoint } from "../src/pack/templates/deep-review.ts";
 import { type EvoPaths, getEvoPaths } from "../src/paths.ts";
 import { BundleRegistry } from "../src/registry/registry.ts";
 import { sha256, withFileLock } from "../src/storage.ts";
@@ -1038,6 +1039,76 @@ describe("S3/S4 runtime integration", () => {
 		expect(collision.notifications).toEqual([
 			expect.stringContaining("Evo workflow trigger conflicts with an existing command: /deep-review"),
 		]);
+	});
+
+	it("runs the composed /deep-review template end to end with host defaults", async () => {
+		const { paths } = await temporaryRoot("pi-evo-deep-review-e2e-");
+		const faux = registerFauxProvider();
+		cleanups.push(faux.unregister);
+		faux.setResponses([
+			fauxAssistantMessage('{"files":["src/alpha.ts"]}'),
+			fauxAssistantMessage('{"findings":[{"summary":"off-by-one in loop","severity":"high"}]}'),
+			fauxAssistantMessage('{"confirmed":true,"reason":"loop skips last element"}'),
+		]);
+		const model = faux.getModel();
+		const modelRegistry: HarnessRegistry = {
+			getAll: () => [model],
+			find: (provider, id) => (provider === model.provider && id === model.id ? model : undefined),
+			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "faux-key" }),
+		};
+		const spawnGrant: EvoCapabilityGrant = {
+			capability: "spawn-agent",
+			maxCalls: 8,
+			models: [`${model.provider}/${model.id}`],
+			maxInputTokens: model.contextWindow * 4,
+			maxOutputTokens: 64 * 8,
+			maxTotalTokens: model.contextWindow * 4 + 64 * 8,
+			maxCostUsd: 5,
+			maxOutputTokensPerCall: 64,
+			tools: [],
+		};
+		const selection = await publishSelection(paths, {
+			id: "deep-review",
+			abi: "workflow/v1",
+			boundary: "invocation",
+			capabilities: ["spawn-agent"],
+			source: await composeDeepReviewEntrypoint(),
+			grants: [spawnGrant],
+		});
+		const workflows: EvoWorkflowSelection[] = [{ ...selection, trigger: "/deep-review" }];
+		const bundle = await compilePolicy(paths, { schemaVersion: 1, workflows }, null, "deep review template");
+		await new BundleRegistry(paths).initialize(bundle.digest);
+
+		const harness = createHarness(paths.root, { modelRegistry });
+		createPolicyRuntimeExtension({
+			root: paths.root,
+			componentSandbox: false,
+			spawnAgentMaxTurns: 1,
+		})(harness.api);
+		await harness.emit("session_start", { type: "session_start", reason: "startup" });
+		await harness.invokeCommand("deep-review", "recent changes");
+
+		expect(harness.sentMessages).toHaveLength(1);
+		expect(harness.sentMessages[0]).toMatchObject({
+			customType: "evo.workflow-result",
+			details: {
+				id: "deep-review",
+				trigger: "/deep-review",
+				result: {
+					scope: "recent changes",
+					findings: [
+						{
+							summary: "off-by-one in loop",
+							severity: "high",
+							file: "src/alpha.ts",
+							reason: "loop skips last element",
+						},
+					],
+				},
+			},
+		});
+		expect(faux.state.callCount).toBe(3);
+		await harness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
 	});
 
 	it("runs memory recall, encode, and consolidate across trial rollback, promotion, and stable rollback", async () => {

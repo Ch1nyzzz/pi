@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the workflow SDK: `composeWorkflowEntrypoint()` composes a dependency-free prelude into a workflow component entrypoint, giving authors `runWorkflow()`, `agent()` (with JSON-schema structured output and retry), barrier `parallel()`, streaming `pipeline()`, and `log()` over the JSONL-RPC protocol.
+- Added workflow host defaults: `workflow/v1` invokes now carry an optional `host` record (default model, granted tools, per-call output ceiling) derived from the spawn-agent grant, and workflow invokes get a dedicated 60-minute request timeout.
+- Added the bundled `/deep-review` workflow template and `writeDeepReviewPack()`: per-file reviewers plus adversarial verification, shipped as an importable integrity-signed pack.
+- Added a workflow dry-run validator: workflow/v1 candidates are launched against a stub capability broker and must speak the protocol cleanly end to end before release; a structured orchestration error passes, a protocol violation fails.
+- Added streaming session triage: every N completed sessions (config `triage.everyNSessions`, default 5) a minimum-cost model (`models.triage`, default `gpt-5.6-luna`) scans new session digests and files pre-classified improvement hypotheses into the inbox from the auto-improve tick.
+- Added dual-channel research: request-triggered runs plan exclusively for the requested direction, while scheduled runs consume the pre-triaged inbox hypotheses before fresh mining.
+- Added guardrail metrics: every pre-registered metric in a frozen experiment's `minimumEffect` now acts as a machine rollback trigger and auto-keep blocker, so a proposal cannot improve its primary metric while regressing another pre-registered one.
+- Added `grants.approval` config (default `auto`): pack import/install stages the derived capability grants without an interactive confirmation; set `prompt` to restore the confirmation gate.
+
+### Changed
+
+- Changed Evo activity into a dedicated final status line that names active Canary components, stays separate from provider quota status, and can be entered with Down from the end of a draft to open runs, trials, and proposals.
+- Raised default pack capability budgets (spawn-agent: 100 calls, 64-turn children, sized for parallel large-context reservations) and expanded the `workflow/v1` capability ceiling with `memory-read`/`memory-write` for persistent workflow state.
+- Spawned child agents now default to the host's real coding tools (`bash`, `edit`, `find`, `grep`, `ls`, `read`, `write`) and grant previews default their allowlist to the same set.
+
 ## [0.80.9] - 2026-07-16
 
 ### Added
@@ -41,4 +58,5 @@
 
 ### Fixed
 
+- Fixed background reflection treating the component capability audit journal as a Recorder session log.
 - Fixed managed-source replay reconstruction across Pi versions that add or remove the date line from the system prompt.

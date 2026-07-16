@@ -32,7 +32,7 @@ Then use Pi normally. The Recorder writes session evidence without making live o
 /evo permit <proposal-id>
 ```
 
-Pending proposals appear in the Pi status bar; startup never opens an approval dialog. In an idle interactive TUI, `Ctrl+Alt+E` applies the exact first pending T0 proposal without entering `/evo permit`. The same deterministic eligibility, revision, and artifact checks still run; non-T0 proposals require the normal review flow.
+Pending proposals and background work appear on a dedicated final Pi status line; startup never opens an approval dialog. Press Down at the end of a draft to enter those status items, then use the configured selection keys and Enter to open the selected run, proposal, or Canary directly. Canary entries show the selected component name rather than internal run, proposal, or bundle IDs. `/evo inspect` opens the same unified activity list. In an idle interactive TUI, `Ctrl+Alt+E` applies the exact first pending T0 proposal without entering `/evo permit`. The same deterministic eligibility, revision, and artifact checks still run; non-T0 proposals require the normal review flow.
 
 ## Commands
 
@@ -43,7 +43,7 @@ Pending proposals appear in the Pi status bar; startup never opens an approval d
 | `/evo status` | `evo-pi-admin status` | Show the stable digest, active trial, pending/deferred counts, and pause state. |
 | `/evo report` | `evo-pi-admin report` | Generate a read-only evidence report covering the window since the last successful improve. |
 | `/evo go [request]` | `evo-pi-admin go [request]` | Start a detached headless ResearchPlanner → Builder → Evaluator task and return immediately. |
-| `/evo inspect [run-id]` | `evo-pi-admin inspect [run-id]` | Open the workflow task picker and a human-readable live dashboard; select Thinking, Tool calls, or Phase results and press Enter to expand. The local CLI prints a snapshot. |
+| `/evo inspect [run-id]` | `evo-pi-admin inspect [run-id]` | Open the unified Evo activity picker for runs, Canary trials, proposals, and recent history. Select an item with the arrow keys and press Enter for its live details. The local CLI prints a run snapshot. |
 | `/evo pause <run-id>` | `evo-pi-admin pause <run-id>` | Suspend a live task without deleting its process or artifacts. |
 | `/evo resume <run-id>` | `evo-pi-admin resume <run-id>` | Continue a suspended task. |
 | `/evo delete <run-id>` | `evo-pi-admin delete <run-id>` | Stop a live worker and permanently delete the task directory. |

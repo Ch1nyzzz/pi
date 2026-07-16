@@ -14,12 +14,19 @@ const DEFAULT_EVO_CONTROL_CONFIG: Readonly<EvoControlConfig> = {
 		researchPlanner: { model: "openai-codex/gpt-5.6-sol", thinkingLevel: "max" },
 		builder: { model: "openai-codex/gpt-5.6-terra", thinkingLevel: "max" },
 		evaluator: { model: "openai-codex/gpt-5.6-terra", thinkingLevel: "xhigh" },
+		triage: { model: "openai-codex/gpt-5.6-luna", thinkingLevel: "low" },
 	},
 	release: {
 		autoApplyT0: true,
 		autoStartDataTrial: true,
 		autoStartComponentTrial: true,
 		autoKeepSuccessfulTrial: true,
+	},
+	grants: {
+		approval: "auto",
+	},
+	triage: {
+		everyNSessions: 5,
 	},
 };
 
@@ -52,10 +59,10 @@ function parseRole(value: unknown, label: string): EvoRoleModelConfig {
 
 function parseEvoControlConfig(value: unknown): EvoControlConfig {
 	const config = asRecord(value, "Evo control config");
-	exactKeys(config, ["schemaVersion", "models", "release"], "Evo control config");
+	exactKeys(config, ["schemaVersion", "models", "release", "grants", "triage"], "Evo control config");
 	if (config.schemaVersion !== 1) throw new Error("Evo control config schemaVersion must be 1");
 	const models = asRecord(config.models, "Evo control config.models");
-	exactKeys(models, ["researchPlanner", "builder", "evaluator"], "Evo control config.models");
+	exactKeys(models, ["researchPlanner", "builder", "evaluator", "triage"], "Evo control config.models");
 	const release = asRecord(config.release, "Evo control config.release");
 	exactKeys(
 		release,
@@ -70,18 +77,46 @@ function parseEvoControlConfig(value: unknown): EvoControlConfig {
 	] as const) {
 		if (typeof release[key] !== "boolean") throw new Error(`Evo control config.release.${key} must be boolean`);
 	}
+	let grantApproval: "auto" | "prompt" = "auto";
+	if (config.grants !== undefined) {
+		const grants = asRecord(config.grants, "Evo control config.grants");
+		exactKeys(grants, ["approval"], "Evo control config.grants");
+		if (grants.approval !== "auto" && grants.approval !== "prompt") {
+			throw new Error("Evo control config.grants.approval must be 'auto' or 'prompt'");
+		}
+		grantApproval = grants.approval;
+	}
+	let triageEveryNSessions = DEFAULT_EVO_CONTROL_CONFIG.triage.everyNSessions;
+	if (config.triage !== undefined) {
+		const triage = asRecord(config.triage, "Evo control config.triage");
+		exactKeys(triage, ["everyNSessions"], "Evo control config.triage");
+		if (!Number.isSafeInteger(triage.everyNSessions) || (triage.everyNSessions as number) < 1) {
+			throw new Error("Evo control config.triage.everyNSessions must be a positive integer");
+		}
+		triageEveryNSessions = triage.everyNSessions as number;
+	}
 	return {
 		schemaVersion: 1,
 		models: {
 			researchPlanner: parseRole(models.researchPlanner, "Evo control config.models.researchPlanner"),
 			builder: parseRole(models.builder, "Evo control config.models.builder"),
 			evaluator: parseRole(models.evaluator, "Evo control config.models.evaluator"),
+			triage:
+				models.triage === undefined
+					? DEFAULT_EVO_CONTROL_CONFIG.models.triage
+					: parseRole(models.triage, "Evo control config.models.triage"),
 		},
 		release: {
 			autoApplyT0: release.autoApplyT0 as boolean,
 			autoStartDataTrial: release.autoStartDataTrial as boolean,
 			autoStartComponentTrial: release.autoStartComponentTrial as boolean,
 			autoKeepSuccessfulTrial: release.autoKeepSuccessfulTrial as boolean,
+		},
+		grants: {
+			approval: grantApproval,
+		},
+		triage: {
+			everyNSessions: triageEveryNSessions,
 		},
 	};
 }

@@ -209,12 +209,19 @@ const config: EvoControlConfig = {
 		researchPlanner: { model: "fake/research" },
 		builder: { model: "fake/builder" },
 		evaluator: { model: "fake/evaluator" },
+		triage: { model: "fake/luna" },
 	},
 	release: {
 		autoApplyT0: false,
 		autoStartDataTrial: false,
 		autoStartComponentTrial: false,
 		autoKeepSuccessfulTrial: false,
+	},
+	grants: {
+		approval: "auto",
+	},
+	triage: {
+		everyNSessions: 5,
 	},
 };
 

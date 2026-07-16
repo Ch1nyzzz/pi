@@ -60,6 +60,8 @@ Personal evolution state is persisted locally and Evo-Pi has no hosted synchroni
 /evo rollback
 ```
 
+In the interactive TUI, a dedicated final status line names the active Canary component. Press Down at the end of a draft to enter Evo activity, then use the configured selection keys and Enter to open the selected run, trial, or proposal; internal IDs are not shown. `/evo inspect` opens the same activity list.
+
 Use `evo-pi-admin <command>` for non-interactive administration or external scheduling. See [`../evo/README.md`](../evo/README.md) in the source repository for the complete command and architecture reference.
 
 ## License

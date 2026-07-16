@@ -2,6 +2,7 @@ import { type ExecFileException, execFile, spawnSync } from "child_process";
 import { existsSync, type FSWatcher, readFileSync, type Stats, statSync, unwatchFile, watchFile } from "fs";
 import { dirname, join, resolve } from "path";
 import { closeWatcher, FS_WATCH_RETRY_DELAY_MS, watchWithErrorHandler } from "../utils/fs-watch.ts";
+import type { ExtensionStatusItem, InteractiveExtensionStatusView } from "./extension-status.ts";
 
 type GitPaths = {
 	repoDir: string;
@@ -101,6 +102,9 @@ export class FooterDataProvider {
 	private static readonly WATCH_DEBOUNCE_MS = 500;
 
 	private extensionStatuses = new Map<string, string>();
+	private interactiveExtensionStatuses = new Map<string, readonly ExtensionStatusItem[]>();
+	private interactiveSelection: { key: string; itemId: string } | undefined;
+	private interactiveNavigationActive = false;
 	private cachedBranch: string | null | undefined = undefined;
 	private gitPaths: GitPaths | null | undefined = undefined;
 	private headWatcher: FSWatcher | null = null;
@@ -136,6 +140,46 @@ export class FooterDataProvider {
 		return this.extensionStatuses;
 	}
 
+	getInteractiveExtensionStatus(): InteractiveExtensionStatusView | undefined {
+		const items = this.flattenInteractiveStatuses();
+		if (items.length === 0) return undefined;
+		const selectedIndex = this.interactiveNavigationActive
+			? items.findIndex(
+					(entry) =>
+						entry.key === this.interactiveSelection?.key && entry.item.id === this.interactiveSelection.itemId,
+				)
+			: 0;
+		const index = selectedIndex >= 0 ? selectedIndex : 0;
+		return { item: items[index]!.item, index, total: items.length, navigating: this.interactiveNavigationActive };
+	}
+
+	moveInteractiveExtensionStatusSelection(delta: -1 | 1): boolean {
+		const items = this.flattenInteractiveStatuses();
+		if (items.length === 0) return false;
+		let index = items.findIndex(
+			(entry) => entry.key === this.interactiveSelection?.key && entry.item.id === this.interactiveSelection.itemId,
+		);
+		if (!this.interactiveNavigationActive || index < 0) index = delta === 1 ? 0 : items.length - 1;
+		else index = (index + delta + items.length) % items.length;
+		const selected = items[index]!;
+		this.interactiveSelection = { key: selected.key, itemId: selected.item.id };
+		this.interactiveNavigationActive = true;
+		return true;
+	}
+
+	activateInteractiveExtensionStatus(): ExtensionStatusItem["onSelect"] | undefined {
+		if (!this.interactiveNavigationActive) return undefined;
+		const selected = this.getInteractiveExtensionStatus()?.item;
+		this.interactiveNavigationActive = false;
+		return selected?.onSelect;
+	}
+
+	cancelInteractiveExtensionStatusNavigation(): boolean {
+		if (!this.interactiveNavigationActive) return false;
+		this.interactiveNavigationActive = false;
+		return true;
+	}
+
 	/** Subscribe to git branch changes. Returns unsubscribe function. */
 	onBranchChange(callback: () => void): () => void {
 		this.branchChangeCallbacks.add(callback);
@@ -147,13 +191,39 @@ export class FooterDataProvider {
 		if (text === undefined) {
 			this.extensionStatuses.delete(key);
 		} else {
+			this.interactiveExtensionStatuses.delete(key);
 			this.extensionStatuses.set(key, text);
+		}
+	}
+
+	setInteractiveExtensionStatus(key: string, items: readonly ExtensionStatusItem[] | undefined): void {
+		if (!items || items.length === 0) {
+			this.interactiveExtensionStatuses.delete(key);
+		} else {
+			this.extensionStatuses.delete(key);
+			this.interactiveExtensionStatuses.set(key, items);
+		}
+		if (
+			this.interactiveSelection?.key === key &&
+			!items?.some((item) => item.id === this.interactiveSelection?.itemId)
+		) {
+			this.interactiveSelection = undefined;
+			this.interactiveNavigationActive = false;
 		}
 	}
 
 	/** Internal: clear extension statuses */
 	clearExtensionStatuses(): void {
 		this.extensionStatuses.clear();
+		this.interactiveExtensionStatuses.clear();
+		this.interactiveSelection = undefined;
+		this.interactiveNavigationActive = false;
+	}
+
+	private flattenInteractiveStatuses(): Array<{ key: string; item: ExtensionStatusItem }> {
+		return Array.from(this.interactiveExtensionStatuses.entries())
+			.sort(([left], [right]) => left.localeCompare(right))
+			.flatMap(([key, items]) => items.map((item) => ({ key, item })));
 	}
 
 	/** Number of unique providers with available models (for footer display) */
@@ -384,5 +454,9 @@ export class FooterDataProvider {
 /** Read-only view for extensions - excludes setExtensionStatus, setAvailableProviderCount and dispose */
 export type ReadonlyFooterDataProvider = Pick<
 	FooterDataProvider,
-	"getGitBranch" | "getExtensionStatuses" | "getAvailableProviderCount" | "onBranchChange"
+	| "getGitBranch"
+	| "getExtensionStatuses"
+	| "getInteractiveExtensionStatus"
+	| "getAvailableProviderCount"
+	| "onBranchChange"
 >;

@@ -17,6 +17,7 @@ function createUiContext(
 		notify: onNotify,
 		onTerminalInput: () => () => {},
 		setStatus: () => {},
+		setStatusItems: () => {},
 		setWorkingMessage: () => {},
 		setWorkingVisible: () => {},
 		setWorkingIndicator: () => {},

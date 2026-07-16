@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added interactive extension status items on a dedicated final status line that users can enter with Down from the end of a draft and open directly without clearing their input.
+
 ## [0.80.9] - 2026-07-16
 
 ### New Features

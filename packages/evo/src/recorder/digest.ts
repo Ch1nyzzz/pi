@@ -7,6 +7,8 @@ import type { UsageSummary } from "../types.ts";
 import type { RecordedEvent } from "./schema.ts";
 import { readSessionLog } from "./store.ts";
 
+const NON_SESSION_LOG_NAMES = new Set(["capability-audit.jsonl"]);
+
 export interface SessionDigestMetrics {
 	tasks: number;
 	userMessages: number;
@@ -212,7 +214,7 @@ export async function listSessionDigests(paths: EvoPaths): Promise<SessionDigest
 	const entries = await readdir(paths.log, { withFileTypes: true });
 	const digests: SessionDigest[] = [];
 	for (const entry of entries
-		.filter((item) => item.isFile() && item.name.endsWith(".jsonl"))
+		.filter((item) => item.isFile() && item.name.endsWith(".jsonl") && !NON_SESSION_LOG_NAMES.has(item.name))
 		.sort((a, b) => a.name.localeCompare(b.name))) {
 		const sessionId = entry.name.slice(0, -".jsonl".length);
 		const stored = await readSessionDigest(paths, sessionId);

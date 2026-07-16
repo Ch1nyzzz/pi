@@ -399,11 +399,25 @@ export interface EvoControlConfig {
 		researchPlanner: EvoRoleModelConfig;
 		builder: EvoRoleModelConfig;
 		evaluator: EvoRoleModelConfig;
+		/** Minimum-cost model that pre-triages session digests into inbox hypotheses. */
+		triage: EvoRoleModelConfig;
 	};
 	release: {
 		autoApplyT0: boolean;
 		autoStartDataTrial: boolean;
 		autoStartComponentTrial: boolean;
 		autoKeepSuccessfulTrial: boolean;
+	};
+	grants: {
+		/**
+		 * How pack capability grants are approved at import/install time.
+		 * "auto" stages the derived grants without prompting (the preview is
+		 * still shown); "prompt" requires interactive confirmation.
+		 */
+		approval: "auto" | "prompt";
+	};
+	triage: {
+		/** Run the streaming session triage after this many new complete sessions. */
+		everyNSessions: number;
 	};
 }

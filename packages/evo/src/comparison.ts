@@ -364,10 +364,45 @@ export interface TrialContractGate {
 	reasons: string[];
 }
 
+export interface ContractMetricRegression {
+	metric: TrialMetricName;
+	primary: boolean;
+	reason: string;
+}
+
 /**
- * Deterministic keep-gate: sufficiency must hold and the primary metric must have
- * improved by at least the frozen minimum effect. Model recommendations can veto a
- * keep but can never substitute for this gate.
+ * Every frozen-contract metric regression: the primary metric plus each other
+ * pre-registered metric in minimumEffect acts as a guardrail. A regression at
+ * least as large as a metric's frozen minimum effect fires, so a proposal that
+ * improves its primary metric while tanking a guardrail still gets caught.
+ */
+export function contractMetricRegressions(
+	contract: TrialContract | undefined,
+	comparison: TrialComparison,
+): ContractMetricRegression[] {
+	if (!contract) return [];
+	const regressions: ContractMetricRegression[] = [];
+	for (const [metric, threshold] of Object.entries(contract.minimumEffect)) {
+		if (!isTrialMetricName(metric) || !threshold || threshold <= 0) continue;
+		const delta = comparison.delta[metric];
+		if (delta === null) continue;
+		if (improvement(metric, delta) <= -threshold) {
+			const primary = metric === contract.primaryMetric;
+			regressions.push({
+				metric,
+				primary,
+				reason: `${primary ? "primary" : "guardrail"} metric ${metric} regressed by ${(-improvement(metric, delta)).toFixed(4)} (frozen minimum effect ${threshold})`,
+			});
+		}
+	}
+	return regressions;
+}
+
+/**
+ * Deterministic keep-gate: sufficiency must hold, the primary metric must have
+ * improved by at least the frozen minimum effect, and no pre-registered
+ * guardrail metric may have regressed beyond its own frozen effect size. Model
+ * recommendations can veto a keep but can never substitute for this gate.
  */
 export function evaluateTrialContractGate(
 	contract: TrialContract | undefined,
@@ -388,6 +423,9 @@ export function evaluateTrialContractGate(
 				`primary metric ${primary} improved by ${improvement(primary, delta).toFixed(4)}, below the frozen minimum effect ${threshold}`,
 			);
 		}
+	}
+	for (const regression of contractMetricRegressions(contract, comparison)) {
+		if (!regression.primary) reasons.push(regression.reason);
 	}
 	return { allowed: reasons.length === 0, reasons };
 }

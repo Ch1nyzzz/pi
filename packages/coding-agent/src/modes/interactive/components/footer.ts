@@ -4,6 +4,7 @@ import type { AgentSession } from "../../../core/agent-session.ts";
 import { areExperimentalFeaturesEnabled } from "../../../core/experimental.ts";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.ts";
 import { theme } from "../theme/theme.ts";
+import { keyText } from "./keybinding-hints.ts";
 
 /**
  * Sanitize text for display in a single-line status.
@@ -229,14 +230,24 @@ export class FooterComponent implements Component {
 		const pwdLine = truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "..."));
 		const lines = [pwdLine, dimStatsLeft + dimRemainder];
 
-		// Add extension statuses on a single line, sorted by key alphabetically
-		const extensionStatuses = this.footerData.getExtensionStatuses();
-		if (extensionStatuses.size > 0) {
-			const sortedStatuses = Array.from(extensionStatuses.entries())
-				.sort(([a], [b]) => a.localeCompare(b))
-				.map(([, text]) => sanitizeStatusText(text));
-			const statusLine = sortedStatuses.join(" ");
-			// Truncate to terminal width with dim ellipsis for consistency with footer style
+		// Keep passive extension statuses together, but reserve the final line for
+		// interactive activity so it remains visually distinct and navigable.
+		const extensionStatuses = Array.from(this.footerData.getExtensionStatuses().entries())
+			.sort(([a], [b]) => a.localeCompare(b))
+			.map(([, text]) => sanitizeStatusText(text));
+		if (extensionStatuses.length > 0) {
+			lines.push(truncateToWidth(extensionStatuses.join(" "), width, theme.fg("dim", "...")));
+		}
+
+		const interactiveStatus = this.footerData.getInteractiveExtensionStatus();
+		if (interactiveStatus) {
+			const marker = interactiveStatus.navigating ? theme.fg("accent", "› ") : "";
+			const position =
+				interactiveStatus.total > 1 ? ` ${interactiveStatus.index + 1}/${interactiveStatus.total}` : "";
+			const hint = interactiveStatus.navigating
+				? ` · ${keyText("tui.select.confirm")} open · ${keyText("tui.select.cancel")} cancel`
+				: ` · ${keyText("tui.select.down")} browse`;
+			const statusLine = `${marker}${sanitizeStatusText(interactiveStatus.item.text)}${position}${hint}`;
 			lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
 		}
 

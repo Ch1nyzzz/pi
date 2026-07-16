@@ -2,13 +2,14 @@ import type { ExtensionFactory } from "@ch1nyzzz/pi-coding-agent";
 import { refreshEvoStatusIndicator } from "./cli.ts";
 import {
 	buildTrialComparison,
+	contractMetricRegressions,
 	evaluateTrialContractGate,
 	parseTrialDurationDays,
-	primaryMetricRegression,
 } from "./comparison.ts";
 import { readEvoControlConfig } from "./evolve/config.ts";
 import { runEvolutionCycle } from "./evolve/cycle.ts";
 import { readFrozenExperimentForProposal } from "./evolve/run.ts";
+import { runSessionTriage } from "./evolve/triage.ts";
 import { type EvoPaths, getEvoPaths } from "./paths.ts";
 import { createPiModelRunner, type ModelRunner } from "./reflect/model-runner.ts";
 import { runRetrospective, type TrialRecommendation } from "./reflect/retrospective.ts";
@@ -106,6 +107,30 @@ export function createEvoAutoImproveExtension(options: EvoAutoImproveExtensionOp
 					if (stopped || !ctx.isIdle()) return;
 					const status = await service.status();
 					if (!status.initialized) return;
+					// Streaming triage is cheap and cursor-gated: it no-ops until
+					// enough new sessions accumulate, and never blocks the tick.
+					try {
+						const config = await readEvoControlConfig(paths);
+						const triage = await runSessionTriage({
+							paths,
+							runner,
+							model: options.model ?? config.models.triage.model,
+							...(config.models.triage.thinkingLevel
+								? { thinkingLevel: config.models.triage.thinkingLevel }
+								: {}),
+							everyNSessions: config.triage.everyNSessions,
+							...(options.cwd ? { cwd: options.cwd } : {}),
+							...(options.agentDir ? { agentDir: options.agentDir } : {}),
+						});
+						if (triage.ran && triage.hypotheses.length > 0) {
+							ctx.ui.notify(
+								`Evo-Pi triage filed ${triage.hypotheses.length} improvement hypothesis(es) from ${triage.newSessions} new session(s)`,
+								"info",
+							);
+						}
+					} catch {
+						// Triage is best-effort; a missing triage model must not stall trials or improves.
+					}
 					if (status.trial) {
 						const proposal = await service.getProposal(status.trial.proposalId);
 						const schedule = await readScheduleConfig(paths);
@@ -129,9 +154,11 @@ export function createEvoAutoImproveExtension(options: EvoAutoImproveExtensionOp
 							notifiedFailure = false;
 							const config = await readEvoControlConfig(paths);
 							// Machine rollback trigger: a measured regression of the frozen
-							// primary metric outranks any model recommendation.
-							const regression = primaryMetricRegression(experiment, comparison);
-							if (regression) {
+							// primary metric or any pre-registered guardrail metric outranks
+							// any model recommendation.
+							const regressions = contractMetricRegressions(experiment, comparison);
+							if (regressions.length > 0) {
+								const regression = regressions.map((entry) => entry.reason).join("; ");
 								await service.rollback(undefined, `Automatic rollback: ${regression}`);
 								ctx.ui.notify(
 									`Evo-Pi automatically rolled back trial ${result.proposal.id}: ${regression}`,

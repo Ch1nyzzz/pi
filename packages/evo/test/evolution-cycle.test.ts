@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { compileBundle } from "../src/bundle/compile.ts";
 import { approveCanaryRun } from "../src/cli.ts";
+import { listEvoActivityItems } from "../src/evolve/activity.ts";
 import { runEvolutionCycle } from "../src/evolve/cycle.ts";
 import { EvolutionProcessInspector } from "../src/evolve/inspect-ui.ts";
 import { applyEvolutionReleasePolicy } from "../src/evolve/release.ts";
@@ -68,12 +69,19 @@ const config: EvoControlConfig = {
 		researchPlanner: { model: "fake/sol-ultra" },
 		builder: { model: "fake/terra-max" },
 		evaluator: { model: "fake/terra", thinkingLevel: "xhigh" },
+		triage: { model: "fake/luna" },
 	},
 	release: {
 		autoApplyT0: false,
 		autoStartDataTrial: false,
 		autoStartComponentTrial: false,
 		autoKeepSuccessfulTrial: false,
+	},
+	grants: {
+		approval: "auto",
+	},
+	triage: {
+		everyNSessions: 5,
 	},
 };
 
@@ -357,6 +365,10 @@ lines.on("line", line => {
 			status: "pending",
 		});
 		expect(result.proposals[0].artifacts.replay).toBeUndefined();
+		const activity = await listEvoActivityItems({ paths: f.paths, service: f.service });
+		expect(activity[0]?.text).toBe("Evo: test-compaction · 等待 Canary 确认");
+		expect(activity[0]?.text).not.toContain(result.run.id);
+		expect(activity[0]?.text).not.toContain(result.proposals[0].id);
 		expect(runner.requests).toHaveLength(4);
 		expect(await f.service.registry.readTrial()).toBeUndefined();
 		const componentStrategy = JSON.parse(componentPlan).experiment.evidenceStrategy;
@@ -445,7 +457,8 @@ lines.on("line", line => {
 			tui as never,
 			theme as never,
 			f.paths,
-			retried.runId,
+			f.service,
+			`run:${retried.runId}`,
 			() => {},
 			async (runId) => {
 				reviewedRun = runId;
@@ -454,7 +467,8 @@ lines.on("line", line => {
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		const canaryCard = inspector.render(160).join("\n");
 		expect(canaryCard).toContain("Exact diff");
-		expect(canaryCard).toContain(retried.proposal.diffDigest);
+		expect(canaryCard).toContain("test-compaction");
+		expect(canaryCard).not.toContain(retried.proposal.id);
 		expect(canaryCard).toContain("按 Enter 同意以上精确候选");
 		inspector.handleInput("\r");
 		await new Promise((resolve) => setTimeout(resolve, 0));
@@ -539,6 +553,49 @@ lines.on("line", line => {
 		expect(result.proposals).toEqual([]);
 		expect(result.run.status).toBe("completed");
 		expect(runner.requests).toHaveLength(1);
+	});
+
+	it("feeds triage hypotheses to scheduled research and keeps request-channel runs narrow", async () => {
+		const scheduled = await fixture();
+		const scheduledStore = await createRecorderStore({ paths: scheduled.paths, sessionId: "triage-session" });
+		const scheduledNote = await scheduledStore.writeInbox(
+			"NOTE: triage hypothesis (reduce-tool-errors): bash verification keeps failing across recent sessions [evidence sessions: s1, s2]",
+			"extension",
+			"note",
+		);
+		await initializeInboxLifecycle(scheduled.paths, scheduledNote.fileName);
+		const scheduledRunner = new FakeRunner([{ submission: JSON.parse(planResponse("none")) }]);
+		await runEvolutionCycle({
+			paths: scheduled.paths,
+			service: scheduled.service,
+			runner: scheduledRunner,
+			cwd: scheduled.root,
+			config,
+		});
+		expect(scheduledRunner.requests[0]?.prompt).toContain("<triage_hypotheses>");
+		expect(scheduledRunner.requests[0]?.prompt).toContain("reduce-tool-errors");
+		expect(scheduledRunner.requests[0]?.prompt).not.toContain("request-channel run");
+
+		const requested = await fixture();
+		const requestedStore = await createRecorderStore({ paths: requested.paths, sessionId: "triage-session" });
+		const requestedNote = await requestedStore.writeInbox(
+			"NOTE: triage hypothesis (reduce-tool-errors): bash verification keeps failing across recent sessions",
+			"extension",
+			"note",
+		);
+		await initializeInboxLifecycle(requested.paths, requestedNote.fileName);
+		const requestedRunner = new FakeRunner([{ submission: JSON.parse(planResponse("none")) }]);
+		await runEvolutionCycle({
+			paths: requested.paths,
+			service: requested.service,
+			runner: requestedRunner,
+			cwd: requested.root,
+			config,
+			request: "reduce prompt caching misses",
+		});
+		expect(requestedRunner.requests[0]?.prompt).toContain("request-channel run");
+		expect(requestedRunner.requests[0]?.prompt).toContain("reduce prompt caching misses");
+		expect(requestedRunner.requests[0]?.prompt).not.toContain("<triage_hypotheses>");
 	});
 
 	it("classifies feature-shaped natural language as an open request rather than a durable preference", async () => {

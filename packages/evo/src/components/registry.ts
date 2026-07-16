@@ -1085,9 +1085,19 @@ export const MEMORY_V1_ABI: EvoAbiDefinition<MemoryV1Input, MemoryV1Output, Reco
 	},
 };
 
+export interface WorkflowV1Host {
+	/** Default provider/model route for spawned child agents. */
+	model?: string;
+	/** Tool names the spawn-agent grant allows. */
+	tools?: string[];
+	/** Per-call output token ceiling from the spawn-agent grant. */
+	maxOutputTokensPerCall?: number;
+}
+
 export interface WorkflowV1Input {
 	trigger: string;
 	args: Record<string, unknown>;
+	host?: WorkflowV1Host;
 }
 
 export interface WorkflowV1Output {
@@ -1098,15 +1108,26 @@ export const WORKFLOW_V1_ABI: EvoAbiDefinition<WorkflowV1Input, WorkflowV1Output
 	id: "workflow/v1",
 	surface: "workflow",
 	activationBoundary: "invocation",
-	capabilityCeiling: ["spawn-agent"],
+	capabilityCeiling: ["memory-read", "memory-write", "spawn-agent"],
 	validateConfig(value) {
 		return validateEmptyConfig(value, "workflow/v1 config");
 	},
 	validateInput(value) {
 		const input = asRecord(jsonValue(value, "workflow/v1 input"), "workflow/v1 input");
-		rejectUnknownKeys(input, ["trigger", "args"], "workflow/v1 input");
+		rejectUnknownKeys(input, ["trigger", "args", "host"], "workflow/v1 input");
 		requireNonEmptyString(input.trigger, "workflow/v1 input.trigger");
 		asRecord(input.args, "workflow/v1 input.args");
+		if (input.host !== undefined) {
+			const host = asRecord(input.host, "workflow/v1 input.host");
+			rejectUnknownKeys(host, ["model", "tools", "maxOutputTokensPerCall"], "workflow/v1 input.host");
+			if (host.model !== undefined) requireNonEmptyString(host.model, "workflow/v1 input.host.model");
+			if (host.tools !== undefined) requireStringArray(host.tools, "workflow/v1 input.host.tools");
+			if (host.maxOutputTokensPerCall !== undefined) {
+				if (!Number.isSafeInteger(host.maxOutputTokensPerCall) || (host.maxOutputTokensPerCall as number) <= 0) {
+					throw new Error("workflow/v1 input.host.maxOutputTokensPerCall must be a positive safe integer");
+				}
+			}
+		}
 		return input as unknown as WorkflowV1Input;
 	},
 	validateOutput(value) {

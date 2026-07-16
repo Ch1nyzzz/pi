@@ -3,10 +3,18 @@ import { join } from "node:path";
 import type { AgentTool, ThinkingLevel } from "@ch1nyzzz/pi-agent-core";
 import {
 	convertToLlm,
+	createBashToolDefinition,
+	createEditToolDefinition,
+	createFindToolDefinition,
+	createGrepToolDefinition,
+	createLsToolDefinition,
+	createReadToolDefinition,
+	createWriteToolDefinition,
 	type ExtensionContext,
 	type ExtensionFactory,
 	type SessionStartEvent,
 	serializeConversation,
+	type ToolDefinition,
 } from "@ch1nyzzz/pi-coding-agent";
 import { Type } from "typebox";
 import { type LoadedEvoComponentArtifact, validateEvoComponentSelection } from "../components/artifact.ts";
@@ -81,7 +89,54 @@ const BUNDLE_END = "<!-- evo-pi bundle end -->";
 const EVO_TOOL_PARAMETERS = Type.Record(Type.String(), Type.Unknown());
 const DEFAULT_SPAWN_AGENT_SYSTEM_PROMPT =
 	"You are an isolated child agent. Complete the requested task using only explicitly provided tools.";
-const DEFAULT_SPAWN_AGENT_MAX_TURNS = 8;
+const DEFAULT_SPAWN_AGENT_MAX_TURNS = 64;
+/**
+ * A workflow invoke spans an entire orchestration (potentially dozens of
+ * sequential child-agent rounds), so it gets a far larger request timeout
+ * than the single-transform invokes of the other ABIs.
+ */
+const WORKFLOW_INVOKE_TIMEOUT_MS = 60 * 60_000;
+
+/**
+ * Tool names offered to spawned child agents when the embedder does not supply
+ * its own trusted tool set. Grant previews default their spawn-agent allowlist
+ * to this same list so imported packs work against the default host.
+ */
+export const DEFAULT_SPAWN_AGENT_TOOL_NAMES: readonly string[] = [
+	"bash",
+	"edit",
+	"find",
+	"grep",
+	"ls",
+	"read",
+	"write",
+];
+
+/**
+ * The host's standard coding tools, rebuilt against the session cwd. The
+ * `agent` tool is deliberately excluded: spawned children must not recurse.
+ */
+function createDefaultSpawnAgentTools(cwd: string): AgentTool[] {
+	const definitions: ToolDefinition<any, any>[] = [
+		createBashToolDefinition(cwd),
+		createEditToolDefinition(cwd),
+		createFindToolDefinition(cwd),
+		createGrepToolDefinition(cwd),
+		createLsToolDefinition(cwd),
+		createReadToolDefinition(cwd),
+		createWriteToolDefinition(cwd),
+	];
+	return definitions.map((definition) => ({
+		name: definition.name,
+		label: definition.label,
+		description: definition.description,
+		parameters: definition.parameters,
+		prepareArguments: definition.prepareArguments,
+		executionMode: definition.executionMode,
+		execute: (toolCallId, params, signal, onUpdate) =>
+			definition.execute(toolCallId, params, signal, onUpdate, undefined as unknown as ExtensionContext),
+	}));
+}
 
 export type RuntimeBundleSectionPlacement = "stable" | "regular" | "memory" | "dynamic";
 
@@ -524,7 +579,7 @@ export function createPolicyRuntimeExtension(options: EvoPolicyRuntimeOptions = 
 				"spawn-agent": createSpawnAgentCapabilityService(
 					createModelRegistrySpawnAgentHost({
 						modelRegistry: ctx.modelRegistry,
-						tools: options.spawnAgentTools ?? [],
+						tools: options.spawnAgentTools ?? createDefaultSpawnAgentTools(ctx.cwd),
 						systemPrompt: options.spawnAgentSystemPrompt ?? DEFAULT_SPAWN_AGENT_SYSTEM_PROMPT,
 						maxTurns: options.spawnAgentMaxTurns ?? DEFAULT_SPAWN_AGENT_MAX_TURNS,
 					}),
@@ -544,7 +599,11 @@ export function createPolicyRuntimeExtension(options: EvoPolicyRuntimeOptions = 
 				artifact,
 				abi,
 				config,
-				processOptions: { ...sandboxOptions, capabilityBroker: scopedCapabilityBroker },
+				processOptions: {
+					...sandboxOptions,
+					capabilityBroker: scopedCapabilityBroker,
+					...(surface === "workflow" ? { requestTimeoutMs: WORKFLOW_INVOKE_TIMEOUT_MS } : {}),
+				},
 				...(componentMemory ? { memoryNamespace: componentMemory } : {}),
 			};
 		}
@@ -643,6 +702,15 @@ export function createPolicyRuntimeExtension(options: EvoPolicyRuntimeOptions = 
 			}
 			registeredEvoWorkflowCommands.add(command);
 			workflowComponents.set(selection.trigger, component);
+			const spawnGrant = (selection.grants ?? []).find((grant) => grant.capability === "spawn-agent");
+			const host =
+				spawnGrant && "models" in spawnGrant
+					? {
+							...(spawnGrant.models[0] ? { model: spawnGrant.models[0] } : {}),
+							tools: [...(spawnGrant.tools ?? [])],
+							maxOutputTokensPerCall: spawnGrant.maxOutputTokensPerCall,
+						}
+					: undefined;
 			pi.registerCommand(command, {
 				description: `Run sandboxed Evo workflow ${selection.id}`,
 				async handler(args) {
@@ -653,6 +721,7 @@ export function createPolicyRuntimeExtension(options: EvoPolicyRuntimeOptions = 
 					const output = await invokeTurnComponent(active, {
 						trigger: selection.trigger,
 						args: { text: args },
+						...(host ? { host } : {}),
 					});
 					pi.sendMessage(
 						{

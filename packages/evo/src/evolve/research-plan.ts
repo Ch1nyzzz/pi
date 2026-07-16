@@ -4,6 +4,7 @@ import { StringEnum } from "@ch1nyzzz/pi-ai";
 import { Type } from "typebox";
 import { isTrialMetricName, parseTrialDurationDays, TRIAL_METRIC_DIRECTIONS } from "../comparison.ts";
 import { createDefaultEvoAbiRegistry } from "../components/registry.ts";
+import { readInboxEntry } from "../inbox.ts";
 import type { EvoPaths } from "../paths.ts";
 import type { EvidenceCorpus } from "../reflect/evidence.ts";
 import type { ModelRunner, ModelRunRequest, ModelRunResult } from "../reflect/model-runner.ts";
@@ -378,15 +379,47 @@ export async function persistEvolutionResearchPlan(options: {
 	return { plan, state };
 }
 
+const TRIAGE_NOTE_PREFIX = "NOTE: triage hypothesis";
+const MAX_TRIAGE_HYPOTHESES_IN_PROMPT = 10;
+
+async function collectTriageHypotheses(paths: EvoPaths, inboxFiles: readonly string[]): Promise<string[]> {
+	const notes: string[] = [];
+	for (const file of inboxFiles) {
+		if (notes.length >= MAX_TRIAGE_HYPOTHESES_IN_PROMPT) break;
+		try {
+			const entry = await readInboxEntry(paths, file);
+			if (entry.kind === "note" && entry.text.startsWith(TRIAGE_NOTE_PREFIX)) {
+				notes.push(`- [inbox ${file}] ${entry.text}`);
+			}
+		} catch {
+			// Unreadable inbox entries are already surfaced through the corpus itself.
+		}
+	}
+	return notes;
+}
+
 export async function runEvolutionResearchPlan(
 	options: RunEvolutionResearchPlanOptions,
 ): Promise<EvolutionResearchPlanResult> {
 	const workflow = await readEvolutionWorkflow(options.paths);
+	// Request-channel runs stay narrow and fast; scheduled runs consume the
+	// pre-triaged hypotheses the streaming triage filed into the inbox.
+	const triageHypotheses = options.run.request
+		? []
+		: await collectTriageHypotheses(options.paths, options.corpus.inboxFiles);
 	const prompt = [
 		"Research one worthwhile improvement and freeze its experiment before implementation.",
 		options.run.request
-			? `The user supplied this priority request: ${options.run.request}`
+			? `The user supplied this priority request: ${options.run.request}\nThis is a request-channel run: research and plan exclusively for that direction, and do not survey the corpus for unrelated opportunities. When the evidence cannot support any candidate in the requested direction, return candidateKind none and explain why.`
 			: "No user request was supplied; select the best grounded opportunity yourself.",
+		...(triageHypotheses.length > 0
+			? [
+					"The streaming session triage pre-filed the following hypotheses from recent session telemetry. Treat them as prioritized starting points: verify each against the corpus evidence, prefer a confirmed hypothesis over fresh mining, and discard any the evidence does not support.",
+					"<triage_hypotheses>",
+					...triageHypotheses,
+					"</triage_hypotheses>",
+				]
+			: []),
 		"Deliver exactly one plan by calling the submit_research_plan tool with: topic, reason, planMarkdown, experiment { baseline, hypothesis, checkProfiles, evidenceStrategy, metrics, primaryMetric, minimumEffect, trialPlan, rollbackConditions }, targetAbi (optional), requiresNewAbi, candidateKind, builderInstructions, and inboxDecisions.",
 		`experiment.metrics must come from the measured set: ${Object.keys(TRIAL_METRIC_DIRECTIONS).join(", ")}. A plan declaring shadow or canary evidence must pre-register primaryMetric (one of its metrics) with a positive minimumEffect; keep and rollback are decided against that frozen threshold.`,
 		"Classify every supplied explicit inbox input in inboxDecisions as preference, request, note, or task-local. A preference instruction must be an exact user-authored substring. Feature requests are requests even when they contain words such as every or always. Do not classify the same file twice.",

@@ -87,6 +87,61 @@ async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void
 	}
 }
 
+describe("FooterDataProvider interactive extension statuses", () => {
+	it("cycles stable items and returns the selected action", () => {
+		const provider = new FooterDataProvider(process.cwd());
+		const selected: string[] = [];
+		try {
+			provider.setInteractiveExtensionStatus("evo", [
+				{ id: "canary", text: "Canary component", onSelect: () => void selected.push("canary") },
+				{ id: "pending", text: "Pending proposal", onSelect: () => void selected.push("pending") },
+			]);
+			expect(provider.getInteractiveExtensionStatus()).toMatchObject({
+				item: { id: "canary", text: "Canary component" },
+				index: 0,
+				total: 2,
+				navigating: false,
+			});
+
+			expect(provider.moveInteractiveExtensionStatusSelection(1)).toBe(true);
+			expect(provider.getInteractiveExtensionStatus()).toMatchObject({
+				item: { id: "canary" },
+				index: 0,
+				navigating: true,
+			});
+			provider.moveInteractiveExtensionStatusSelection(1);
+			expect(provider.getInteractiveExtensionStatus()).toMatchObject({ item: { id: "pending" }, index: 1 });
+			provider.activateInteractiveExtensionStatus()?.();
+			expect(selected).toEqual(["pending"]);
+			expect(provider.getInteractiveExtensionStatus()?.navigating).toBe(false);
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	it("preserves selection across status refreshes by item id", () => {
+		const provider = new FooterDataProvider(process.cwd());
+		try {
+			provider.setInteractiveExtensionStatus("evo", [
+				{ id: "one", text: "One", onSelect: () => {} },
+				{ id: "two", text: "Two", onSelect: () => {} },
+			]);
+			provider.moveInteractiveExtensionStatusSelection(-1);
+			provider.setInteractiveExtensionStatus("evo", [
+				{ id: "one", text: "One refreshed", onSelect: () => {} },
+				{ id: "two", text: "Two refreshed", onSelect: () => {} },
+			]);
+			expect(provider.getInteractiveExtensionStatus()).toMatchObject({
+				item: { id: "two", text: "Two refreshed" },
+				index: 1,
+				navigating: true,
+			});
+		} finally {
+			provider.dispose();
+		}
+	});
+});
+
 describe("FooterDataProvider reftable branch detection", () => {
 	let originalCwd: string;
 	let tempDir: string;

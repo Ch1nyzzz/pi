@@ -16,6 +16,7 @@ const MODEL_USAGE_PHASES = [
 	"replay-candidate",
 	"permit",
 	"retrospective",
+	"triage",
 ] as const;
 
 export type ModelUsagePhase = (typeof MODEL_USAGE_PHASES)[number];

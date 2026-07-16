@@ -740,7 +740,16 @@ ctx.ui.setStatus("my-ext", ctx.ui.theme.fg("accent", "● active"));
 
 // Clear status
 ctx.ui.setStatus("my-ext", undefined);
+
+// Publish a dedicated final status line. Down enters it from the end of a draft.
+ctx.ui.setStatusItems("my-ext", [
+  { id: "task-1", text: "Task 1 running", onSelect: () => openTask("task-1") },
+  { id: "task-2", text: "Task 2 waiting", onSelect: () => openTask("task-2") },
+]);
+ctx.ui.setStatusItems("my-ext", undefined);
 ```
+
+Interactive status item IDs are internal stable identities and are not rendered. Interactive activity is rendered on its own final line, separate from passive extension statuses. At the end of a focused draft, the configured `tui.select.down` binding enters the activity list; selection then uses `tui.select.up`, `tui.select.down`, `tui.select.confirm`, and `tui.select.cancel`. Editor movement and autocomplete retain the down key before the draft end.
 
 **Examples:** [status-line.ts](../examples/extensions/status-line.ts), [plan-mode/index.ts](../examples/extensions/plan-mode/index.ts), [preset.ts](../examples/extensions/preset.ts)
 

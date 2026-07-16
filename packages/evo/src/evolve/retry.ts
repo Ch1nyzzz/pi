@@ -28,6 +28,7 @@ import { type EvolutionEvaluationVerdict, runEvolutionEvaluator } from "./evalua
 import { applyEvolutionReleasePolicy, type EvolutionReleaseResult, RELEASE_ACTION_RUN_STATUS } from "./release.ts";
 import { readMaterializedCorpus } from "./research-corpus.ts";
 import { createEvolutionRun, evolutionRunDirectory, readEvolutionRun, updateEvolutionRun } from "./run.ts";
+import { dryRunWorkflowSelection } from "./workflow-dry-run.ts";
 
 async function candidateChanges(
 	paths: EvoPaths,
@@ -70,6 +71,22 @@ export async function validateComponentCandidate(
 	const bundle = await loadCompiledBundle(paths, proposal.candidateDigest);
 	const registry = createDefaultEvoAbiRegistry();
 	const abi = registry.require(proposal.targetAbi);
+	if (abi.id === "workflow/v1") {
+		const selections = bundle.policy.workflows ?? [];
+		if (selections.length === 0) throw new Error("Candidate bundle selects no workflows");
+		const outcomes = await Promise.all(
+			selections.map((selection) => dryRunWorkflowSelection(paths, selection, options)),
+		);
+		const failed = outcomes.filter((outcome) => !outcome.passed);
+		if (failed.length > 0) {
+			throw new Error(
+				`Workflow dry run failed for ${failed.length} selection(s):\n${failed
+					.map((outcome) => outcome.markdown)
+					.join("\n")}`,
+			);
+		}
+		return outcomes.map((outcome) => outcome.markdown).join("\n");
+	}
 	const selection = bundle.policy.components?.[abi.surface];
 	if (!selection) throw new Error(`Candidate bundle does not select ${abi.surface}`);
 	const config = registry.validateSelection(abi.surface, selection);

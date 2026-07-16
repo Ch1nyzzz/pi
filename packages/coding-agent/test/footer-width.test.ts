@@ -60,10 +60,17 @@ function createSession(options: {
 	return session as unknown as AgentSession;
 }
 
-function createFooterData(providerCount: number): ReadonlyFooterDataProvider {
+function createFooterData(
+	providerCount: number,
+	options: {
+		statuses?: ReadonlyMap<string, string>;
+		interactiveStatus?: ReturnType<ReadonlyFooterDataProvider["getInteractiveExtensionStatus"]>;
+	} = {},
+): ReadonlyFooterDataProvider {
 	const provider = {
 		getGitBranch: () => "main",
-		getExtensionStatuses: () => new Map<string, string>(),
+		getExtensionStatuses: () => options.statuses ?? new Map<string, string>(),
+		getInteractiveExtensionStatus: () => options.interactiveStatus,
 		getAvailableProviderCount: () => providerCount,
 		onBranchChange: (callback: () => void) => {
 			void callback;
@@ -123,6 +130,28 @@ describe("FooterComponent width handling", () => {
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 		}
+	});
+
+	it("renders interactive activity on its own final line", () => {
+		const session = createSession({ sessionName: "" });
+		const footer = new FooterComponent(
+			session,
+			createFooterData(1, {
+				statuses: new Map([["quota", "Codex week 66% · left 34%"]]),
+				interactiveStatus: {
+					item: { id: "canary", text: "Evo: compaction · Canary 运行中", onSelect: () => {} },
+					index: 0,
+					total: 1,
+					navigating: false,
+				},
+			}),
+		);
+
+		const lines = footer.render(120).map(stripAnsi);
+
+		expect(lines.at(-2)).toContain("Codex week 66% · left 34%");
+		expect(lines.at(-2)).not.toContain("Evo:");
+		expect(lines.at(-1)).toContain("Evo: compaction · Canary 运行中");
 	});
 
 	it("shows the latest cache hit rate when cache usage is present", () => {

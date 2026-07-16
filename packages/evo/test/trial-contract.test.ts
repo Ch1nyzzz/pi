@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+	contractMetricRegressions,
 	evaluateTrialContractGate,
 	parseTrialDurationDays,
 	primaryMetricRegression,
@@ -63,5 +64,53 @@ describe("trial contract gates", () => {
 		expect(primaryMetricRegression(CONTRACT, comparisonWith({ followUpsPerTask: 0.2 }))).toContain("regressed");
 		expect(primaryMetricRegression(CONTRACT, comparisonWith({ followUpsPerTask: 0.05 }))).toBeUndefined();
 		expect(primaryMetricRegression(undefined, comparisonWith({ followUpsPerTask: 0.5 }))).toBeUndefined();
+	});
+
+	it("treats every pre-registered metric as a rollback guardrail", () => {
+		const contract = {
+			primaryMetric: "followUpsPerTask",
+			minimumEffect: { followUpsPerTask: 0.1, verificationPassRate: 0.05 },
+		};
+		// Primary improved but the guardrail collapsed: the regression list catches it.
+		const regressions = contractMetricRegressions(
+			contract,
+			comparisonWith({ followUpsPerTask: -0.3, verificationPassRate: -0.2 }),
+		);
+		expect(regressions).toHaveLength(1);
+		expect(regressions[0]).toMatchObject({ metric: "verificationPassRate", primary: false });
+		expect(regressions[0]?.reason).toContain("guardrail metric verificationPassRate regressed");
+
+		// Both regressed: primary and guardrail are reported.
+		const both = contractMetricRegressions(
+			contract,
+			comparisonWith({ followUpsPerTask: 0.3, verificationPassRate: -0.2 }),
+		);
+		expect(both.map((entry) => entry.primary).sort()).toEqual([false, true]);
+
+		// Healthy trial: nothing fires; unmeasured guardrails never fire.
+		expect(
+			contractMetricRegressions(contract, comparisonWith({ followUpsPerTask: -0.3, verificationPassRate: 0.01 })),
+		).toEqual([]);
+		expect(contractMetricRegressions(contract, comparisonWith({ followUpsPerTask: -0.3 }))).toEqual([]);
+	});
+
+	it("blocks an auto-keep when a guardrail metric regressed even though the primary improved", () => {
+		const contract = {
+			primaryMetric: "followUpsPerTask",
+			minimumEffect: { followUpsPerTask: 0.1, verificationPassRate: 0.05 },
+		};
+		const gate = evaluateTrialContractGate(
+			contract,
+			comparisonWith({ followUpsPerTask: -0.3, verificationPassRate: -0.2 }),
+		);
+		expect(gate.allowed).toBe(false);
+		expect(gate.reasons).toHaveLength(1);
+		expect(gate.reasons[0]).toContain("guardrail metric verificationPassRate regressed");
+
+		const healthy = evaluateTrialContractGate(
+			contract,
+			comparisonWith({ followUpsPerTask: -0.3, verificationPassRate: 0.06 }),
+		);
+		expect(healthy).toEqual({ allowed: true, reasons: [] });
 	});
 });

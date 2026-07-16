@@ -145,9 +145,11 @@ my-optimization/
           → strong human-in-the-loop: T2 code review + explicit confirm.
           → COLD: approval leaves a staged patch; commit + rebuild + restart,
             then the part can activate via (a).
-5. Any part requesting a capability the user has not granted stops at an explicit
-   grant prompt (surfaced up front from `requiresCapabilities`); `infer` and
-   `spawn-agent` are off by default and always require an explicit grant.
+5. Every declared capability (surfaced up front from `requiresCapabilities`)
+   becomes an exact per-component grant with default budgets. With the default
+   `grants.approval: "auto"` config the previewed grants are staged without
+   prompting; setting `grants.approval: "prompt"` restores an explicit grant
+   confirmation before staging.
 6. Every activation is reversible (trial → keep / rollback).
 ```
 
@@ -205,7 +207,8 @@ subagents reaches them only through a **host-brokered capability** over RPC —
 never ambient. See `docs/host-abis.md` for the capability broker and its
 authorization/audit model. `infer` (host-mediated model inference) and
 `spawn-agent` (host-mediated subagents, used by `workflow/v1`) are the
-load-bearing capabilities and are always granted explicitly at approval time.
+load-bearing capabilities; their exact budgets are previewed at import and
+granted automatically or after confirmation per the `grants.approval` config.
 
 ## Implementation
 

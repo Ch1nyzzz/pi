@@ -52,7 +52,7 @@ one layer above it, orchestrating multiple agents.
 | `generation/v1` | the assistant message just produced | `{message}` → `{message?,redo?,stopReason?}` | turn | empty; `infer` for critique/redo |
 | `control/v1` | between-turn supervision | `{turnIndex,message,toolResults,usage?,model?,reasoning?}` → `{stop?,model?,reasoning?,memoryDeltas?}` | session | empty for routing/stop; `memory-write` for deltas |
 | `memory/v1` | the persistent memory subsystem (episodic + semantic) | `recall{query}` → `{fragments}`; `encode{turnDigest}` → `{writes,updates,forgets}`; `consolidate{candidates}` → `{merged,insights,forget}` | session | `memory-read`/`memory-write`, `retrieve`, `infer` |
-| `workflow/v1` | **meta-layer**: imperative multi-agent orchestration (above the turn loop) | `run{trigger, args}` → orchestration result | invocation | `spawn-agent` with bounded model/tools |
+| `workflow/v1` | **meta-layer**: imperative multi-agent orchestration (above the turn loop) | `run{trigger, args}` → orchestration result | invocation | `spawn-agent` with bounded model/tools; `memory-read`/`memory-write` for persistent workflow state (goals, progress) across invocations |
 
 `workflow/v1` is different in kind from the other seven: they replace a
 data-transform point *inside* one agent's turn loop; `workflow/v1` is an
@@ -105,8 +105,12 @@ kill, wait, and forced removal.
   "the network + my key"); components process untrusted data (conversation, tool
   output → prompt-injection surface), so a trusted-but-buggy component must not
   hold the key; the key never leaves the host and every call is audited.
-- **Authorization model:** `infer` and `spawn-agent` are off by default. Import
-  previews the exact requested grants before staging, and the selected artifact
+- **Authorization model:** every capability requires a per-component grant.
+  Import derives the exact grants (with default budgets) from the pack's
+  declared capabilities and previews them before staging; whether staging also
+  requires interactive confirmation is controlled by the Evo control config
+  `grants.approval` (`"auto"`, the default, stages the previewed grants without
+  prompting; `"prompt"` requires explicit confirmation). The selected artifact
   is bound to those grants. A deterministic authority ID binds the artifact
   digest to its exact canonical grant set, so concurrently pinned sessions
   cannot overwrite one another's authority.

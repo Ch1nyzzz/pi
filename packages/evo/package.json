@@ -28,7 +28,7 @@
 	],
 	"scripts": {
 		"clean": "shx rm -rf dist",
-		"copy-assets": "shx mkdir -p dist/prompts && shx cp src/prompts/*.md dist/prompts/",
+		"copy-assets": "shx mkdir -p dist/prompts dist/components/workflow-sdk && shx cp src/prompts/*.md dist/prompts/ && shx cp src/components/workflow-sdk/sdk.mjs dist/components/workflow-sdk/",
 		"build": "tsgo -p tsconfig.build.json && npm run copy-assets && shx chmod +x dist/bin.js",
 		"test": "vitest --run",
 		"prepublishOnly": "npm run clean && npm run build"

@@ -46,6 +46,7 @@ import type { BashResult } from "../bash-executor.ts";
 import type { CompactionPreparation, CompactionResult } from "../compaction/index.ts";
 import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
+import type { ExtensionStatusItem } from "../extension-status.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
 import type { CustomMessage } from "../messages.ts";
@@ -141,6 +142,12 @@ export interface ExtensionUIContext {
 
 	/** Set status text in the footer/status bar. Pass undefined to clear. */
 	setStatus(key: string, text: string | undefined): void;
+
+	/**
+	 * Set interactive footer items on a dedicated final status line. Down enters the list from the end of the
+	 * focused editor, selection keys cycle items, and Enter opens one. Pass undefined to clear the group.
+	 */
+	setStatusItems(key: string, items: readonly ExtensionStatusItem[] | undefined): void;
 
 	/** Set the working/loading message shown during streaming. Call with no argument to restore default. */
 	setWorkingMessage(message?: string): void;

@@ -5,7 +5,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { compileBundle, loadCompiledBundle } from "../src/bundle/compile.ts";
 import { type EvoCliIO, runEvoCli } from "../src/cli.ts";
 import { publishEvoComponentArtifact } from "../src/components/artifact.ts";
+import { readEvoControlConfig } from "../src/evolve/config.ts";
 import { computeEvoPackIntegrity, loadEvoPack, parseEvoPackManifest } from "../src/pack/pack.ts";
+import { writeDeepReviewPack } from "../src/pack/templates/deep-review.ts";
 import { getEvoPaths } from "../src/paths.ts";
 import { BundleRegistry } from "../src/registry/registry.ts";
 import { EvoService } from "../src/service.ts";
@@ -53,6 +55,11 @@ function captureInteractiveCliOutput(answer: "y" | "n"): { io: EvoCliIO; message
 			},
 		},
 	};
+}
+
+async function setGrantApproval(paths: ReturnType<typeof getEvoPaths>, approval: "auto" | "prompt"): Promise<void> {
+	const config = await readEvoControlConfig(paths);
+	await writeFile(paths.config, JSON.stringify({ ...config, grants: { approval } }, undefined, "\t"));
 }
 
 async function seedActiveBundle(root: string) {
@@ -191,6 +198,7 @@ describe("optimization pack CLI", () => {
 		const root = await temporary("evo-pack-cli-grant-decline-");
 		const packDirectory = await temporary("evo-pack-cli-grant-source-");
 		const { paths, service } = await seedActiveBundle(root);
+		await setGrantApproval(paths, "prompt");
 		const integrity = await writeCapabilityPack(packDirectory, root);
 		const { io, messages, prompts } = captureInteractiveCliOutput("n");
 
@@ -198,9 +206,51 @@ describe("optimization pack CLI", () => {
 
 		expect(await service.listProposals()).toEqual([]);
 		expect(messages.join("\n")).toContain(integrity);
-		expect(messages.join("\n")).toContain('"maxTotalTokens": 81920');
+		expect(messages.join("\n")).toContain('"maxTotalTokens": 1310720');
 		expect(messages.join("\n")).toContain("Pack import cancelled before staging");
 		expect(prompts).toHaveLength(1);
+	});
+
+	it("stages a capability-bearing pack without prompting when grants.approval is auto", async () => {
+		const root = await temporary("evo-pack-cli-grant-auto-");
+		const packDirectory = await temporary("evo-pack-cli-grant-source-");
+		const { paths, service } = await seedActiveBundle(root);
+		const integrity = await writeCapabilityPack(packDirectory, root);
+		const { io, messages } = captureCliOutput();
+
+		await runEvoCli(["import", packDirectory], { paths, service, io, model: "faux/model" });
+
+		const proposals = await service.listProposals();
+		expect(proposals).toHaveLength(1);
+		expect(proposals[0]?.status).toBe("pending");
+		const output = messages.join("\n");
+		expect(output).toContain(integrity);
+		expect(output).toContain("Capability grants auto-approved (grants.approval is 'auto')");
+	});
+
+	it("imports the bundled /deep-review template pack with auto-approved spawn-agent grants", async () => {
+		const root = await temporary("evo-pack-cli-deep-review-");
+		const packDirectory = await temporary("evo-pack-cli-deep-review-source-");
+		const { paths, service } = await seedActiveBundle(root);
+		const written = await writeDeepReviewPack(packDirectory);
+		expect((await loadEvoPack(packDirectory)).integrity.ok).toBe(true);
+		const { io, messages } = captureCliOutput();
+
+		await runEvoCli(["import", packDirectory], {
+			paths,
+			service,
+			io,
+			model: "faux/model",
+			spawnAgentToolNames: ["read", "bash"],
+		});
+
+		const proposals = await service.listProposals();
+		expect(proposals).toHaveLength(1);
+		expect(proposals[0]?.status).toBe("pending");
+		const output = messages.join("\n");
+		expect(output).toContain(written.integrity);
+		expect(output).toContain("Capability grants auto-approved (grants.approval is 'auto')");
+		expect(output).toContain("deep-review");
 	});
 
 	it("persists confirmed component grants in the candidate without activating the broker", async () => {
@@ -220,13 +270,13 @@ describe("optimization pack CLI", () => {
 		expect(candidate.policy.components?.generation?.grants).toEqual([
 			{
 				capability: "infer",
-				maxCalls: 16,
+				maxCalls: 200,
 				models: ["faux/model"],
-				maxInputTokens: 65_536,
-				maxOutputTokens: 16_384,
-				maxTotalTokens: 81_920,
-				maxCostUsd: 5,
-				maxOutputTokensPerCall: 4_096,
+				maxInputTokens: 1_048_576,
+				maxOutputTokens: 262_144,
+				maxTotalTokens: 1_310_720,
+				maxCostUsd: 50,
+				maxOutputTokensPerCall: 16_384,
 			},
 		]);
 		await expect(readFile(join(paths.registry, "capability-grants.json"), "utf8")).rejects.toThrow();
@@ -236,6 +286,7 @@ describe("optimization pack CLI", () => {
 		const root = await temporary("evo-pack-cli-integrity-pin-");
 		const packDirectory = await temporary("evo-pack-cli-integrity-source-");
 		const { paths, service } = await seedActiveBundle(root);
+		await setGrantApproval(paths, "prompt");
 		const approvedIntegrity = await writeCapabilityPack(packDirectory, root);
 		const messages: string[] = [];
 		let replacementIntegrity: string | undefined;

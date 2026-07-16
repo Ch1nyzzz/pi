@@ -21,7 +21,7 @@ describe("S4 thinking-component ABIs", () => {
 		).toEqual([
 			["tool/v1", "tool", "session", ["exec", "http-fetch", "infer", "list-dir", "read-file", "write-file"]],
 			["memory/v1", "memory", "session", ["infer", "memory-read", "memory-write", "retrieve"]],
-			["workflow/v1", "workflow", "invocation", ["spawn-agent"]],
+			["workflow/v1", "workflow", "invocation", ["memory-read", "memory-write", "spawn-agent"]],
 		]);
 		expect(INSTRUCTIONS_V1_ABI.capabilityCeiling).toEqual(["read-file"]);
 		expect(CONTEXT_V1_ABI.capabilityCeiling).toEqual(["infer", "retrieve"]);

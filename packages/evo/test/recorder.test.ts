@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@ch1nyzzz/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import { getEvoPaths } from "../src/paths.ts";
-import { readSessionDigest } from "../src/recorder/digest.ts";
+import { listSessionDigests, readSessionDigest } from "../src/recorder/digest.ts";
 import { createRecorderExtension, isDurablePreferenceInstruction } from "../src/recorder/extension.ts";
 import type { RecordedEvent } from "../src/recorder/schema.ts";
 import { createRecorderStore, readSessionLog, resolveStoredPayload } from "../src/recorder/store.ts";
@@ -180,6 +180,21 @@ describe("recorder", () => {
 		await expect(createRecorderStore({ paths, sessionId: "session-corrupt-sequence" })).rejects.toThrow(
 			`Invalid recorder sequence at ${store.logPath}:2`,
 		);
+	});
+
+	it("excludes the capability audit journal from session digest discovery", async () => {
+		const paths = getEvoPaths(await createRoot());
+		const store = await createRecorderStore({ paths, sessionId: "session-with-capability-audit" });
+		await store.append({ type: "session_start", reason: "startup", cwd: "/workspace" });
+		await store.append({ type: "session_end", reason: "quit" });
+		await writeFile(
+			join(paths.log, "capability-audit.jsonl"),
+			`${JSON.stringify({ schemaVersion: 1, type: "authority-registered", timestamp: "2026-07-16T00:00:00.000Z" })}\n`,
+		);
+
+		const digests = await listSessionDigests(paths);
+
+		expect(digests.map((digest) => digest.sessionId)).toEqual(["session-with-capability-audit"]);
 	});
 
 	it("does not consume a sequence when an append fails", async () => {

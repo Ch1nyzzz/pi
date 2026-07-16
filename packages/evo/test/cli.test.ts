@@ -43,6 +43,10 @@ function createHarness(cwd: string) {
 	const entries: unknown[] = [];
 	const notifications: Array<{ message: string; type: string | undefined }> = [];
 	const statuses: Array<{ key: string; text: string | undefined }> = [];
+	const statusItems: Array<{
+		key: string;
+		items: ReadonlyArray<{ id: string; text: string; onSelect: () => unknown }> | undefined;
+	}> = [];
 	const sentMessages: SentMessage[] = [];
 	const confirmations: Array<{ title: string; message: string }> = [];
 	let inputResponse: string | undefined;
@@ -86,7 +90,11 @@ function createHarness(cwd: string) {
 		},
 		ui: {
 			notify: (message: string, type?: string) => notifications.push({ message, type }),
-			setStatus: (key: string, text: string | undefined) => statuses.push({ key, text }),
+			setStatus: (key: string, text: string | undefined) => void statuses.push({ key, text }),
+			setStatusItems: (
+				key: string,
+				items: ReadonlyArray<{ id: string; text: string; onSelect: () => unknown }> | undefined,
+			) => void statusItems.push({ key, items }),
 			select: async () => selectResponse,
 			input: async () => (inputHandler ? inputHandler() : inputResponse),
 			confirm: async (title: string, message: string) => {
@@ -105,6 +113,7 @@ function createHarness(cwd: string) {
 		entries,
 		notifications,
 		statuses,
+		statusItems,
 		sentMessages,
 		confirmations,
 		getActiveTools: () => [...activeTools],
@@ -199,7 +208,9 @@ describe("Evo CLI extension", () => {
 		});
 		harness.notifications.length = 0;
 		await harness.emit("session_start", { type: "session_start", reason: "startup" });
-		expect(harness.statuses.at(-1)).toEqual({ key: "evo", text: "evo: 1 pending" });
+		expect(harness.statuses.at(-1)).toEqual({ key: "evo", text: undefined });
+		expect(harness.statusItems.at(-1)?.items?.[0]?.text).toContain("Add a strictly reviewed preference");
+		expect(harness.statusItems.at(-1)?.items?.[0]?.text).not.toContain(proposal.id);
 		expect(harness.notifications).toEqual([]);
 
 		harness.setInputResponse("wrong-digest");
@@ -261,9 +272,9 @@ describe("Evo CLI extension", () => {
 		const harness = createHarness(fixture.root);
 		await createEvoCommandExtension({ service: fixture.service, runner: fixture.runner })(harness.api);
 		await harness.emit("session_start", { type: "session_start", reason: "startup" });
-		const status = harness.statuses.at(-1)?.text;
-		expect(status).toContain("evo: T0 Record the concise-response preference");
-		expect(status).toContain(proposal.id);
+		const status = harness.statusItems.at(-1)?.items?.[0]?.text;
+		expect(status).toContain("Record the concise-response preference");
+		expect(status).not.toContain(proposal.id);
 		const shortcut = harness.shortcuts.get("ctrl+alt+e");
 		expect(shortcut).toBeDefined();
 		await shortcut?.handler(harness.context);
@@ -271,7 +282,7 @@ describe("Evo CLI extension", () => {
 		expect((await fixture.service.getProposal(proposal.id)).status).toBe("kept");
 		expect((await fixture.service.status()).trial).toBeUndefined();
 		expect(harness.notifications.at(-1)?.message).toContain(`Applied T0 proposal ${proposal.id}`);
-		expect(harness.statuses.at(-1)).toEqual({ key: "evo", text: undefined });
+		expect(harness.statusItems.at(-1)).toEqual({ key: "evo", items: undefined });
 	});
 
 	it("registers policy before recorder so recorder stores the final chained prompt", async () => {
@@ -307,6 +318,11 @@ describe("Evo CLI extension", () => {
 			systemPrompt,
 		);
 		expect(harness.statuses.some((status) => status.text?.includes(seed.digest.slice(0, 8)))).toBe(false);
+		expect(
+			harness.statusItems.some((status) =>
+				status.items?.some((item) => item.text.includes(seed.digest.slice(0, 8))),
+			),
+		).toBe(false);
 	});
 
 	it("restores active tools after a restricted bundle session shuts down", async () => {
@@ -735,7 +751,7 @@ describe("Evo CLI extension", () => {
 		expect(fixture.getModelCalls()).toBe(0);
 	});
 
-	it("surfaces an overdue trial in the status indicator", async () => {
+	it("surfaces an active trial without exposing its proposal id", async () => {
 		const fixture = await createFixture();
 		const seed = await fixture.service.init();
 		const proposal = await stageProposal({
@@ -767,14 +783,15 @@ describe("Evo CLI extension", () => {
 		const dependencies = { service: fixture.service, paths: fixture.service.paths };
 
 		await refreshEvoStatusIndicator(dependencies, harness.context);
-		expect(harness.statuses.at(-1)).toEqual({ key: "evo", text: undefined });
+		let item = harness.statusItems.at(-1)?.items?.[0];
+		expect(item?.text).toContain("Trial 运行中");
+		expect(item?.text).toContain("Exercise the due-trial status");
+		expect(item?.text).not.toContain(proposal.id);
 
 		const eightDaysLater = () => new Date(Date.now() + 8 * 24 * 60 * 60 * 1000);
 		await refreshEvoStatusIndicator(dependencies, harness.context, eightDaysLater);
-		expect(harness.statuses.at(-1)?.text).toBe(`evo: trial ${proposal.id} due [automatic comparison pending]`);
-
-		await writeScheduleConfig(fixture.service.paths, { trialDueAfterDays: 30 });
-		await refreshEvoStatusIndicator(dependencies, harness.context, eightDaysLater);
-		expect(harness.statuses.at(-1)).toEqual({ key: "evo", text: undefined });
+		item = harness.statusItems.at(-1)?.items?.[0];
+		expect(item?.text).toContain("Trial comparison pending");
+		expect(item?.text).not.toContain(proposal.id);
 	});
 });

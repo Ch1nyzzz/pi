@@ -433,6 +433,7 @@ export class InteractiveMode {
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
 	private extensionTerminalInputUnsubscribers = new Set<() => void>();
+	private interactiveStatusInputUnsubscribe: (() => void) | undefined;
 
 	// Extension widgets (components rendered above/below the editor)
 	private extensionWidgetsAbove = new Map<string, Component & { dispose?(): void }>();
@@ -746,6 +747,9 @@ export class InteractiveMode {
 
 		this.setupKeyHandlers();
 		this.setupEditorSubmitHandler();
+		this.interactiveStatusInputUnsubscribe = this.ui.addInputListener((data) =>
+			this.handleInteractiveStatusInput(data),
+		);
 
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
@@ -1871,6 +1875,61 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private setInteractiveExtensionStatus(
+		key: string,
+		items: Parameters<FooterDataProvider["setInteractiveExtensionStatus"]>[1],
+	): void {
+		this.footerDataProvider.setInteractiveExtensionStatus(key, items);
+		this.ui.requestRender();
+	}
+
+	private handleInteractiveStatusInput(data: string): { consume?: boolean } | undefined {
+		if (!this.ui.isFocused(this.editor as Component)) {
+			if (this.footerDataProvider.cancelInteractiveExtensionStatusNavigation()) this.ui.requestRender();
+			return undefined;
+		}
+
+		const status = this.footerDataProvider.getInteractiveExtensionStatus();
+		if (!status) return undefined;
+		const text = this.editor.getText();
+		const lines = this.editor.getLines?.();
+		const cursor = this.editor.getCursor?.();
+		const canEnterFromEditor =
+			!this.editor.isShowingAutocomplete?.() &&
+			(lines && cursor
+				? cursor.line === lines.length - 1 && cursor.col === (lines[cursor.line]?.length ?? 0)
+				: !text.includes("\n"));
+
+		if (this.keybindings.matches(data, "tui.select.up") && (status.navigating || !text.trim())) {
+			if (!this.footerDataProvider.moveInteractiveExtensionStatusSelection(-1)) return undefined;
+			this.ui.requestRender();
+			return { consume: true };
+		}
+		if (this.keybindings.matches(data, "tui.select.down") && (status.navigating || canEnterFromEditor)) {
+			if (!this.footerDataProvider.moveInteractiveExtensionStatusSelection(1)) return undefined;
+			this.ui.requestRender();
+			return { consume: true };
+		}
+		if (this.keybindings.matches(data, "tui.select.confirm")) {
+			const action = this.footerDataProvider.activateInteractiveExtensionStatus();
+			if (!action) return undefined;
+			this.ui.requestRender();
+			Promise.resolve(action()).catch((error) => {
+				this.showError(`Status action failed: ${error instanceof Error ? error.message : String(error)}`);
+			});
+			return { consume: true };
+		}
+		if (
+			this.keybindings.matches(data, "tui.select.cancel") &&
+			this.footerDataProvider.cancelInteractiveExtensionStatusNavigation()
+		) {
+			this.ui.requestRender();
+			return { consume: true };
+		}
+		if (this.footerDataProvider.cancelInteractiveExtensionStatusNavigation()) this.ui.requestRender();
+		return undefined;
+	}
+
 	private showStatusIndicator(indicator: StatusIndicator): void {
 		this.activeStatusIndicator?.dispose();
 		this.activeStatusIndicator = indicator;
@@ -2178,6 +2237,7 @@ export class InteractiveMode {
 			notify: (message, type) => this.showExtensionNotify(message, type),
 			onTerminalInput: (handler) => this.addExtensionTerminalInputListener(handler),
 			setStatus: (key, text) => this.setExtensionStatus(key, text),
+			setStatusItems: (key, items) => this.setInteractiveExtensionStatus(key, items),
 			setWorkingMessage: (message) => {
 				this.workingMessage = message;
 				if (this.activeStatusIndicator?.kind === "working") {
@@ -2635,6 +2695,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.session.resume", () => this.showSessionSelector());
 
 		this.defaultEditor.onChange = (text: string) => {
+			if (text && this.footerDataProvider.cancelInteractiveExtensionStatusNavigation()) this.ui.requestRender();
 			const wasBashMode = this.isBashMode;
 			this.isBashMode = text.trimStart().startsWith("!");
 			if (wasBashMode !== this.isBashMode) {
@@ -6037,6 +6098,8 @@ export class InteractiveMode {
 		this.clearStatusIndicator();
 		this.themeController.disableAutoSync();
 		this.clearExtensionTerminalInputListeners();
+		this.interactiveStatusInputUnsubscribe?.();
+		this.interactiveStatusInputUnsubscribe = undefined;
 		this.footer.dispose();
 		this.footerDataProvider.dispose();
 		if (this.unsubscribe) {

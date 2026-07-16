@@ -175,6 +175,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			} as RpcExtensionUIRequest);
 		},
 
+		setStatusItems(): void {
+			// Interactive footer navigation is not available in RPC mode.
+		},
+
 		setWorkingMessage(_message?: string): void {
 			// Working message not supported in RPC mode - requires TUI loader access
 		},

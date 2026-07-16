@@ -22,6 +22,13 @@ export interface EditorComponent extends Component {
 	/** Handle raw terminal input (key presses, paste sequences, etc.) */
 	handleInput(data: string): void;
 
+	/** Logical lines and cursor position, when exposed by the editor. */
+	getLines?(): string[];
+	getCursor?(): { line: number; col: number };
+
+	/** Whether an autocomplete menu currently owns selection keys. */
+	isShowingAutocomplete?(): boolean;
+
 	// =========================================================================
 	// Callbacks (required)
 	// =========================================================================

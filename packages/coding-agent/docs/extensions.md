@@ -2458,6 +2458,14 @@ See [examples/extensions/timed-confirm.ts](../examples/extensions/timed-confirm.
 ctx.ui.setStatus("my-ext", "Processing...");
 ctx.ui.setStatus("my-ext", undefined);  // Clear
 
+// Interactive footer items use a dedicated final line. Down enters it from
+// the end of a draft; selection keys browse and the confirm key opens an item.
+ctx.ui.setStatusItems("my-ext", [
+  { id: "build", text: "Build running", onSelect: () => openBuildDetails() },
+  { id: "review", text: "Review pending", onSelect: () => openReview() },
+]);
+ctx.ui.setStatusItems("my-ext", undefined);  // Clear
+
 // Working loader (shown during streaming)
 ctx.ui.setWorkingMessage("Thinking deeply...");
 ctx.ui.setWorkingMessage();  // Restore default

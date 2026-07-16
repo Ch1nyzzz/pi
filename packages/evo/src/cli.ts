@@ -1,7 +1,8 @@
 import { createInterface } from "node:readline/promises";
 import type { ExtensionCommandContext, ExtensionContext, ExtensionFactory } from "@ch1nyzzz/pi-coding-agent";
 import { loadCompiledBundle } from "./bundle/compile.ts";
-import { buildTrialComparison, renderTrialComparisonMarkdown, type TrialComparison } from "./comparison.ts";
+import { DEFAULT_SPAWN_AGENT_TOOL_NAMES } from "./bundle/runtime.ts";
+import { renderTrialComparisonMarkdown, type TrialComparison } from "./comparison.ts";
 import type { EvoBudgetedCapabilityGrant, EvoCapabilityGrant } from "./components/capabilities/broker.ts";
 import { parseEvoCapabilityGrants } from "./components/capabilities/broker.ts";
 import { canUseEvoComponentSandbox } from "./components/process-runtime.ts";
@@ -14,6 +15,7 @@ import {
 	EvoPackRegistryService,
 } from "./discovery/service.ts";
 import { type EvoDiscoveryFetch, EvoPackDiscoveryTransport } from "./discovery/transport.ts";
+import { listEvoActivityItems } from "./evolve/activity.ts";
 import {
 	formatEvolutionRuns,
 	inspectBackgroundEvolutions,
@@ -22,7 +24,7 @@ import {
 	resumeBackgroundEvolution,
 	startBackgroundEvolution,
 } from "./evolve/background.ts";
-import { readEvolutionWorkflow, resetEvolutionWorkflow } from "./evolve/config.ts";
+import { readEvoControlConfig, readEvolutionWorkflow, resetEvolutionWorkflow } from "./evolve/config.ts";
 import { runEvolutionCycle, runUnknownAbiBuilderCycle, type UnknownAbiBuilderCycleResult } from "./evolve/cycle.ts";
 import { EvolutionProcessInspector } from "./evolve/inspect-ui.ts";
 import { changesComponentSelection } from "./evolve/release.ts";
@@ -50,7 +52,6 @@ import {
 	type EvoScheduleStatus,
 	getScheduleStatus,
 	parseScheduleCadence,
-	readScheduleConfig,
 	runConfiguredImprove,
 	type ScheduledImproveResult,
 	writeScheduleConfig,
@@ -95,7 +96,6 @@ const SUBCOMMANDS = [
 ] as const;
 
 const QUICK_APPROVE_SHORTCUT = "ctrl+alt+e" as const;
-const DAY_MS = 24 * 60 * 60 * 1000;
 const DISCOVERY_SEARCH_LIMIT = 50;
 const SCHEDULE_USAGE = "/evo schedule [daily | 3d | weekly | every <n>d | manual]";
 
@@ -292,7 +292,7 @@ interface PackCapabilityGrantPreview {
 	grantsByComponent: Readonly<Record<string, readonly EvoCapabilityGrant[]>>;
 }
 
-const DEFAULT_CALL_CAPABILITY_MAX_CALLS = 100;
+const DEFAULT_CALL_CAPABILITY_MAX_CALLS = 1_000;
 
 function createBudgetedCapabilityGrant(
 	capability: EvoBudgetedCapabilityGrant["capability"],
@@ -300,27 +300,32 @@ function createBudgetedCapabilityGrant(
 	tools: readonly string[],
 ): EvoBudgetedCapabilityGrant {
 	if (capability === "spawn-agent") {
+		// The broker holds a worst-case reservation of contextWindow x maxTurns
+		// input tokens per in-flight spawn (~16.8M tokens for a 256k-context
+		// model at the 64-turn host default), so these caps are sized to keep
+		// several large-context child agents runnable in parallel while still
+		// bounding runaway loops. Actual charged usage is real consumption.
 		return {
 			capability,
-			maxCalls: 8,
+			maxCalls: 100,
 			models: [model],
-			maxInputTokens: 131_072,
-			maxOutputTokens: 32_768,
-			maxTotalTokens: 163_840,
-			maxCostUsd: 10,
-			maxOutputTokensPerCall: 4_096,
+			maxInputTokens: 268_435_456,
+			maxOutputTokens: 16_777_216,
+			maxTotalTokens: 285_212_672,
+			maxCostUsd: 500,
+			maxOutputTokensPerCall: 65_536,
 			tools: [...new Set(tools)].sort(),
 		};
 	}
 	return {
 		capability,
-		maxCalls: 16,
+		maxCalls: 200,
 		models: [model],
-		maxInputTokens: 65_536,
-		maxOutputTokens: 16_384,
-		maxTotalTokens: 81_920,
-		maxCostUsd: 5,
-		maxOutputTokensPerCall: 4_096,
+		maxInputTokens: 1_048_576,
+		maxOutputTokens: 262_144,
+		maxTotalTokens: 1_310_720,
+		maxCostUsd: 50,
+		maxOutputTokensPerCall: 16_384,
 	};
 }
 
@@ -528,31 +533,6 @@ async function formatActivePreferences(dependencies: EvoCommandDependencies): Pr
 	].join("\n");
 }
 
-function evolutionRunStatusText(status: string): string {
-	return (
-		{
-			queued: "等待执行",
-			researching: "研究中",
-			planned: "计划已冻结",
-			building: "构建候选",
-			validating: "确定性验证",
-			replaying: "历史回放",
-			evaluating: "独立评估",
-			"awaiting-evidence": "等待实验数据",
-			"awaiting-canary-approval": "等待 Canary 确认",
-			trialing: "Canary 运行中",
-			"awaiting-decision": "等待最终决定",
-			paused: "已暂停",
-		}[status] ?? status
-	);
-}
-
-function compactStatusText(value: string, maxLength = 48): string {
-	const compact = value.replace(/\s+/g, " ").trim();
-	if (compact.length <= maxLength) return compact;
-	return `${compact.slice(0, Math.max(0, maxLength - 3))}...`;
-}
-
 async function findPendingT0Proposal(dependencies: { service: EvoService }): Promise<Proposal | undefined> {
 	return (await dependencies.service.listProposals()).find(
 		(proposal) => proposal.status === "pending" && proposal.kind === "data" && proposal.tier === "T0",
@@ -720,55 +700,24 @@ function modelOptions(dependencies: EvoCommandDependencies, signal?: AbortSignal
 export async function refreshEvoStatusIndicator(
 	dependencies: { service: EvoService; paths: EvoPaths },
 	ctx: ExtensionContext,
-	now: () => Date = () => new Date(),
-	includeTrialComparison = true,
+	_now: () => Date = () => new Date(),
+	_includeTrialComparison = true,
 ): Promise<void> {
-	const status = await dependencies.service.status();
-	const parts: string[] = [];
-	const runs = (await listEvolutionRuns(dependencies.paths)).filter(
-		(run) => !["completed", "failed", "cancelled"].includes(run.status),
+	const items = await listEvoActivityItems(dependencies, {
+		includeTrialComparison: _includeTrialComparison,
+		now: _now,
+	});
+	ctx.ui.setStatus("evo", undefined);
+	ctx.ui.setStatusItems(
+		"evo",
+		items.length > 0
+			? items.map((item) => ({
+					id: item.key,
+					text: item.text,
+					onSelect: () => openEvolutionInspector(dependencies, ctx, item.key),
+				}))
+			: undefined,
 	);
-	const awaitingCanary = runs.filter((run) => run.status === "awaiting-canary-approval");
-	if (awaitingCanary.length > 0) {
-		parts.push(`${awaitingCanary.length} waiting Canary approval [/evo inspect]`);
-	} else if (runs.length === 1) {
-		const run = runs[0];
-		if (run) {
-			const action =
-				run.status === "awaiting-evidence" && run.proposalId
-					? ` [/evo permit ${run.proposalId}]`
-					: run.status === "awaiting-decision" && run.proposalId
-						? ` [/evo show ${run.proposalId}]`
-						: "";
-			parts.push(`${run.id.slice(-8)} ${evolutionRunStatusText(run.status)}${action}`);
-		}
-	} else if (runs.length > 1) parts.push(`${runs.length} active tasks [/evo inspect]`);
-	if (status.pendingProposals > 0) {
-		const quick = await findPendingT0Proposal(dependencies);
-		parts.push(
-			quick
-				? `T0 ${compactStatusText(quick.motivation)} [Ctrl+Alt+E apply; /evo show ${quick.id}]`
-				: `${status.pendingProposals} pending`,
-		);
-	}
-	if (status.trial) {
-		const proposal = await dependencies.service.getProposal(status.trial.proposalId);
-		if (proposal.artifacts.retrospective) {
-			parts.push(`trial ${status.trial.proposalId} comparison ready [/evo show ${status.trial.proposalId}]`);
-		} else if (!includeTrialComparison) parts.push(`trial ${status.trial.proposalId} active`);
-		else {
-			const schedule = await readScheduleConfig(dependencies.paths);
-			const comparison = await buildTrialComparison(dependencies.paths, proposal, status.trial);
-			const dueAt = Date.parse(status.trial.startedAt) + schedule.trialDueAfterDays * DAY_MS;
-			if (
-				(Number.isFinite(dueAt) && now().getTime() >= dueAt) ||
-				comparison.after.totals.sessions >= schedule.trialDueAfterSessions
-			) {
-				parts.push(`trial ${status.trial.proposalId} due [automatic comparison pending]`);
-			}
-		}
-	}
-	ctx.ui.setStatus("evo", parts.length > 0 ? `evo: ${parts.join("; ")}` : undefined);
 }
 
 function sendCustomCard(
@@ -808,6 +757,10 @@ async function confirmExtensionMutation(
 ): Promise<boolean> {
 	if (!ctx.hasUI) throw new Error("Changing Evo-Pi state requires an interactive UI");
 	return ctx.ui.confirm(title, message);
+}
+
+async function packGrantsNeedConfirmation(paths: EvoPaths): Promise<boolean> {
+	return (await readEvoControlConfig(paths)).grants.approval === "prompt";
 }
 
 async function confirmProposal(proposal: Proposal, ctx: ExtensionCommandContext): Promise<boolean> {
@@ -970,17 +923,19 @@ export async function approveCanaryRun(
 }
 
 async function openEvolutionInspector(
-	dependencies: EvoCommandDependencies,
+	dependencies: { service: EvoService; paths: EvoPaths },
 	ctx: ExtensionContext,
-	initialRunId?: string,
+	initialItem?: string,
 ): Promise<void> {
+	const itemKey = initialItem && !initialItem.includes(":") ? `run:${initialItem}` : initialItem;
 	await ctx.ui.custom<void>(
 		(tui, theme, _keybindings, done) =>
 			new EvolutionProcessInspector(
 				tui,
 				theme,
 				dependencies.paths,
-				initialRunId,
+				dependencies.service,
+				itemKey,
 				() => done(undefined),
 				(runId) => approveCanaryRun(dependencies, runId),
 			),
@@ -1026,7 +981,7 @@ async function dispatchExtensionCommand(
 				inspection.manifest,
 				inspection.entry.integrity,
 				dependencies.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
-				dependencies.spawnAgentToolNames ?? [],
+				dependencies.spawnAgentToolNames ?? DEFAULT_SPAWN_AGENT_TOOL_NAMES,
 			);
 			sendCustomCard(pi, "evo.pack-inspect", formatPackInspection(inspection), {
 				pack: inspection.entry.name,
@@ -1034,16 +989,24 @@ async function dispatchExtensionCommand(
 				integrity: inspection.entry.integrity,
 			});
 			const parentDigest = await requireActiveBundleDigest(dependencies);
-			if (
-				Object.keys(preview.grantsByComponent).length > 0 &&
-				!(await confirmExtensionMutation(
-					ctx,
-					"Approve executable pack capability budgets",
-					formatPackCapabilityGrantPreview(preview),
-				))
-			) {
-				ctx.ui.notify("Pack install cancelled before staging", "info");
-				return;
+			if (Object.keys(preview.grantsByComponent).length > 0) {
+				if (await packGrantsNeedConfirmation(dependencies.paths)) {
+					if (
+						!(await confirmExtensionMutation(
+							ctx,
+							"Approve executable pack capability budgets",
+							formatPackCapabilityGrantPreview(preview),
+						))
+					) {
+						ctx.ui.notify("Pack install cancelled before staging", "info");
+						return;
+					}
+				} else {
+					sendCustomCard(pi, "evo.pack-grants", formatPackCapabilityGrantPreview(preview), {
+						pack: inspection.entry.name,
+						approval: "auto",
+					});
+				}
 			}
 			let unknownAbiResults: UnknownAbiBuilderCycleResult[] = [];
 			const result = await discovery.install({
@@ -1070,18 +1033,26 @@ async function dispatchExtensionCommand(
 			const preview = await previewPackCapabilityGrants(
 				packDirectory,
 				dependencies.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
-				dependencies.spawnAgentToolNames ?? [],
+				dependencies.spawnAgentToolNames ?? DEFAULT_SPAWN_AGENT_TOOL_NAMES,
 			);
-			if (
-				Object.keys(preview.grantsByComponent).length > 0 &&
-				!(await confirmExtensionMutation(
-					ctx,
-					"Approve executable pack capability budgets",
-					formatPackCapabilityGrantPreview(preview),
-				))
-			) {
-				ctx.ui.notify("Pack import cancelled before staging", "info");
-				return;
+			if (Object.keys(preview.grantsByComponent).length > 0) {
+				if (await packGrantsNeedConfirmation(dependencies.paths)) {
+					if (
+						!(await confirmExtensionMutation(
+							ctx,
+							"Approve executable pack capability budgets",
+							formatPackCapabilityGrantPreview(preview),
+						))
+					) {
+						ctx.ui.notify("Pack import cancelled before staging", "info");
+						return;
+					}
+				} else {
+					sendCustomCard(pi, "evo.pack-grants", formatPackCapabilityGrantPreview(preview), {
+						pack: preview.manifest.name,
+						approval: "auto",
+					});
+				}
 			}
 			let unknownAbiResults: UnknownAbiBuilderCycleResult[] = [];
 			const result = await stagePackImport(
@@ -1412,6 +1383,7 @@ export function createEvoCommandExtension(options: EvoCommandExtensionOptions = 
 					}
 				} catch {
 					ctx.ui.setStatus("evo", undefined);
+					ctx.ui.setStatusItems("evo", undefined);
 				} finally {
 					refreshingStatus = false;
 				}
@@ -1429,6 +1401,7 @@ export function createEvoCommandExtension(options: EvoCommandExtensionOptions = 
 			canaryInspectorOpen = false;
 			promptedCanaryRuns.clear();
 			ctx.ui.setStatus("evo", undefined);
+			ctx.ui.setStatusItems("evo", undefined);
 		});
 		pi.registerShortcut(QUICK_APPROVE_SHORTCUT, {
 			description: "Apply the first pending T0 Evo-Pi proposal",
@@ -1456,6 +1429,7 @@ export function createEvoCommandExtension(options: EvoCommandExtensionOptions = 
 						await refreshEvoStatusIndicator(dependencies, ctx);
 					} catch {
 						ctx.ui.setStatus("evo", undefined);
+						ctx.ui.setStatusItems("evo", undefined);
 					}
 				}
 			},
@@ -1478,6 +1452,7 @@ export function createEvoCommandExtension(options: EvoCommandExtensionOptions = 
 						await refreshEvoStatusIndicator(dependencies, ctx);
 					} catch {
 						ctx.ui.setStatus("evo", undefined);
+						ctx.ui.setStatusItems("evo", undefined);
 					}
 				}
 			},
@@ -1659,15 +1634,19 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 				inspection.manifest,
 				inspection.entry.integrity,
 				dependencies.model,
-				dependencies.spawnAgentToolNames ?? [],
+				dependencies.spawnAgentToolNames ?? DEFAULT_SPAWN_AGENT_TOOL_NAMES,
 			);
 			io.write(formatPackInspection(inspection));
 			const parentDigest = await requireActiveBundleDigest(dependencies);
 			if (Object.keys(preview.grantsByComponent).length > 0) {
 				io.write(formatPackCapabilityGrantPreview(preview));
-				if (!(await confirmLocalMutation(io, "Stage this pack with the exact capability grants shown above?"))) {
-					io.write("Pack install cancelled before staging");
-					return;
+				if (await packGrantsNeedConfirmation(dependencies.paths)) {
+					if (!(await confirmLocalMutation(io, "Stage this pack with the exact capability grants shown above?"))) {
+						io.write("Pack install cancelled before staging");
+						return;
+					}
+				} else {
+					io.write("Capability grants auto-approved (grants.approval is 'auto')");
 				}
 			}
 			let unknownAbiResults: UnknownAbiBuilderCycleResult[] = [];
@@ -1692,13 +1671,17 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 			const preview = await previewPackCapabilityGrants(
 				packDirectory,
 				dependencies.model,
-				dependencies.spawnAgentToolNames ?? [],
+				dependencies.spawnAgentToolNames ?? DEFAULT_SPAWN_AGENT_TOOL_NAMES,
 			);
 			if (Object.keys(preview.grantsByComponent).length > 0) {
 				io.write(formatPackCapabilityGrantPreview(preview));
-				if (!(await confirmLocalMutation(io, "Stage this pack with the exact capability grants shown above?"))) {
-					io.write("Pack import cancelled before staging");
-					return;
+				if (await packGrantsNeedConfirmation(dependencies.paths)) {
+					if (!(await confirmLocalMutation(io, "Stage this pack with the exact capability grants shown above?"))) {
+						io.write("Pack import cancelled before staging");
+						return;
+					}
+				} else {
+					io.write("Capability grants auto-approved (grants.approval is 'auto')");
 				}
 			}
 			let unknownAbiResults: UnknownAbiBuilderCycleResult[] = [];

@@ -317,6 +317,7 @@ describe("discovery CLI", () => {
 				confirm: async () => true,
 				notify: (message: string) => notifications.push(message),
 				setStatus: () => {},
+				setStatusItems: () => {},
 			},
 		} as unknown as ExtensionCommandContext;
 
