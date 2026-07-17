@@ -15,6 +15,10 @@
 
 - Changed Evo activity into a dedicated final status line that shows the active Canary component by name and can be entered with Down from the end of a draft without exposing internal IDs.
 
+### Fixed
+
+- Fixed `/evo inspect` on small terminals hiding the top of the task list (pending proposals sort first), permanently showing "正在连接后台任务……" when an opened item no longer exists, and proposal cards opening scrolled to the bottom.
+
 ## [0.80.9] - 2026-07-16
 
 ### Added

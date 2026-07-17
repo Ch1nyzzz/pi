@@ -33,6 +33,9 @@
 
 ### Fixed
 
+- Fixed the Inspector polling a permanent "正在连接后台任务……" screen when the opened status item no longer exists (for example a proposal processed elsewhere): it now falls back to the live task list with a notice, and load errors are shown instead of swallowed.
+- Fixed the Inspector task list hiding its highest-priority entries (active runs and pending proposals sort first) on small terminals: the list is now top-anchored and scrolls only as far as needed to keep the selection visible.
+- Fixed proposal detail cards opening scrolled to the bottom; they now open at the top while live run views stay bottom-anchored.
 - Fixed code Builders hand-authoring malformed unified diffs: each code run now edits an isolated, commit-pinned worktree, the host generates and preserves the Git patch, and proposal staging rejects repository drift before validation.
 - Fixed terminal evolution runs hiding their still-pending proposals from `/evo inspect`; proposal details now show the exact `/evo permit` command needed to process them.
 

@@ -209,6 +209,11 @@ export class EvolutionProcessInspector implements Component {
 	private keeping = false;
 	private keepError?: string;
 	private itemKey?: string;
+	private loadError?: string;
+	private taskNotice?: string;
+	private taskScrollTop = 0;
+	private selectedTaskLine = 0;
+	private pendingInitialScroll: boolean;
 
 	constructor(
 		tui: TUI,
@@ -231,6 +236,7 @@ export class EvolutionProcessInspector implements Component {
 		this.approveCanary = approveCanary;
 		this.directKeepCanary = directKeepCanary;
 		this.mode = itemKey ? "run" : "tasks";
+		this.pendingInitialScroll = Boolean(itemKey);
 		void this.refresh();
 		this.timer = setInterval(() => void this.refresh(), 250);
 		this.timer.unref?.();
@@ -245,7 +251,18 @@ export class EvolutionProcessInspector implements Component {
 			this.taskIndex = Math.min(this.taskIndex, Math.max(0, this.items.length - 1));
 			if (this.mode === "run" && this.itemKey) {
 				this.item = this.items.find((item) => item.key === this.itemKey);
-				if (!this.item) throw new Error("Evo item is no longer available");
+				if (!this.item) {
+					// The referenced item no longer exists (processed elsewhere or a
+					// stale status entry): fall back to the live task list instead of
+					// polling a permanent "connecting" screen.
+					this.mode = "tasks";
+					this.itemKey = undefined;
+					this.run = undefined;
+					this.proposal = undefined;
+					this.taskNotice = "所选事项已不存在（可能已被处理）；请从下面的列表重新选择";
+					this.tui.requestRender();
+					return;
+				}
 				if (this.item.kind === "proposal") {
 					this.run = undefined;
 					this.proposal = this.item.proposal;
@@ -253,6 +270,10 @@ export class EvolutionProcessInspector implements Component {
 					this.artifacts = {};
 					this.trial = undefined;
 					this.trialComparison = undefined;
+					if (this.pendingInitialScroll) {
+						// A proposal card is a static document: open it at the top.
+						this.scrollFromBottom = Number.MAX_SAFE_INTEGER;
+					}
 				} else {
 					this.run = await readEvolutionRun(this.paths, this.item.run.id);
 					const directory = evolutionRunDirectory(this.paths, this.run.id);
@@ -284,19 +305,11 @@ export class EvolutionProcessInspector implements Component {
 					} else if (!this.trial) this.trialComparison = undefined;
 				}
 			}
+			this.pendingInitialScroll = false;
+			this.loadError = undefined;
 			this.tui.requestRender();
 		} catch (error) {
-			if (this.mode === "run") {
-				this.run = undefined;
-				this.events = [
-					{
-						timestamp: new Date().toISOString(),
-						phase: "unknown",
-						type: "text",
-						delta: error instanceof Error ? error.message : String(error),
-					},
-				];
-			}
+			this.loadError = error instanceof Error ? error.message : String(error);
 			this.tui.requestRender();
 		}
 	}
@@ -305,12 +318,15 @@ export class EvolutionProcessInspector implements Component {
 		const lines = [
 			this.theme.fg("accent", this.theme.bold("Evo 工作流")),
 			"",
+			...(this.taskNotice ? [this.theme.fg("warning", this.taskNotice), ""] : []),
 			"选择任务并按 Enter 查看实时进度：",
 			"",
 		];
 		if (this.items.length === 0) lines.push(this.theme.fg("muted", "暂无事项"));
+		this.selectedTaskLine = 0;
 		for (const [index, item] of this.items.entries()) {
 			const selected = index === this.taskIndex;
+			if (selected) this.selectedTaskLine = lines.length;
 			const marker = selected ? this.theme.fg("accent", "›") : " ";
 			const terminal = item.kind === "run" && TERMINAL_STATUSES.has(item.run.status);
 			const paused = item.kind === "run" && item.run.status === "paused";
@@ -505,7 +521,14 @@ export class EvolutionProcessInspector implements Component {
 	private runLines(): string[] {
 		if (this.item?.kind === "proposal") return this.proposalLines(this.item.proposal);
 		const run = this.run;
-		if (!run) return [this.theme.fg("warning", "正在连接后台任务……")];
+		if (!run) {
+			return [
+				this.theme.fg("warning", "正在连接后台任务……"),
+				...(this.loadError
+					? ["", this.theme.fg("error", this.loadError), this.theme.fg("dim", "Esc 返回事项列表")]
+					: []),
+			];
+		}
 		if (run.status === "awaiting-canary-approval") return this.canaryLines(run);
 		if (run.status === "trialing" && this.item?.component) return this.activeCanaryLines();
 		const thinking = thinkingText(this.events);
@@ -591,11 +614,25 @@ export class EvolutionProcessInspector implements Component {
 
 	render(width: number): string[] {
 		const logical = this.mode === "tasks" ? this.taskLines() : this.runLines();
-		const wrapped = logical
-			.flatMap((line) => wrapTextWithAnsi(line, Math.max(1, width - 2)))
-			.map((line) => ` ${line}`);
+		const wrapped: string[] = [];
+		let selectedStart = 0;
+		let selectedEnd = 0;
+		for (const [index, line] of logical.entries()) {
+			if (this.mode === "tasks" && index === this.selectedTaskLine) selectedStart = wrapped.length;
+			for (const part of wrapTextWithAnsi(line, Math.max(1, width - 2))) wrapped.push(` ${part}`);
+			if (this.mode === "tasks" && index === this.selectedTaskLine) selectedEnd = wrapped.length;
+		}
 		const viewport = Math.max(5, this.tui.terminal.rows - 4);
 		const maxStart = Math.max(0, wrapped.length - viewport);
+		if (this.mode === "tasks") {
+			// The task list is top-anchored and scrolls only as far as needed to
+			// keep the selected item visible; the highest-priority items are at
+			// the top, so a small terminal must never hide them by default.
+			if (selectedEnd > this.taskScrollTop + viewport) this.taskScrollTop = selectedEnd - viewport;
+			if (selectedStart < this.taskScrollTop) this.taskScrollTop = selectedStart;
+			this.taskScrollTop = Math.min(Math.max(0, this.taskScrollTop), maxStart);
+			return wrapped.slice(this.taskScrollTop, this.taskScrollTop + viewport);
+		}
 		const start = Math.max(0, maxStart - this.scrollFromBottom);
 		return wrapped.slice(start, start + viewport);
 	}
@@ -688,9 +725,12 @@ export class EvolutionProcessInspector implements Component {
 					this.item = selected;
 					this.run = selected.kind === "run" ? selected.run : undefined;
 					this.mode = "run";
+					this.taskNotice = undefined;
 					this.sectionIndex = 0;
 					this.expandedSection = undefined;
-					this.scrollFromBottom = 0;
+					// Proposal cards are static documents and open at the top; run
+					// views stay bottom-anchored to follow live progress.
+					this.scrollFromBottom = selected.kind === "proposal" ? Number.MAX_SAFE_INTEGER : 0;
 					this.approvalView = "choice";
 					this.approvalChoice = 0;
 					this.customField = 0;
