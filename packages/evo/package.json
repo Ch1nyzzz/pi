@@ -1,6 +1,6 @@
 {
 	"name": "@ch1nyzzz/pi-evo",
-	"version": "0.80.21",
+	"version": "0.80.22",
 	"description": "Self-evolving coding agent workflows for pi",
 	"type": "module",
 	"main": "./dist/index.js",

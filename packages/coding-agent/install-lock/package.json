@@ -1,10 +1,10 @@
 {
 	"name": "@ch1nyzzz/pi-coding-agent-install",
-	"version": "0.80.21",
+	"version": "0.80.22",
 	"private": true,
 	"description": "Lockfile root used by the Pi installer and updater.",
 	"dependencies": {
-		"@ch1nyzzz/pi-coding-agent": "0.80.21"
+		"@ch1nyzzz/pi-coding-agent": "0.80.22"
 	},
 	"overrides": {
 		"rimraf": "6.1.2",
