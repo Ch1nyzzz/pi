@@ -4,6 +4,12 @@
 
 ### Added
 
+- Added user-decided recommended verification: research plans can mark replay evidence as recommended instead of required, and a request-triggered run then parks after evaluation with an Inspector decision card (执行 `e` / 跳过 `s` / 拒绝 `r`, auto-prompted in the TUI) or `/evo verify [run-id] execute|skip|reject`. Scheduled runs execute recommendations automatically; `verification.approval: auto` extends that to request runs.
+
+### Fixed
+
+- Fixed required replay to execute inline for every proposal tier (previously only T2, so a T0/T1 plan requiring replay was rejected for evidence the harness never produced) and enforced deterministic session-sourced preference ids at the schema level.
+
 - Added `grants` (capability budgets and usage per component), `history` (bundle keep/rollback audit trail), and `triage [now]` (streaming-triage status and manual trigger) commands; `go --scheduled` absorbs `scheduled-improve` (deprecated alias kept), and the shared commands of `/evo` and `evo-pi` now run through one handler table so the two surfaces cannot drift.
 - Added `packs init`, `workflows`, `config get/set`, `inbox`, and `usage` commands; `workflow` is renamed to `playbook` (deprecated alias kept).
 - Added the bundled `/deep-research` (multi-source research with adversarial claim verification) and `/deepcode` (multi-agent coding: parallel exploration, frozen plan, verify-fix loop) workflow pack templates alongside `/deep-review`.
