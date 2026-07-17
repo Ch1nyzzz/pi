@@ -74,6 +74,36 @@ describe("evo command surface", () => {
 		);
 	});
 
+	it("installs a bundled workflow end to end from the parameterless import wizard", async () => {
+		const root = await temporary("evo-cmd-import-wizard-");
+		const { paths, service } = await seedActiveBundle(root);
+
+		const listing = captureCliOutput();
+		await runEvoCli(["import"], { paths, service, io: listing.io, model: "test/model", sandbox: false });
+		expect(listing.messages.join("\n")).toContain("可安装的 workflow 模板");
+
+		// Interactive wizard: pick template 3 (deepcode), approve it in one flow.
+		const answers = ["3", "a", "y"];
+		const messages: string[] = [];
+		const io: EvoCliIO = {
+			interactive: true,
+			write: (message) => messages.push(message),
+			writeError: (message) => messages.push(message),
+			question: async () => answers.shift() ?? "",
+		};
+		await runEvoCli(["import"], { paths, service, io, model: "test/model", sandbox: false });
+		const output = messages.join("\n");
+		expect(output).toContain("可安装的 workflow 模板");
+		const trialing = (await service.listProposals()).find((entry) => entry.status === "trialing");
+		expect(trialing?.motivation).toContain("deepcode");
+		expect(output).toContain("/deepcode 生效");
+
+		// Re-running the wizard now reports deepcode as active.
+		const again = captureCliOutput();
+		await runEvoCli(["import"], { paths, service, io: again.io, model: "test/model", sandbox: false });
+		expect(again.messages.join("\n")).toContain("[已激活] — Multi-agent coding");
+	});
+
 	it("imports a workflow pack whose proposal is immediately approvable", async () => {
 		const root = await temporary("evo-cmd-import-approve-");
 		const { paths, service } = await seedActiveBundle(root);

@@ -1,5 +1,6 @@
-import { readdir, readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdtemp, readdir, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { loadCompiledBundle } from "./bundle/compile.ts";
 import { renderTrialComparisonMarkdown, type TrialComparison } from "./comparison.ts";
 import { EvoCapabilityBroker } from "./components/capabilities/broker.ts";
@@ -232,6 +233,71 @@ const WORKFLOW_PACK_TEMPLATES: Record<
 		write: writeDeepcodePack,
 	},
 };
+
+export interface EvoInstallableWorkflowTemplate {
+	name: string;
+	trigger: string;
+	description: string;
+	/** active: already in the stable bundle; pending: staged proposal awaits approval. */
+	state: "available" | "active" | "pending";
+	pendingProposalId?: string;
+}
+
+/** The bundled workflow templates annotated with their local install state. */
+export async function listInstallableWorkflowTemplates(
+	context: EvoSharedCommandContext,
+): Promise<EvoInstallableWorkflowTemplate[]> {
+	const digest = await context.service.registry.readStableDigest();
+	const activeTriggers = new Set<string>();
+	if (digest) {
+		const bundle = await loadCompiledBundle(context.paths, digest);
+		for (const selection of bundle.policy.workflows ?? []) activeTriggers.add(selection.trigger);
+	}
+	const proposals = await context.service.listProposals();
+	return Object.entries(WORKFLOW_PACK_TEMPLATES).map(([name, template]) => {
+		const pending = proposals.find(
+			(proposal) =>
+				proposal.status === "pending" &&
+				proposal.targetAbi === "workflow/v1" &&
+				proposal.motivation.includes(`optimization pack "${name}"`),
+		);
+		return {
+			name,
+			trigger: template.trigger,
+			description: template.description,
+			state: activeTriggers.has(template.trigger)
+				? ("active" as const)
+				: pending
+					? ("pending" as const)
+					: ("available" as const),
+			...(pending ? { pendingProposalId: pending.id } : {}),
+		};
+	});
+}
+
+const TEMPLATE_STATE_LABELS = { available: "可安装", active: "已激活", pending: "待批准" } as const;
+
+/** Numbered listing used by the parameterless `import` wizard. */
+export function formatInstallableTemplates(templates: readonly EvoInstallableWorkflowTemplate[]): string {
+	return [
+		"可安装的 workflow 模板:",
+		...templates.map(
+			(template, index) =>
+				`${index + 1}. ${template.name} (${template.trigger}) [${TEMPLATE_STATE_LABELS[template.state]}] — ${template.description}`,
+		),
+		"",
+		"选择一个模板可自动完成 生成 → 导入 → 批准;外部优化包用 'import <directory>'。",
+	].join("\n");
+}
+
+/** Write a bundled template into a throwaway staging directory for import. */
+export async function writeWorkflowTemplateToStaging(name: string): Promise<string> {
+	const template = WORKFLOW_PACK_TEMPLATES[name];
+	if (!template) throw new Error(`Unknown pack template: ${name}`);
+	const directory = await mkdtemp(join(tmpdir(), `evo-pack-${name}-`));
+	await template.write(directory);
+	return directory;
+}
 
 function formatWorkflowPackTemplates(): string {
 	return [

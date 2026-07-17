@@ -15,6 +15,10 @@
 
 - Changed Evo activity into a dedicated final status line that shows the active Canary component by name and can be entered with Down from the end of a draft without exposing internal IDs.
 
+### Added
+
+- `/evo import` without arguments is now a one-flow install wizard: it lists the bundled workflow templates with their state, and selecting one generates, imports, and immediately opens approval; directory imports also continue into approval.
+
 ### Fixed
 
 - Fixed imported workflow packs being unapprovable ("missing required review artifact"): import now executes each component (dry run / fixture / health probe) and attaches the approval artifacts, so `packs init` → `import` → `permit` works end to end.

@@ -1,14 +1,18 @@
+import { rm } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import type { ExtensionCommandContext, ExtensionContext, ExtensionFactory } from "@ch1nyzzz/pi-coding-agent";
 import { DEFAULT_SPAWN_AGENT_TOOL_NAMES } from "./bundle/runtime.ts";
 import {
 	type EvoCommandPresenter,
+	formatInstallableTemplates,
 	formatProposalCard,
+	listInstallableWorkflowTemplates,
 	modelRunOptions,
 	requireActiveBundleDigest,
 	requireValue,
 	runSharedEvoCommand,
 	splitFirst,
+	writeWorkflowTemplateToStaging,
 } from "./cli-commands.ts";
 import { parseTrialDurationDays } from "./comparison.ts";
 import type { EvoBudgetedCapabilityGrant, EvoCapabilityGrant } from "./components/capabilities/broker.ts";
@@ -113,7 +117,7 @@ const EVO_HELP = `Usage: /evo <command>
   init                         Initialize and migrate Pi data into a bundle
   search [query]               Search configured optimization-pack registries
   install <name> [version]     Verify a trusted registry pack and stage proposals
-  import <directory>           Verify a pack and stage proposals; never activate it
+  import [directory]           No argument: pick a bundled workflow and install it end to end; with a directory: verify the pack and stage proposals
   export <directory>           Export the active bundle as an optimization pack
   status                       Show registry and trial status
   report                       Generate a read-only evidence report
@@ -460,6 +464,16 @@ async function stagePackImport(
 		...(grantsByComponent ? { grantsByComponent } : {}),
 		...(beforeStage ? { beforeStage } : {}),
 	});
+}
+
+function describePermitOutcome(proposal: Proposal, trigger?: string): string {
+	if (proposal.status === "trialing") {
+		return trigger
+			? `已批准并进入 Canary；重开会话后 ${trigger} 生效`
+			: `Proposal ${proposal.id} approved; reversible trial started`;
+	}
+	if (proposal.status === "kept") return `Proposal ${proposal.id} approved and kept`;
+	return `Proposal ${proposal.id} is ${proposal.status}`;
 }
 
 const PACK_DIRECT_VALIDATION_PROMPT =
@@ -1086,7 +1100,33 @@ async function dispatchExtensionCommand(
 			return;
 		}
 		case "import": {
-			const packDirectory = requireValue(rest, "/evo import <directory>");
+			let packDirectory = rest.trim();
+			let stagingDirectory: string | undefined;
+			if (!packDirectory) {
+				const templates = await listInstallableWorkflowTemplates(dependencies);
+				if (!ctx.hasUI) {
+					sendCustomCard(pi, "evo.import-menu", formatInstallableTemplates(templates), {});
+					return;
+				}
+				const labels = templates.map(
+					(template) =>
+						`${template.name} (${template.trigger}) — ${template.state === "active" ? "已激活" : template.state === "pending" ? "待批准" : template.description}`,
+				);
+				const choice = await ctx.ui.select("安装 workflow 模板（外部包用 /evo import <目录>）", labels);
+				const selected = templates[labels.indexOf(choice ?? "")];
+				if (!selected) return;
+				if (selected.state === "active") {
+					ctx.ui.notify(`${selected.trigger} 已在当前 bundle 中激活`, "info");
+					return;
+				}
+				if (selected.state === "pending" && selected.pendingProposalId) {
+					const outcome = await runExtensionPermit(pi, dependencies, selected.pendingProposalId, ctx);
+					if (outcome) ctx.ui.notify(describePermitOutcome(outcome, selected.trigger), "info");
+					return;
+				}
+				stagingDirectory = await writeWorkflowTemplateToStaging(selected.name);
+				packDirectory = stagingDirectory;
+			}
 			const parentDigest = await requireActiveBundleDigest(dependencies);
 			const preview = await previewPackCapabilityGrants(
 				packDirectory,
@@ -1140,6 +1180,19 @@ async function dispatchExtensionCommand(
 				pack: result.manifest.name,
 				integrity: result.manifest.integrity,
 			});
+			if (stagingDirectory) await rm(stagingDirectory, { recursive: true, force: true }).catch(() => undefined);
+			// Continue straight into approval so installing a pack is one flow
+			// instead of a scavenger hunt across import/list/permit.
+			if (ctx.hasUI) {
+				for (const component of result.importedComponents) {
+					const outcome = await runExtensionPermit(pi, dependencies, component.proposal.id, ctx);
+					if (outcome) ctx.ui.notify(describePermitOutcome(outcome, component.trigger), "info");
+				}
+				if (result.proposal) {
+					const outcome = await runExtensionPermit(pi, dependencies, result.proposal.id, ctx);
+					if (outcome) ctx.ui.notify(describePermitOutcome(outcome), "info");
+				}
+			}
 			return;
 		}
 		case "export": {
@@ -1449,6 +1502,7 @@ async function runLocalPermit(
 ): Promise<Proposal | undefined> {
 	requireInteractive(io);
 	let proposal = await dependencies.service.getProposal(id);
+	let unrecognizedActions = 0;
 	while (true) {
 		io.write(await formatProposalCard(dependencies.paths, proposal));
 		const strictPermit = proposal.kind === "code" || proposal.tier === "T2";
@@ -1530,7 +1584,13 @@ async function runLocalPermit(
 				diffDigest: proposal.diffDigest,
 				reason,
 			});
+			continue;
 		}
+		// Guard against scripted input that never matches an action key: close
+		// instead of re-prompting forever.
+		unrecognizedActions += 1;
+		if (unrecognizedActions >= 5) return undefined;
+		io.write(`Unrecognized action: ${action}`);
 	}
 }
 
@@ -1625,8 +1685,31 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 			return;
 		}
 		case "import": {
-			requireArgumentCount(args, 2, 2, "evo-pi import <directory>");
-			const packDirectory = requireValue(args[1] ?? "", "evo-pi import <directory>");
+			requireArgumentCount(args, 1, 2, "evo-pi import [directory]");
+			let packDirectory = (args[1] ?? "").trim();
+			let stagingDirectory: string | undefined;
+			if (!packDirectory) {
+				const templates = await listInstallableWorkflowTemplates(dependencies);
+				io.write(formatInstallableTemplates(templates));
+				if (!io.interactive) return;
+				const answer = (await io.question("选择要安装的模板编号（回车取消）: ")).trim();
+				if (!answer) return;
+				const selected = templates[Number(answer) - 1];
+				if (!selected) throw new Error(`无效选择: ${answer}`);
+				if (selected.state === "active") {
+					io.write(`${selected.trigger} 已在当前 bundle 中激活`);
+					return;
+				}
+				if (selected.state === "pending" && selected.pendingProposalId) {
+					const outcome = await runLocalPermit(io, dependencies, selected.pendingProposalId);
+					io.write(
+						outcome ? describePermitOutcome(outcome, selected.trigger) : "Approval closed without a decision",
+					);
+					return;
+				}
+				stagingDirectory = await writeWorkflowTemplateToStaging(selected.name);
+				packDirectory = stagingDirectory;
+			}
 			const parentDigest = await requireActiveBundleDigest(dependencies);
 			const preview = await previewPackCapabilityGrants(
 				packDirectory,
@@ -1664,6 +1747,20 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 				sandboxDecision.sandbox,
 			);
 			io.write(formatPackImportResult(result, unknownAbiResults));
+			if (stagingDirectory) await rm(stagingDirectory, { recursive: true, force: true }).catch(() => undefined);
+			// Continue straight into approval so installing a pack is one flow.
+			if (io.interactive) {
+				for (const component of result.importedComponents) {
+					const outcome = await runLocalPermit(io, dependencies, component.proposal.id);
+					io.write(
+						outcome ? describePermitOutcome(outcome, component.trigger) : "Approval closed without a decision",
+					);
+				}
+				if (result.proposal) {
+					const outcome = await runLocalPermit(io, dependencies, result.proposal.id);
+					io.write(outcome ? describePermitOutcome(outcome) : "Approval closed without a decision");
+				}
+			}
 			return;
 		}
 		case "export": {

@@ -33,6 +33,7 @@
 
 ### Added
 
+- Added the one-flow install wizard: parameterless `import` lists the bundled workflow templates with their live state (可安装/待批准/已激活), and picking one generates, imports, and drops straight into approval — no separate `packs init`/`list`/`permit` steps. `import <directory>` also continues into approval interactively, and installed triggers report exactly when they become usable.
 - Added in-place proposal processing to the Inspector: a pinned action bar under the proposal card offers 批准/拒绝/推迟 (and 重新打开 for deferred proposals) with reason input, a two-step confirm for ordinary approvals, and the exact-digest entry for strict T2/code approvals — no more copying the id into `/evo permit`.
 - Redesigned the Inspector task list: status glyphs (● pending, ▶ running, ◆ Canary, ✓/✗ history), no redundant `Evo:` prefix, inline elapsed time, and an item count in the header. Proposal cards show the executable validation and independent review artifacts when present and localize the status line.
 
