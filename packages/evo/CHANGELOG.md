@@ -31,6 +31,11 @@
 - Spawned child agents now default to the host's real coding tools (`bash`, `edit`, `find`, `grep`, `ls`, `read`, `write`) and grant previews default their allowlist to the same set.
 - Unified the surface-independent commands of the `/evo` extension and the `evo-pi` CLI behind one shared handler table (`cli-commands.ts`) with a presenter seam, so command behavior can no longer drift between the two dispatchers.
 
+### Added
+
+- Added in-place proposal processing to the Inspector: a pinned action bar under the proposal card offers 批准/拒绝/推迟 (and 重新打开 for deferred proposals) with reason input, a two-step confirm for ordinary approvals, and the exact-digest entry for strict T2/code approvals — no more copying the id into `/evo permit`.
+- Redesigned the Inspector task list: status glyphs (● pending, ▶ running, ◆ Canary, ✓/✗ history), no redundant `Evo:` prefix, inline elapsed time, and an item count in the header. Proposal cards show the executable validation and independent review artifacts when present and localize the status line.
+
 ### Fixed
 
 - Fixed the Inspector polling a permanent "正在连接后台任务……" screen when the opened status item no longer exists (for example a proposal processed elsewhere): it now falls back to the live task list with a notice, and load errors are shown instead of swallowed.
