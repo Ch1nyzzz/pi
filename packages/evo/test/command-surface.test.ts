@@ -4,11 +4,13 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { compileBundle } from "../src/bundle/compile.ts";
 import { type EvoCliIO, runEvoCli } from "../src/cli.ts";
+import { EvoCapabilityBroker } from "../src/components/capabilities/broker.ts";
 import { readEvoControlConfig } from "../src/evolve/config.ts";
 import { loadEvoPack } from "../src/pack/pack.ts";
 import { getEvoPaths } from "../src/paths.ts";
 import { createRecorderStore } from "../src/recorder/store.ts";
 import { BundleRegistry } from "../src/registry/registry.ts";
+import { writeScheduleConfig } from "../src/scheduler.ts";
 import { EvoService } from "../src/service.ts";
 
 const roots: string[] = [];
@@ -110,6 +112,81 @@ describe("evo command surface", () => {
 		const output = messages.join("\n");
 		expect(output).toContain("Inbox entries (1)");
 		expect(output).toContain("remember to profile the slow path");
+	});
+
+	it("shows capability grants with usage against their budgets", async () => {
+		const root = await temporary("evo-cmd-grants-");
+		const { paths, service } = await seedActiveBundle(root);
+		const empty = captureCliOutput();
+		await runEvoCli(["grants"], { paths, service, io: empty.io });
+		expect(empty.messages.join("\n")).toContain("No components hold capability grants");
+
+		await new EvoCapabilityBroker({ paths }).replaceComponentGrants(
+			{
+				id: "wf-demo",
+				abi: "workflow/v1",
+				artifactDigest: "ab".repeat(32),
+				declaredCapabilities: ["memory-read"],
+				abiCapabilityCeiling: ["memory-read", "memory-write", "spawn-agent"],
+			},
+			[{ capability: "memory-read", maxCalls: 5 }],
+		);
+		const listed = captureCliOutput();
+		await runEvoCli(["grants"], { paths, service, io: listed.io });
+		const output = listed.messages.join("\n");
+		expect(output).toContain("wf-demo");
+		expect(output).toContain("memory-read: 0/5 calls");
+
+		await expect(runEvoCli(["grants", "extra"], { paths, service, io: listed.io })).rejects.toThrow(
+			"Usage: evo-pi grants",
+		);
+	});
+
+	it("shows the bundle transition history", async () => {
+		const root = await temporary("evo-cmd-history-");
+		const { paths, service } = await seedActiveBundle(root);
+		const { io, messages } = captureCliOutput();
+		await runEvoCli(["history"], { paths, service, io });
+		const output = messages.join("\n");
+		expect(output).toContain("Bundle history");
+		expect(output).toContain("initialize");
+
+		await expect(runEvoCli(["history", "soon"], { paths, service, io })).rejects.toThrow("Usage: evo-pi history");
+	});
+
+	it("reports triage status and skips a forced run without new sessions", async () => {
+		const root = await temporary("evo-cmd-triage-");
+		const { paths, service } = await seedActiveBundle(root);
+		const status = captureCliOutput();
+		await runEvoCli(["triage"], { paths, service, io: status.io });
+		const output = status.messages.join("\n");
+		expect(output).toContain("Last triage run: never");
+		expect(output).toContain("triage now");
+
+		const forced = captureCliOutput();
+		await runEvoCli(["triage", "now"], { paths, service, io: forced.io });
+		expect(forced.messages.join("\n")).toContain("no new complete sessions");
+
+		await expect(runEvoCli(["triage", "later"], { paths, service, io: forced.io })).rejects.toThrow(
+			"Usage: evo-pi triage [now]",
+		);
+	});
+
+	it("folds scheduled-improve into go --scheduled with the alias intact", async () => {
+		const root = await temporary("evo-cmd-go-scheduled-");
+		const { paths, service } = await seedActiveBundle(root);
+		await writeScheduleConfig(paths, { mode: "manual" });
+		const scheduled = captureCliOutput();
+		await runEvoCli(["go", "--scheduled"], { paths, service, io: scheduled.io });
+		expect(scheduled.messages.at(-1)).toBe("Scheduled improve skipped: manual-mode");
+
+		const alias = captureCliOutput();
+		await runEvoCli(["scheduled-improve"], { paths, service, io: alias.io });
+		expect(alias.messages).toEqual(scheduled.messages);
+
+		await expect(runEvoCli(["go", "--soon"], { paths, service, io: alias.io })).rejects.toThrow(
+			"Usage: evo-pi go [request | --scheduled]",
+		);
 	});
 
 	it("summarizes model usage and treats workflow as a playbook alias", async () => {

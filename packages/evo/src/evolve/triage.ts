@@ -88,6 +88,21 @@ async function readTriageCursor(paths: EvoPaths): Promise<TriageCursor | undefin
 	return cursor as unknown as TriageCursor;
 }
 
+export interface SessionTriageStatus {
+	/** ISO timestamp of the last triage run, absent when triage never ran. */
+	lastRunAt?: string;
+	/** Complete sessions recorded since the cursor (all sessions when no cursor). */
+	newSessions: number;
+}
+
+/** Read-only view of the triage cursor and the backlog behind it. */
+export async function getSessionTriageStatus(paths: EvoPaths): Promise<SessionTriageStatus> {
+	const cursor = await readTriageCursor(paths);
+	const digests = (await listSessionDigests(paths)).filter((digest) => digest.complete);
+	const fresh = cursor ? digests.filter((digest) => digestKey(digest) > cursor.lastSessionKey) : digests;
+	return { ...(cursor ? { lastRunAt: cursor.lastRunAt } : {}), newSessions: fresh.length };
+}
+
 const TRIAGE_SUBMISSION_PARAMETERS = Type.Object(
 	{
 		hypotheses: Type.Array(

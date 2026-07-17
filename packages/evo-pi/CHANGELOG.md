@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added `grants` (capability budgets and usage per component), `history` (bundle keep/rollback audit trail), and `triage [now]` (streaming-triage status and manual trigger) commands; `go --scheduled` absorbs `scheduled-improve` (deprecated alias kept), and the shared commands of `/evo` and `evo-pi` now run through one handler table so the two surfaces cannot drift.
 - Added `packs init`, `workflows`, `config get/set`, `inbox`, and `usage` commands; `workflow` is renamed to `playbook` (deprecated alias kept).
 - Added the bundled `/deep-research` (multi-source research with adversarial claim verification) and `/deepcode` (multi-agent coding: parallel exploration, frozen plan, verify-fix loop) workflow pack templates alongside `/deep-review`.
 - Added the workflow SDK and the bundled `/deep-review` workflow pack template: workflow components can now be written with `runWorkflow()`/`agent()`/`parallel()`/`pipeline()` instead of raw JSONL-RPC, and child agents run with the host's real coding tools.

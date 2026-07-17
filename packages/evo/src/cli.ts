@@ -1,12 +1,18 @@
-import { readdir } from "node:fs/promises";
-import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import type { ExtensionCommandContext, ExtensionContext, ExtensionFactory } from "@ch1nyzzz/pi-coding-agent";
-import { loadCompiledBundle } from "./bundle/compile.ts";
 import { DEFAULT_SPAWN_AGENT_TOOL_NAMES } from "./bundle/runtime.ts";
-import { parseTrialDurationDays, renderTrialComparisonMarkdown, type TrialComparison } from "./comparison.ts";
+import {
+	type EvoCommandPresenter,
+	formatProposalCard,
+	modelRunOptions,
+	requireActiveBundleDigest,
+	requireValue,
+	runSharedEvoCommand,
+	splitFirst,
+} from "./cli-commands.ts";
+import { parseTrialDurationDays } from "./comparison.ts";
 import type { EvoBudgetedCapabilityGrant, EvoCapabilityGrant } from "./components/capabilities/broker.ts";
-import { EvoCapabilityBroker, parseEvoCapabilityGrants } from "./components/capabilities/broker.ts";
+import { parseEvoCapabilityGrants } from "./components/capabilities/broker.ts";
 import { canUseEvoComponentSandbox } from "./components/process-runtime.ts";
 import type { EvoDiscoveredPack } from "./discovery/client.ts";
 import { getEvoPackDiscoveryConfigPath, readEvoPackDiscoveryConfig } from "./discovery/config.ts";
@@ -18,21 +24,9 @@ import {
 } from "./discovery/service.ts";
 import { type EvoDiscoveryFetch, EvoPackDiscoveryTransport } from "./discovery/transport.ts";
 import { listEvoActivityItems } from "./evolve/activity.ts";
-import {
-	formatEvolutionRuns,
-	inspectBackgroundEvolutions,
-	pauseBackgroundEvolution,
-	removeBackgroundEvolution,
-	resumeBackgroundEvolution,
-	startBackgroundEvolution,
-} from "./evolve/background.ts";
-import {
-	readEvoControlConfig,
-	readEvolutionWorkflow,
-	resetEvolutionWorkflow,
-	updateEvoControlConfigValue,
-} from "./evolve/config.ts";
-import { runEvolutionCycle, runUnknownAbiBuilderCycle, type UnknownAbiBuilderCycleResult } from "./evolve/cycle.ts";
+import { formatEvolutionRuns, inspectBackgroundEvolutions } from "./evolve/background.ts";
+import { readEvoControlConfig } from "./evolve/config.ts";
+import { runUnknownAbiBuilderCycle, type UnknownAbiBuilderCycleResult } from "./evolve/cycle.ts";
 import { EvolutionProcessInspector } from "./evolve/inspect-ui.ts";
 import { changesComponentSelection } from "./evolve/release.ts";
 import { retryEvolutionFromValidation } from "./evolve/retry.ts";
@@ -43,18 +37,11 @@ import {
 	updateEvolutionRun,
 } from "./evolve/run.ts";
 import type { UnknownAbiBuilderRequest } from "./evolve/unknown-abi.ts";
-import { readInboxEntry, readInboxLifecycleStates } from "./inbox.ts";
-import { readBundlePreferenceMemory } from "./memory/preferences.ts";
 import { exportEvoPack } from "./pack/export.ts";
 import { type EvoPackImportPreflight, type EvoPackImportResult, importEvoPack } from "./pack/import.ts";
 import { type EvoPackManifest, loadEvoPack } from "./pack/pack.ts";
-import { DEEP_RESEARCH_TRIGGER, writeDeepResearchPack } from "./pack/templates/deep-research.ts";
-import { DEEP_REVIEW_TRIGGER, writeDeepReviewPack } from "./pack/templates/deep-review.ts";
-import { DEEPCODE_TRIGGER, writeDeepcodePack } from "./pack/templates/deepcode.ts";
-import type { WrittenWorkflowPack } from "./pack/templates/write-pack.ts";
 import { type EvoPaths, getEvoPaths } from "./paths.ts";
 import { proposalApproval } from "./proposal.ts";
-import { readEvaluationArtifact } from "./proposal-artifacts.ts";
 import { createPiModelRunner, type ModelRunner } from "./reflect/model-runner.ts";
 import {
 	askProposalQuestion,
@@ -64,25 +51,16 @@ import {
 } from "./reflect/permit.ts";
 import { runReport } from "./reflect/reflector.ts";
 import { runRetrospective } from "./reflect/retrospective.ts";
-import { renderModelUsageSummary, summarizeModelUsage } from "./reflect/usage.ts";
 import {
 	type EvoScheduleConfig,
 	type EvoScheduleStatus,
 	getScheduleStatus,
 	parseScheduleCadence,
 	readScheduleConfig,
-	runConfiguredImprove,
-	type ScheduledImproveResult,
 	writeScheduleConfig,
 } from "./scheduler.ts";
 import { EvoService } from "./service.ts";
-import type {
-	CanaryTrialControl,
-	ComponentApprovalDecision,
-	EvoStatus,
-	Proposal,
-	ProposalArtifactKind,
-} from "./types.ts";
+import type { CanaryTrialControl, ComponentApprovalDecision, Proposal } from "./types.ts";
 
 const SUBCOMMANDS = [
 	"help",
@@ -99,13 +77,14 @@ const SUBCOMMANDS = [
 	"resume",
 	"delete",
 	"retry",
-	"scheduled-improve",
 	"schedule",
-	"workflow",
 	"playbook",
 	"workflows",
 	"packs",
 	"config",
+	"grants",
+	"history",
+	"triage",
 	"inbox",
 	"usage",
 	"list",
@@ -122,8 +101,6 @@ const SUBCOMMANDS = [
 	"rollback",
 	"keep",
 	"retrospect",
-	"pause",
-	"resume",
 ] as const;
 
 const QUICK_APPROVE_SHORTCUT = "ctrl+alt+e" as const;
@@ -140,18 +117,20 @@ const EVO_HELP = `Usage: /evo <command>
   export <directory>           Export the active bundle as an optimization pack
   status                       Show registry and trial status
   report                       Generate a read-only evidence report
-  go [request]                 Start a background research-plan/build/evaluate task
+  go [request|--scheduled]     Start a background evolution task (--scheduled: one guarded cadence-gated attempt)
   inspect [run-id]             Inspect background and completed tasks
   pause <run-id>               Pause a background task
   resume <run-id>              Resume a paused task
   delete <run-id>              Stop and permanently delete a task
   retry <run-id>               Reuse a built component and continue from validation
-  scheduled-improve            Run one guarded background evolution attempt
   schedule [cadence]           Show or set the evolution cadence (daily, 3d, weekly, manual)
   playbook [reset]             Show or reset the evolution playbook (guides research)
   workflows                    List active workflow components and their triggers
   packs [init <name> [dir]]    List bundled workflow pack templates or write one
   config [set <key> <value>]   Show or update the evo control config
+  grants                       Show component capability grants, usage, and budgets
+  history [<count>]            Show the bundle transition audit history (keep/rollback)
+  triage [now]                 Show streaming-triage status, or scan new sessions now
   inbox                        List inbox entries with lifecycle status
   usage [<n>d]                 Show model usage and cost by phase (default 7d)
   list                         List proposals
@@ -235,18 +214,6 @@ function parseSubcommand(args: string): { command: string; rest: string } {
 	};
 }
 
-function splitFirst(value: string): { first: string; rest: string } {
-	const trimmed = value.trim();
-	const separator = trimmed.search(/\s/);
-	if (separator === -1) return { first: trimmed, rest: "" };
-	return { first: trimmed.slice(0, separator), rest: trimmed.slice(separator).trim() };
-}
-
-function requireValue(value: string, usage: string): string {
-	if (!value.trim()) throw new Error(`Usage: ${usage}`);
-	return value.trim();
-}
-
 function requireArgumentCount(args: string[], minimum: number, maximum: number, usage: string): void {
 	if (args.length < minimum || args.length > maximum) throw new Error(`Usage: ${usage}`);
 }
@@ -265,21 +232,6 @@ function parsePackSelection(value: string, usage: string): { name: string; versi
 	const { first: version, rest: extra } = splitFirst(rest);
 	if (!version || extra) throw new Error(`Usage: ${usage}`);
 	return { name, version };
-}
-
-function formatStatus(status: EvoStatus): string {
-	return [
-		`initialized: ${String(status.initialized)}`,
-		`stable: ${status.stableDigest ?? "none"}`,
-		`trial: ${status.trial ? `${status.trial.proposalId} (${status.trial.digest})` : "none"}`,
-		`pending proposals: ${status.pendingProposals}`,
-		`deferred proposals: ${status.deferredProposals}`,
-		`paused: ${String(status.paused)}`,
-	].join("\n");
-}
-
-function formatProposalSummary(proposal: Proposal): string {
-	return `${proposal.id}  r${proposal.revision}  ${proposal.status}  ${proposal.tier}/${proposal.kind}  ${proposal.motivation}`;
 }
 
 function formatPackImportResult(
@@ -486,118 +438,6 @@ function formatRegistryPackInstallResult(
 	].join("\n");
 }
 
-const WORKFLOW_PACK_TEMPLATES: Record<
-	string,
-	{ trigger: string; description: string; write(directory: string): Promise<WrittenWorkflowPack> }
-> = {
-	"deep-review": {
-		trigger: DEEP_REVIEW_TRIGGER,
-		description: "Voting-style code review: per-file reviewers plus adversarial verification",
-		write: writeDeepReviewPack,
-	},
-	"deep-research": {
-		trigger: DEEP_RESEARCH_TRIGGER,
-		description: "Multi-source research: parallel searchers, adversarial claim verification, cited report",
-		write: writeDeepResearchPack,
-	},
-	deepcode: {
-		trigger: DEEPCODE_TRIGGER,
-		description: "Multi-agent coding: parallel explorers, frozen step plan, serial implementation, verify-fix loop",
-		write: writeDeepcodePack,
-	},
-};
-
-function formatWorkflowPackTemplates(): string {
-	return [
-		"Bundled workflow pack templates:",
-		...Object.entries(WORKFLOW_PACK_TEMPLATES).map(
-			([name, template]) => `- ${name} (${template.trigger}): ${template.description}`,
-		),
-		"",
-		"Write one with 'packs init <template> [directory]', then import the directory to stage it.",
-	].join("\n");
-}
-
-async function initWorkflowPackTemplate(name: string, directory: string | undefined): Promise<string> {
-	const template = WORKFLOW_PACK_TEMPLATES[name];
-	if (!template) {
-		throw new Error(
-			`Unknown pack template: ${name || "(none)"}. Available: ${Object.keys(WORKFLOW_PACK_TEMPLATES).join(", ")}`,
-		);
-	}
-	const target = resolve(directory ?? `${name}-pack`);
-	const written = await template.write(target);
-	return [
-		`Wrote ${written.manifest.name}@${written.manifest.version} (${template.trigger}) to ${target}`,
-		`Integrity: ${written.integrity}`,
-		`Next: run 'import ${target}' to stage the workflow proposal.`,
-	].join("\n");
-}
-
-async function formatActiveWorkflows(dependencies: EvoCommandDependencies): Promise<string> {
-	const digest = await requireActiveBundleDigest(dependencies);
-	const bundle = await loadCompiledBundle(dependencies.paths, digest);
-	const workflows = bundle.policy.workflows ?? [];
-	if (workflows.length === 0) {
-		return "No workflow components are active in the current bundle. Use 'packs' to see bundled templates.";
-	}
-	const broker = await new EvoCapabilityBroker({ paths: dependencies.paths }).getState();
-	const lines = workflows.map((selection) => {
-		const spawn = (selection.grants ?? []).find((grant) => grant.capability === "spawn-agent");
-		const grantLabel =
-			spawn && "models" in spawn
-				? `spawn-agent \u2264${spawn.maxCalls} calls \u00b7 ${spawn.models.join(",")}`
-				: "no spawn-agent grant";
-		const usage = broker.components
-			.find((component) => component.id === selection.id && component.artifactDigest === selection.artifactDigest)
-			?.usage.find((entry) => entry.capability === "spawn-agent");
-		const usageLabel = usage ? ` \u00b7 used ${usage.calls} call(s)` : "";
-		return `- ${selection.trigger} \u2192 ${selection.id} (${selection.artifactDigest.slice(0, 12)}) \u00b7 ${grantLabel}${usageLabel}`;
-	});
-	return [`Active workflows in bundle ${digest.slice(0, 12)}:`, ...lines].join("\n");
-}
-
-async function formatInboxListing(paths: EvoPaths): Promise<string> {
-	const states = await readInboxLifecycleStates(paths);
-	const files = (await readdir(paths.inbox)).filter((file) => file.endsWith(".json")).sort();
-	if (files.length === 0) return "Inbox is empty.";
-	const lines: string[] = [];
-	for (const file of files) {
-		try {
-			const entry = await readInboxEntry(paths, file);
-			const state = states.get(file);
-			const preview = entry.text.replaceAll("\n", " ").slice(0, 96);
-			lines.push(`- [${state?.status ?? "open"}/${state?.kind ?? entry.kind ?? "unclassified"}] ${file}`);
-			lines.push(`    ${preview}`);
-		} catch {
-			lines.push(`- [unreadable] ${file}`);
-		}
-	}
-	return [`Inbox entries (${files.length}):`, ...lines].join("\n");
-}
-
-async function formatUsageSummary(paths: EvoPaths, rest: string): Promise<string> {
-	const trimmed = rest.trim();
-	const match = /^([1-9][0-9]*)d$/.exec(trimmed);
-	if (trimmed && !match) throw new Error("Usage: usage [<n>d]");
-	const days = match ? Number(match[1]) : 7;
-	const summary = await summarizeModelUsage(paths, {
-		since: new Date(Date.now() - days * 24 * 60 * 60 * 1_000),
-	});
-	return [`Model usage over the last ${days}d:`, "", renderModelUsageSummary(summary)].join("\n");
-}
-
-async function formatControlConfig(paths: EvoPaths): Promise<string> {
-	const config = await readEvoControlConfig(paths);
-	return [`Config file: ${paths.config}`, "", JSON.stringify(config, undefined, 2)].join("\n");
-}
-
-async function requireActiveBundleDigest(dependencies: EvoCommandDependencies): Promise<string> {
-	const digest = await dependencies.service.registry.readStableDigest();
-	if (!digest) throw new Error("Evo-Pi is not initialized; run evo-pi init first");
-	return digest;
-}
-
 async function stagePackImport(
 	dependencies: EvoCommandDependencies,
 	packDirectory: string,
@@ -663,18 +503,6 @@ function formatPackExportResult(result: ActivePackExport): string {
 	].join("\n");
 }
 
-async function formatActivePreferences(dependencies: EvoCommandDependencies): Promise<string> {
-	const digest = await dependencies.service.registry.readStableDigest();
-	if (!digest) return "No active Evo-Pi preferences";
-	const memory = await readBundlePreferenceMemory(await loadCompiledBundle(dependencies.paths, digest));
-	if (memory.preferences.length === 0) return "No active Evo-Pi preferences";
-	return [
-		"# Active Evo-Pi preferences",
-		"",
-		...memory.preferences.map((preference) => `- ${preference.id}: ${preference.instruction}`),
-	].join("\n");
-}
-
 async function findPendingT0Proposal(dependencies: { service: EvoService }): Promise<Proposal | undefined> {
 	return (await dependencies.service.listProposals()).find(
 		(proposal) => proposal.status === "pending" && proposal.kind === "data" && proposal.tier === "T0",
@@ -698,14 +526,6 @@ function formatScheduleStatus(status: EvoScheduleStatus): string {
 	].join("\n");
 }
 
-function describeImproveSkip(result: Extract<ScheduledImproveResult<unknown>, { status: "skipped" }>): string {
-	const detail =
-		result.reason === "interval-not-elapsed" && result.nextEligibleDay
-			? ` (next eligible ${result.nextEligibleDay})`
-			: "";
-	return `Scheduled improve skipped: ${result.reason}${detail}`;
-}
-
 const SCHEDULE_CADENCE_CHOICES: ReadonlyArray<{
 	label: string;
 	input: { mode: "auto" | "manual"; everyDays?: number };
@@ -715,92 +535,6 @@ const SCHEDULE_CADENCE_CHOICES: ReadonlyArray<{
 	{ label: "Every week", input: { mode: "auto", everyDays: 7 } },
 	{ label: "Manual only", input: { mode: "manual" } },
 ];
-async function readProposalArtifact(
-	paths: EvoPaths,
-	proposal: Proposal,
-	kind: ProposalArtifactKind,
-): Promise<string | undefined> {
-	const reference = proposal.artifacts[kind];
-	if (!reference) return undefined;
-	return (
-		await readEvaluationArtifact({
-			paths,
-			proposalId: proposal.id,
-			revision: proposal.revision,
-			diffDigest: proposal.diffDigest,
-			kind,
-			reference,
-		})
-	).trim();
-}
-
-async function formatProposalCard(paths: EvoPaths, proposal: Proposal): Promise<string> {
-	const evidence = proposal.evidence.length
-		? proposal.evidence
-				.map(
-					(reference) =>
-						`- ${reference.sessionId}:${reference.sequence}${reference.quote ? ` — ${reference.quote}` : ""}`,
-				)
-				.join("\n")
-		: "- none";
-	const review = await readProposalArtifact(paths, proposal, "review");
-	const replay = await readProposalArtifact(paths, proposal, "replay");
-	const validation = await readProposalArtifact(paths, proposal, "validation");
-	const comparisonJson = await readProposalArtifact(paths, proposal, "comparison");
-	const comparison = comparisonJson
-		? renderTrialComparisonMarkdown(JSON.parse(comparisonJson) as TrialComparison)
-		: undefined;
-	const retrospective = await readProposalArtifact(paths, proposal, "retrospective");
-	return [
-		`# Evo proposal ${proposal.id}`,
-		"",
-		`Status: ${proposal.status}`,
-		`Revision: ${proposal.revision}`,
-		`Tier: ${proposal.tier}`,
-		`Kind: ${proposal.kind}`,
-		`Parent bundle: ${proposal.parentBundleDigest}`,
-		`Final diff digest: ${proposal.diffDigest}`,
-		...(proposal.codeWorkspace
-			? [
-					`Approval context digest: ${proposal.approvalDigest}`,
-					`Repository root: ${proposal.codeWorkspace.repositoryRoot}`,
-					`Repository identity: ${proposal.codeWorkspace.repositoryId}`,
-					`Base commit: ${proposal.codeWorkspace.baseCommit}`,
-					`Worktree: ${proposal.codeWorkspace.worktreePath}`,
-					`Branch: ${proposal.codeWorkspace.branch}`,
-				]
-			: []),
-		"",
-		"## Motivation",
-		proposal.motivation,
-		"",
-		"## Evidence",
-		evidence,
-		"",
-		"## Diff",
-		"```diff",
-		proposal.diff,
-		"```",
-		"",
-		"## Expected effect",
-		proposal.expectedEffect,
-		"",
-		"## Risk",
-		proposal.risk,
-		"",
-		"## Verification plan",
-		proposal.verifyPlan,
-		"",
-		"## Trial plan",
-		proposal.trialPlan,
-		...(validation ? ["", "## L1 validation", validation] : []),
-		...(review ? ["", "## Critic review", review] : []),
-		...(replay ? ["", "## Counterfactual replay", replay] : []),
-		...(comparison ? ["", comparison] : []),
-		...(retrospective ? ["", "## Retrospective", retrospective] : []),
-	].join("\n");
-}
-
 function createDependencies(options: EvoCommandExtensionOptions): EvoCommandDependencies {
 	const paths = options.service?.paths ?? options.paths ?? getEvoPaths(options.root);
 	let discoveryService = options.discovery?.service;
@@ -825,17 +559,6 @@ function createDependencies(options: EvoCommandExtensionOptions): EvoCommandDepe
 			});
 			return discoveryService;
 		},
-	};
-}
-
-function modelOptions(dependencies: EvoCommandDependencies, signal?: AbortSignal) {
-	return {
-		paths: dependencies.paths,
-		runner: dependencies.runner,
-		...(dependencies.cwd ? { cwd: dependencies.cwd } : {}),
-		...(dependencies.agentDir ? { agentDir: dependencies.agentDir } : {}),
-		...(dependencies.model ? { model: dependencies.model } : {}),
-		...(signal ? { signal } : {}),
 	};
 }
 
@@ -1237,6 +960,15 @@ async function dispatchExtensionCommand(
 	const { command, rest } = parseSubcommand(args);
 	await ctx.waitForIdle();
 
+	const presenter: EvoCommandPresenter = {
+		commandPrefix: "/evo",
+		cwd: dependencies.cwd ?? ctx.cwd,
+		print: (customType, content, details = {}) => sendCustomCard(pi, customType, content, details),
+		notify: (message) => ctx.ui.notify(message, "info"),
+		confirm: (title, message) => confirmExtensionMutation(ctx, title, message),
+	};
+	if (await runSharedEvoCommand(dependencies, command, rest, presenter)) return;
+
 	switch (command) {
 		case "help":
 			sendCustomCard(pi, "evo.help", EVO_HELP, { command: "help" });
@@ -1365,21 +1097,9 @@ async function dispatchExtensionCommand(
 			});
 			return;
 		}
-		case "status":
-			ctx.ui.notify(formatStatus(await dependencies.service.status()), "info");
-			return;
 		case "report": {
-			const report = await runReport(modelOptions(dependencies));
+			const report = await runReport(modelRunOptions(dependencies));
 			sendCustomCard(pi, "evo.report", report.observationsMarkdown, { file: report.file });
-			return;
-		}
-		case "go": {
-			const run = await startBackgroundEvolution({
-				paths: dependencies.paths,
-				cwd: dependencies.cwd ?? ctx.cwd,
-				...(rest ? { request: rest } : {}),
-			});
-			ctx.ui.notify(`Evolution task ${run.id} started in the background`, "info");
 			return;
 		}
 		case "inspect": {
@@ -1389,18 +1109,6 @@ async function dispatchExtensionCommand(
 				return;
 			}
 			await openEvolutionInspector(dependencies, ctx, rest || undefined);
-			return;
-		}
-		case "pause": {
-			const id = requireValue(rest, "/evo pause <run-id>");
-			await pauseBackgroundEvolution(dependencies.paths, id);
-			ctx.ui.notify(`Evolution task ${id} paused`, "info");
-			return;
-		}
-		case "resume": {
-			const id = requireValue(rest, "/evo resume <run-id>");
-			await resumeBackgroundEvolution(dependencies.paths, id);
-			ctx.ui.notify(`Evolution task ${id} resumed`, "info");
 			return;
 		}
 		case "retry": {
@@ -1435,38 +1143,6 @@ async function dispatchExtensionCommand(
 			);
 			return;
 		}
-		case "delete": {
-			const id = requireValue(rest, "/evo delete <run-id>");
-			if (!(await confirmExtensionMutation(ctx, "Delete evolution task", `Permanently delete ${id}?`))) {
-				ctx.ui.notify("Delete cancelled", "info");
-				return;
-			}
-			await removeBackgroundEvolution(dependencies.paths, id);
-			ctx.ui.notify(`Evolution task ${id} deleted`, "info");
-			return;
-		}
-		case "scheduled-improve": {
-			const scheduled = await runConfiguredImprove({
-				paths: dependencies.paths,
-				improve: (signal) =>
-					runEvolutionCycle({
-						paths: dependencies.paths,
-						service: dependencies.service,
-						runner: dependencies.runner,
-						cwd: dependencies.cwd,
-						agentDir: dependencies.agentDir,
-						trigger: "scheduled",
-						signal,
-					}),
-			});
-			if (scheduled.status === "skipped") {
-				ctx.ui.notify(describeImproveSkip(scheduled), "info");
-				return;
-			}
-			for (const proposal of scheduled.value.proposals) await showProposal(pi, dependencies, proposal);
-			ctx.ui.notify(`Evolution run ${scheduled.value.run.id} completed`, "info");
-			return;
-		}
 		case "schedule": {
 			if (rest) {
 				const cadence = parseScheduleCadence(rest);
@@ -1493,70 +1169,6 @@ async function dispatchExtensionCommand(
 			ctx.ui.notify(`Evo-Pi schedule updated — ${describeScheduleCadence(updated)}`, "info");
 			return;
 		}
-		// "workflow" is a deprecated alias: the evolution playbook is unrelated to
-		// workflow components, which live under "workflows" and "packs".
-		case "workflow":
-		case "playbook": {
-			if (rest === "reset") await resetEvolutionWorkflow(dependencies.paths);
-			else if (rest) throw new Error("Usage: /evo playbook [reset]");
-			const playbook = await readEvolutionWorkflow(dependencies.paths);
-			sendCustomCard(pi, "evo.playbook", playbook, { path: dependencies.paths.workflow });
-			return;
-		}
-		case "workflows": {
-			sendCustomCard(pi, "evo.workflows", await formatActiveWorkflows(dependencies), {});
-			return;
-		}
-		case "packs": {
-			const parts = rest.split(/\s+/).filter(Boolean);
-			if (parts.length === 0) {
-				sendCustomCard(pi, "evo.packs", formatWorkflowPackTemplates(), {});
-				return;
-			}
-			if (parts[0] !== "init") throw new Error("Usage: /evo packs [init <template> [directory]]");
-			sendCustomCard(pi, "evo.packs", await initWorkflowPackTemplate(parts[1] ?? "", parts[2]), {
-				template: parts[1],
-			});
-			return;
-		}
-		case "config": {
-			const parts = rest.split(/\s+/).filter(Boolean);
-			if (parts[0] === "set") {
-				const key = parts[1];
-				const value = parts.slice(2).join(" ");
-				if (!key || !value) throw new Error("Usage: /evo config set <key> <value>");
-				await updateEvoControlConfigValue(dependencies.paths, key, value);
-				ctx.ui.notify(`Config updated: ${key} = ${value}`, "info");
-				return;
-			}
-			if (parts.length > 0) throw new Error("Usage: /evo config [set <key> <value>]");
-			sendCustomCard(pi, "evo.config", await formatControlConfig(dependencies.paths), {});
-			return;
-		}
-		case "inbox": {
-			sendCustomCard(pi, "evo.inbox", await formatInboxListing(dependencies.paths), {});
-			return;
-		}
-		case "usage": {
-			sendCustomCard(pi, "evo.usage", await formatUsageSummary(dependencies.paths, rest), {});
-			return;
-		}
-		case "list": {
-			const proposals = await dependencies.service.listProposals();
-			if (proposals.length === 0) {
-				ctx.ui.notify("No Evo-Pi proposals", "info");
-				return;
-			}
-			sendCustomCard(pi, "evo.proposal-list", proposals.map(formatProposalSummary).join("\n"), {
-				proposalIds: proposals.map((proposal) => proposal.id),
-			});
-			return;
-		}
-		case "show": {
-			const id = requireValue(rest, "/evo show <proposal-id>");
-			await showProposal(pi, dependencies, await dependencies.service.getProposal(id));
-			return;
-		}
 		case "note": {
 			const note = await dependencies.service.note(
 				ctx.sessionManager.getSessionId(),
@@ -1581,40 +1193,10 @@ async function dispatchExtensionCommand(
 			ctx.ui.notify(`Activated durable preference from ${preference.fileName}`, "info");
 			return;
 		}
-		case "preferences": {
-			if (rest) throw new Error("Usage: /evo preferences");
-			sendCustomCard(pi, "evo.preferences", await formatActivePreferences(dependencies), {});
-			return;
-		}
 		case "forget": {
 			const preferenceId = requireValue(rest, "/evo forget <preference-id>");
 			const request = await dependencies.service.forgetPreference(ctx.sessionManager.getSessionId(), preferenceId);
 			ctx.ui.notify(`Saved removal request ${request.fileName}`, "info");
-			return;
-		}
-		case "resolve": {
-			const { first: file, rest: reason } = splitFirst(rest);
-			requireValue(file, "/evo resolve <inbox-file> [reason]");
-			if (!(await confirmExtensionMutation(ctx, "Resolve Evo-Pi input", `Mark ${file} fulfilled and collect it?`))) {
-				ctx.ui.notify("Resolve cancelled", "info");
-				return;
-			}
-			await dependencies.service.resolveInbox(file, reason || "User confirmed the input was fulfilled externally");
-			ctx.ui.notify(`Resolved ${file}`, "info");
-			return;
-		}
-		case "gc": {
-			if (rest && rest !== "--dry-run") throw new Error("Usage: /evo gc [--dry-run]");
-			const dryRun = rest === "--dry-run";
-			if (
-				!dryRun &&
-				!(await confirmExtensionMutation(ctx, "Collect Evo-Pi inbox", "Delete terminal inbox payloads?"))
-			) {
-				ctx.ui.notify("GC cancelled", "info");
-				return;
-			}
-			const result = await dependencies.service.gcInbox(dryRun);
-			ctx.ui.notify(`${dryRun ? "GC would collect" : "GC collected"} ${result.files.length} inbox payloads`, "info");
 			return;
 		}
 		case "permit": {
@@ -1623,18 +1205,6 @@ async function dispatchExtensionCommand(
 			if (!result) return;
 			await showProposal(pi, dependencies, result);
 			ctx.ui.notify(`Proposal ${id} is ${result.status}`, "info");
-			return;
-		}
-		case "reject": {
-			const { first: id, rest: reason } = splitFirst(rest);
-			requireValue(id, "/evo reject <proposal-id> <reason>");
-			requireValue(reason, "/evo reject <proposal-id> <reason>");
-			if (!(await confirmExtensionMutation(ctx, `Reject ${id}`, `Reject proposal ${id}?`))) {
-				ctx.ui.notify("Rejection cancelled", "info");
-				return;
-			}
-			await dependencies.service.reject(id, reason);
-			ctx.ui.notify(`Rejected ${id}`, "info");
 			return;
 		}
 		case "rollback": {
@@ -1652,7 +1222,7 @@ async function dispatchExtensionCommand(
 		}
 		case "keep": {
 			if (!ctx.hasUI) throw new Error("Keeping a trial requires an interactive UI");
-			const retrospective = await runRetrospective(modelOptions(dependencies));
+			const retrospective = await runRetrospective(modelRunOptions(dependencies));
 			sendCustomCard(pi, "evo.retrospective", retrospective.retrospectiveMarkdown, {
 				proposalId: retrospective.proposal.id,
 			});
@@ -1666,13 +1236,6 @@ async function dispatchExtensionCommand(
 			}
 			const kept = await dependencies.service.keep(rest || "User kept trial after retrospective");
 			ctx.ui.notify(`Kept ${kept.id}`, "info");
-			return;
-		}
-		case "retrospect": {
-			const retrospective = await runRetrospective(modelOptions(dependencies));
-			sendCustomCard(pi, "evo.retrospective", retrospective.retrospectiveMarkdown, {
-				proposalId: retrospective.proposal.id,
-			});
 			return;
 		}
 		default:
@@ -1931,6 +1494,15 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 	const command = args[0]?.toLowerCase() ?? "help";
 	const rest = args.slice(1).join(" ").trim();
 
+	const presenter: EvoCommandPresenter = {
+		commandPrefix: "evo-pi",
+		cwd: dependencies.cwd ?? process.cwd(),
+		print: (_customType, content) => io.write(content),
+		notify: (message) => io.write(message),
+		confirm: (_title, message) => confirmLocalMutation(io, message),
+	};
+	if (await runSharedEvoCommand(dependencies, command, rest, presenter)) return;
+
 	switch (command) {
 		case "help":
 		case "--help":
@@ -2039,38 +1611,14 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 			);
 			return;
 		}
-		case "status":
-			io.write(formatStatus(await dependencies.service.status()));
-			return;
 		case "report": {
-			const report = await runReport(modelOptions(dependencies));
+			const report = await runReport(modelRunOptions(dependencies));
 			io.write(`${report.observationsMarkdown}\n\nSaved: ${report.file}`);
-			return;
-		}
-		case "go": {
-			const run = await startBackgroundEvolution({
-				paths: dependencies.paths,
-				cwd: dependencies.cwd ?? process.cwd(),
-				...(rest ? { request: rest } : {}),
-			});
-			io.write(`Evolution task ${run.id} started in the background`);
 			return;
 		}
 		case "inspect":
 			io.write(formatEvolutionRuns(await inspectBackgroundEvolutions(dependencies.paths), rest || undefined));
 			return;
-		case "pause": {
-			const id = requireValue(rest, "evo-pi pause <run-id>");
-			await pauseBackgroundEvolution(dependencies.paths, id);
-			io.write(`Evolution task ${id} paused`);
-			return;
-		}
-		case "resume": {
-			const id = requireValue(rest, "evo-pi resume <run-id>");
-			await resumeBackgroundEvolution(dependencies.paths, id);
-			io.write(`Evolution task ${id} resumed`);
-			return;
-		}
 		case "retry": {
 			const id = parseRetryArgs(rest, "evo-pi-admin retry <run-id> [--from validating]");
 			const sandboxAvailable = await canUseEvoComponentSandbox();
@@ -2097,39 +1645,6 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 			);
 			return;
 		}
-		case "delete": {
-			const id = requireValue(rest, "evo-pi delete <run-id>");
-			if (!(await confirmLocalMutation(io, `Permanently delete ${id}?`))) {
-				io.write("Delete cancelled");
-				return;
-			}
-			await removeBackgroundEvolution(dependencies.paths, id);
-			io.write(`Evolution task ${id} deleted`);
-			return;
-		}
-		case "scheduled-improve": {
-			const scheduled = await runConfiguredImprove({
-				paths: dependencies.paths,
-				improve: (signal) =>
-					runEvolutionCycle({
-						paths: dependencies.paths,
-						service: dependencies.service,
-						runner: dependencies.runner,
-						cwd: dependencies.cwd,
-						agentDir: dependencies.agentDir,
-						trigger: "scheduled",
-						signal,
-					}),
-			});
-			if (scheduled.status === "skipped") {
-				io.write(describeImproveSkip(scheduled));
-				return;
-			}
-			io.write(`Evolution run ${scheduled.value.run.id} completed`);
-			for (const proposal of scheduled.value.proposals)
-				io.write(await formatProposalCard(dependencies.paths, proposal));
-			return;
-		}
 		case "schedule": {
 			if (!rest) {
 				io.write(formatScheduleStatus(await getScheduleStatus(dependencies.paths)));
@@ -2141,64 +1656,6 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 			io.write(`Evo-Pi schedule updated — ${describeScheduleCadence(updated)}`);
 			return;
 		}
-		// "workflow" is a deprecated alias for "playbook"; workflow components
-		// live under "workflows" and "packs".
-		case "workflow":
-		case "playbook": {
-			if (rest === "reset") await resetEvolutionWorkflow(dependencies.paths);
-			else if (rest) throw new Error("Usage: evo-pi playbook [reset]");
-			io.write(`${dependencies.paths.workflow}\n\n${await readEvolutionWorkflow(dependencies.paths)}`);
-			return;
-		}
-		case "workflows": {
-			io.write(await formatActiveWorkflows(dependencies));
-			return;
-		}
-		case "packs": {
-			const parts = rest.split(/\s+/).filter(Boolean);
-			if (parts.length === 0) {
-				io.write(formatWorkflowPackTemplates());
-				return;
-			}
-			if (parts[0] !== "init") throw new Error("Usage: evo-pi packs [init <template> [directory]]");
-			io.write(await initWorkflowPackTemplate(parts[1] ?? "", parts[2]));
-			return;
-		}
-		case "config": {
-			const parts = rest.split(/\s+/).filter(Boolean);
-			if (parts[0] === "set") {
-				const key = parts[1];
-				const value = parts.slice(2).join(" ");
-				if (!key || !value) throw new Error("Usage: evo-pi config set <key> <value>");
-				await updateEvoControlConfigValue(dependencies.paths, key, value);
-				io.write(`Config updated: ${key} = ${value}`);
-				return;
-			}
-			if (parts.length > 0) throw new Error("Usage: evo-pi config [set <key> <value>]");
-			io.write(await formatControlConfig(dependencies.paths));
-			return;
-		}
-		case "inbox": {
-			io.write(await formatInboxListing(dependencies.paths));
-			return;
-		}
-		case "usage": {
-			io.write(await formatUsageSummary(dependencies.paths, rest));
-			return;
-		}
-		case "list": {
-			const proposals = await dependencies.service.listProposals();
-			io.write(proposals.length ? proposals.map(formatProposalSummary).join("\n") : "No Evo-Pi proposals");
-			return;
-		}
-		case "show":
-			io.write(
-				await formatProposalCard(
-					dependencies.paths,
-					await dependencies.service.getProposal(requireValue(args[1] ?? "", "evo-pi show <proposal-id>")),
-				),
-			);
-			return;
 		case "note": {
 			const value = parseSessionText(rest, "evo-pi note <session-id> <text>");
 			io.write((await dependencies.service.note(value.sessionId, value.text)).path);
@@ -2216,52 +1673,15 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 			);
 			return;
 		}
-		case "preferences":
-			if (rest) throw new Error("Usage: evo-pi preferences");
-			io.write(await formatActivePreferences(dependencies));
-			return;
 		case "forget": {
 			const value = parseSessionText(rest, "evo-pi forget <session-id> <preference-id>");
 			io.write((await dependencies.service.forgetPreference(value.sessionId, value.text)).path);
-			return;
-		}
-		case "resolve": {
-			const { first: file, rest: reason } = splitFirst(rest);
-			requireValue(file, "evo-pi resolve <inbox-file> [reason]");
-			if (!(await confirmLocalMutation(io, `Mark ${file} fulfilled and collect it?`))) {
-				io.write("Resolve cancelled");
-				return;
-			}
-			await dependencies.service.resolveInbox(file, reason || "User confirmed the input was fulfilled externally");
-			io.write(`Resolved ${file}`);
-			return;
-		}
-		case "gc": {
-			if (rest && rest !== "--dry-run") throw new Error("Usage: evo-pi gc [--dry-run]");
-			const dryRun = rest === "--dry-run";
-			if (!dryRun && !(await confirmLocalMutation(io, "Delete terminal inbox payloads?"))) {
-				io.write("GC cancelled");
-				return;
-			}
-			const result = await dependencies.service.gcInbox(dryRun);
-			io.write(`${dryRun ? "GC would collect" : "GC collected"} ${result.files.length} inbox payloads`);
 			return;
 		}
 		case "permit": {
 			const id = requireValue(args[1] ?? "", "evo-pi permit <proposal-id>");
 			const result = await runLocalPermit(io, dependencies, id);
 			io.write(result ? `Proposal ${id} is ${result.status}` : "Approval closed without a decision");
-			return;
-		}
-		case "reject": {
-			const id = requireValue(args[1] ?? "", "evo-pi reject <proposal-id> <reason>");
-			const reason = requireValue(args.slice(2).join(" "), "evo-pi reject <proposal-id> <reason>");
-			if (!(await confirmLocalMutation(io, `Reject proposal ${id}?`))) {
-				io.write("Rejection cancelled");
-				return;
-			}
-			await dependencies.service.reject(id, reason);
-			io.write(`Rejected ${id}`);
 			return;
 		}
 		case "rollback": {
@@ -2282,7 +1702,7 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 		}
 		case "keep": {
 			requireInteractive(io);
-			const retrospective = await runRetrospective(modelOptions(dependencies));
+			const retrospective = await runRetrospective(modelRunOptions(dependencies));
 			io.write(retrospective.retrospectiveMarkdown);
 			const answer = await io.question(`Keep trial ${retrospective.proposal.id}? [y/N] `);
 			if (!/^(?:y|yes)$/i.test(answer.trim())) {
@@ -2290,11 +1710,6 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 				return;
 			}
 			io.write(`Kept ${(await dependencies.service.keep(rest || "User kept trial after retrospective")).id}`);
-			return;
-		}
-		case "retrospect": {
-			const retrospective = await runRetrospective(modelOptions(dependencies));
-			io.write(retrospective.retrospectiveMarkdown);
 			return;
 		}
 		default:

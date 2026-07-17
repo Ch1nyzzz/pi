@@ -4,6 +4,10 @@
 
 ### Added
 
+- Added `grants`: lists every component's persisted capability grants with per-capability usage against its budgets (calls, cost, tokens) plus in-flight operations and reservations.
+- Added `history [<count>]`: read-only view of the bundle transition audit log (initialize/keep/rollback/pause and proposal decisions) with digests, proposal ids, and reasons.
+- Added `triage [now]`: shows the streaming-triage cursor and backlog, and `triage now` forces an immediate scan of the new session digests regardless of the cadence.
+- Added `go --scheduled` as the single entry point for the guarded cadence-gated evolution attempt; `scheduled-improve` remains a deprecated alias.
 - Added command-surface coverage for the workflow ecosystem: `packs [init <template> [dir]]` writes a bundled workflow pack, `workflows` lists active workflow components with their triggers, grants, and spawn usage, `config [set <key> <value>]` reads and updates the control config through the fail-closed parser, `inbox` lists inbox entries with lifecycle status, and `usage [<n>d]` reports model token/cost totals by phase.
 - Renamed `workflow` to `playbook` (the evolution playbook is unrelated to workflow components); `workflow` remains a deprecated alias.
 - Added the bundled `/deep-research` workflow template and `writeDeepResearchPack()`: decompose a question into angles, fan out parallel searchers over allowlisted public sources (arXiv/Crossref/GitHub plus bash curl), adversarially verify each claim against its source, and synthesize a cited report.
@@ -25,9 +29,11 @@
 - Changed Evo activity into a dedicated final status line that names active Canary components, stays separate from provider quota status, and can be entered with Down from the end of a draft to open runs, trials, and proposals.
 - Raised default pack capability budgets (spawn-agent: 100 calls, 64-turn children, sized for parallel large-context reservations) and expanded the `workflow/v1` capability ceiling with `memory-read`/`memory-write` for persistent workflow state.
 - Spawned child agents now default to the host's real coding tools (`bash`, `edit`, `find`, `grep`, `ls`, `read`, `write`) and grant previews default their allowlist to the same set.
+- Unified the surface-independent commands of the `/evo` extension and the `evo-pi` CLI behind one shared handler table (`cli-commands.ts`) with a presenter seam, so command behavior can no longer drift between the two dispatchers.
 
 ### Fixed
 
+- Fixed code Builders hand-authoring malformed unified diffs: each code run now edits an isolated, commit-pinned worktree, the host generates and preserves the Git patch, and proposal staging rejects repository drift before validation.
 - Fixed terminal evolution runs hiding their still-pending proposals from `/evo inspect`; proposal details now show the exact `/evo permit` command needed to process them.
 
 ## [0.80.9] - 2026-07-16
