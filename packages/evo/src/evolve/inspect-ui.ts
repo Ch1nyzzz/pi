@@ -9,7 +9,13 @@ import { readEvaluationArtifact } from "../proposal-artifacts.ts";
 import { recordPermitDefer, recordPermitReopen } from "../reflect/permit.ts";
 import type { EvoService } from "../service.ts";
 import type { ComponentApprovalDecision, EvolutionRun, EvolutionRunStatus, Proposal, TrialState } from "../types.ts";
-import { type EvoActivityItem, listEvoActivityItems } from "./activity.ts";
+import {
+	activityGroup,
+	type EvoActivityGroup,
+	type EvoActivityItem,
+	groupActivityItems,
+	listEvoActivityItems,
+} from "./activity.ts";
 import { evolutionRunDirectory, readEvolutionRun } from "./run.ts";
 
 interface TranscriptEvent {
@@ -31,7 +37,6 @@ interface RunArtifacts {
 	evaluation?: string;
 }
 
-const TERMINAL_STATUSES = new Set<EvolutionRunStatus>(["completed", "failed", "cancelled"]);
 const PHASE_ORDER: EvolutionRunStatus[] = [
 	"queued",
 	"researching",
@@ -45,7 +50,33 @@ const PHASE_ORDER: EvolutionRunStatus[] = [
 	"awaiting-decision",
 	"completed",
 ];
-const SECTION_NAMES = ["当前思考", "工具调用", "阶段成果"] as const;
+
+const GROUP_LABELS: Record<EvoActivityGroup, string> = {
+	action: "需要你的决定",
+	running: "进行中",
+	history: "历史",
+};
+
+const PROPOSAL_ACTION_HOTKEYS: Record<ProposalActionId, string> = {
+	approve: "a",
+	reject: "r",
+	defer: "d",
+	reopen: "o",
+};
+
+interface InspectorSection {
+	id: string;
+	title: string;
+	summary?: string;
+	tone?: "warning";
+	content: string[];
+}
+
+/** Collapse a paragraph to a single scannable line. */
+function summarize(value: string, maxLength = 96): string {
+	const normalized = value.replace(/\s+/g, " ").trim();
+	return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 1)}…`;
+}
 
 type ProposalActionId = "approve" | "reject" | "defer" | "reopen";
 
@@ -188,8 +219,12 @@ export class EvolutionProcessInspector implements Component {
 	private proposal?: Proposal;
 	private mode: "tasks" | "run";
 	private taskIndex = 0;
-	private sectionIndex = 0;
-	private expandedSection?: number;
+	private displayItems: EvoActivityItem[] = [];
+	private sectionFocus = 0;
+	private expandedSections = new Set<string>();
+	private activeSectionIds: string[] = [];
+	private focusedSectionLine = -1;
+	private followFocus = false;
 	private scrollFromBottom = 0;
 	private readonly tui: TUI;
 	private readonly theme: Theme;
@@ -261,7 +296,8 @@ export class EvolutionProcessInspector implements Component {
 				{ paths: this.paths, service: this.service },
 				{ includeHistory: true, includeTrialComparison: false },
 			);
-			this.taskIndex = Math.min(this.taskIndex, Math.max(0, this.items.length - 1));
+			this.displayItems = groupActivityItems(this.items);
+			this.taskIndex = Math.min(this.taskIndex, Math.max(0, this.displayItems.length - 1));
 			if (this.mode === "run" && this.itemKey) {
 				this.item = this.items.find((item) => item.key === this.itemKey);
 				if (!this.item) {
@@ -333,7 +369,10 @@ export class EvolutionProcessInspector implements Component {
 		}
 	}
 
-	private itemGlyph(item: EvoActivityItem): { icon: string; color: "warning" | "muted" | "accent" | "success" } {
+	private itemGlyph(item: EvoActivityItem): {
+		icon: string;
+		color: "warning" | "muted" | "accent" | "success" | "error";
+	} {
 		if (item.kind === "proposal") {
 			if (item.proposal.status === "pending") return { icon: "●", color: "warning" };
 			if (item.proposal.status === "deferred") return { icon: "○", color: "muted" };
@@ -343,39 +382,118 @@ export class EvolutionProcessInspector implements Component {
 		if (status === "trialing") return { icon: "◆", color: "accent" };
 		if (status === "awaiting-canary-approval" || status === "awaiting-decision")
 			return { icon: "●", color: "warning" };
-		if (status === "completed") return { icon: "✓", color: "muted" };
-		if (status === "failed" || status === "cancelled") return { icon: "✗", color: "muted" };
+		if (status === "completed") return { icon: "✓", color: "success" };
+		if (status === "failed" || status === "cancelled") return { icon: "✗", color: "error" };
 		if (status === "paused") return { icon: "○", color: "warning" };
 		return { icon: "▶", color: "success" };
 	}
 
 	private taskLines(): string[] {
+		const actionCount = this.displayItems.filter((item) => activityGroup(item) === "action").length;
 		const lines = [
-			this.theme.fg("accent", this.theme.bold(`Evo 工作流 · ${this.items.length} 项`)),
+			this.theme.fg("accent", this.theme.bold("Evo 工作流")) +
+				(actionCount > 0
+					? this.theme.fg("warning", this.theme.bold(` · ${actionCount} 项等待你处理`))
+					: this.theme.fg("dim", ` · ${this.displayItems.length} 项`)),
+			...(this.taskNotice ? ["", this.theme.fg("warning", this.taskNotice)] : []),
 			"",
-			...(this.taskNotice ? [this.theme.fg("warning", this.taskNotice), ""] : []),
 		];
-		if (this.items.length === 0) lines.push(this.theme.fg("muted", "暂无事项"));
+		if (this.displayItems.length === 0) {
+			lines.push(
+				this.theme.fg("muted", "暂无事项"),
+				this.theme.fg("dim", "/evo go <目标> 启动一次演化 · /evo help 查看全部命令"),
+			);
+		}
 		this.selectedTaskLine = 0;
-		for (const [index, item] of this.items.entries()) {
+		let lastGroup: EvoActivityGroup | undefined;
+		for (const [index, item] of this.displayItems.entries()) {
+			const group = activityGroup(item);
+			if (group !== lastGroup) {
+				if (lastGroup !== undefined) lines.push("");
+				const headerColor = group === "action" ? "warning" : group === "running" ? "text" : "dim";
+				lines.push(this.theme.fg(headerColor, this.theme.bold(GROUP_LABELS[group])));
+				lastGroup = group;
+			}
 			const selected = index === this.taskIndex;
 			if (selected) this.selectedTaskLine = lines.length;
 			const marker = selected ? this.theme.fg("accent", "›") : " ";
 			const glyph = this.itemGlyph(item);
-			const terminal = item.kind === "run" && TERMINAL_STATUSES.has(item.run.status);
-			const stateColor = terminal ? "muted" : glyph.color === "muted" ? "muted" : "success";
-			const text = item.text.replace(/^Evo: /, "");
+			const text = item.text.replace(/^Evo: /, "").replace(/ · \[.*\]$/, "");
+			const textColor = group === "history" ? "muted" : "text";
 			const suffix = item.kind === "run" ? this.theme.fg("dim", `  ${elapsed(item.run.startedAt)}`) : "";
-			lines.push(`${marker} ${this.theme.fg(glyph.color, glyph.icon)} ${this.theme.fg(stateColor, text)}${suffix}`);
+			lines.push(`${marker} ${this.theme.fg(glyph.color, glyph.icon)} ${this.theme.fg(textColor, text)}${suffix}`);
 		}
-		lines.push("", this.theme.fg("dim", "↑↓ 选择 • Enter 查看 • Esc 关闭"));
 		return lines;
 	}
 
-	private sectionHeader(index: number, summary: string): string {
-		const marker = this.sectionIndex === index ? this.theme.fg("accent", "›") : " ";
-		const expanded = this.expandedSection === index ? "▾" : "▸";
-		return `${marker} ${expanded} ${this.theme.bold(SECTION_NAMES[index] ?? "详情")}  ${this.theme.fg("muted", summary)}`;
+	private pushSections(lines: string[], sections: InspectorSection[]): void {
+		this.activeSectionIds = sections.map((section) => section.id);
+		this.sectionFocus = Math.min(this.sectionFocus, Math.max(0, sections.length - 1));
+		for (const [index, section] of sections.entries()) {
+			if (index === this.sectionFocus) this.focusedSectionLine = lines.length;
+			const focused = index === this.sectionFocus;
+			const expanded = this.expandedSections.has(section.id);
+			const marker = focused ? this.theme.fg("accent", "›") : " ";
+			const triangle = expanded ? "▾" : "▸";
+			const title =
+				section.tone === "warning"
+					? this.theme.fg("warning", this.theme.bold(section.title))
+					: this.theme.bold(section.title);
+			lines.push(
+				`${marker} ${triangle} ${title}${section.summary ? `  ${this.theme.fg("muted", section.summary)}` : ""}`,
+			);
+			if (expanded) lines.push(...section.content.map((line) => `  ${line}`), "");
+		}
+	}
+
+	private focusNextSection(): void {
+		if (this.activeSectionIds.length === 0) return;
+		this.sectionFocus = (this.sectionFocus + 1) % this.activeSectionIds.length;
+		this.followFocus = true;
+	}
+
+	private toggleFocusedSection(): void {
+		const id = this.activeSectionIds[this.sectionFocus];
+		if (!id) return;
+		if (this.expandedSections.has(id)) this.expandedSections.delete(id);
+		else this.expandedSections.add(id);
+		this.followFocus = true;
+	}
+
+	private tierBadge(proposal: Proposal): string {
+		const color = proposal.tier === "T0" ? "success" : proposal.tier === "T1" ? "warning" : "error";
+		return this.theme.fg(color, this.theme.bold(`[${proposal.tier}/${proposal.kind}]`));
+	}
+
+	private proposalStatusMeta(proposal: Proposal): {
+		label: string;
+		color: "warning" | "muted" | "accent" | "success" | "error";
+	} {
+		switch (proposal.status) {
+			case "pending":
+				return { label: "等待处理", color: "warning" };
+			case "deferred":
+				return { label: "已推迟", color: "muted" };
+			case "approved":
+				return { label: "已批准", color: "success" };
+			case "trialing":
+				return { label: "Trial 运行中", color: "accent" };
+			case "kept":
+				return { label: "已保留", color: "success" };
+			case "rejected":
+				return { label: "已拒绝", color: "error" };
+			case "rolled-back":
+				return { label: "已回滚", color: "muted" };
+			default:
+				return { label: proposal.status, color: "muted" };
+		}
+	}
+
+	private progressBar(current: number, minimum: number): string {
+		const width = 10;
+		const filled = Math.min(width, Math.round((width * current) / Math.max(1, minimum)));
+		const color = current >= minimum ? "success" : "accent";
+		return `${this.theme.fg(color, "●".repeat(filled))}${this.theme.fg("dim", "○".repeat(width - filled))}`;
 	}
 
 	private initializeCustomCanaryDefaults(): void {
@@ -405,7 +523,7 @@ export class EvolutionProcessInspector implements Component {
 			return [
 				this.theme.fg("warning", this.theme.bold("直接上线将跳过所有 Canary 效果证据。")),
 				"候选会立即成为 stable；其 parent 仍可通过 /evo rollback 恢复。",
-				this.theme.fg("accent", "再次按 Enter 确认直接上线；Esc 返回选择"),
+				this.theme.fg("accent", "再次按 Enter 确认直接上线 · Esc 返回选择"),
 			];
 		}
 		if (this.approvalView === "custom") {
@@ -417,24 +535,93 @@ export class EvolutionProcessInspector implements Component {
 			return [
 				this.theme.bold("自定义 Canary"),
 				...rows.map((row, index) => `${index === this.customField ? this.theme.fg("accent", "›") : " "} ${row}`),
-				this.theme.fg("dim", "↑↓ 选择 • ←→ 调整 • Enter 启动 • Esc 返回"),
+				this.theme.fg("dim", "↑↓ 选择 · ←→ 调整 · Enter 启动 · Esc 返回"),
 			];
 		}
 		const choices = [
-			"按冻结计划和本地默认值启动 Canary",
-			"自定义 Canary 样本数与最长时间",
-			directAvailable ? "直接上线，跳过 Canary" : "直接上线不可用：缺少可执行 validation artifact",
+			{ key: "c", label: "默认 Canary", note: "按冻结计划与本地默认值" },
+			{ key: "u", label: "自定义 Canary", note: "样本数与最长时间" },
+			directAvailable
+				? { key: "x", label: "直接上线", note: "跳过 Canary 效果证据" }
+				: { key: "x", label: "直接上线不可用", note: "缺少可执行 validation artifact" },
 		];
 		return [
-			this.theme.bold("人工发布决策"),
-			...choices.map(
-				(choice, index) => `${index === this.approvalChoice ? this.theme.fg("accent", "›") : " "} ${choice}`,
+			this.theme.bold("发布决策"),
+			...choices.map((choice, index) => {
+				const marker = index === this.approvalChoice ? this.theme.fg("accent", "›") : " ";
+				return `${marker} ${this.theme.fg("accent", `[${choice.key}]`)} ${choice.label}  ${this.theme.fg("muted", choice.note)}`;
+			}),
+			this.theme.fg(
+				"dim",
+				"推荐默认 Canary：先收集效果证据，可随时回滚 · 快捷键或 ←→+Enter · Tab 章节 · ↑↓ 滚动 · Esc 返回",
 			),
-			this.theme.fg("dim", "←→ 选择 • Enter 确认 • ↑↓ 滚动 • Home/End 跳转 • Esc 返回任务列表"),
 		];
 	}
 
 	private canaryLines(run: EvolutionRun): string[] {
+		const proposal = this.proposal;
+		const validation = this.artifacts.validation?.trim();
+		const evaluation = this.artifacts.evaluation?.trim();
+		const diff = proposal?.diff.trim() ?? "";
+		const sections: InspectorSection[] = [
+			{
+				id: "risk",
+				title: "风险",
+				tone: "warning",
+				summary: summarize(proposal?.risk ?? "unknown", 48),
+				content: [proposal?.risk ?? "unknown"],
+			},
+			{
+				id: "rollback",
+				title: "Canary 与回滚计划",
+				summary: summarize(proposal?.trialPlan ?? "unknown", 48),
+				content: [proposal?.trialPlan ?? "unknown", "", "回滚将恢复 Canary 启动前的 stable bundle。"],
+			},
+			{
+				id: "validation",
+				title: "可执行验证",
+				summary: validation ? "✓ 已完成" : "缺失",
+				content: validation ? validation.split("\n") : ["没有可执行验证报告"],
+			},
+			{
+				id: "evaluation",
+				title: "独立评估",
+				summary: evaluation ? "✓ 已完成" : "缺失",
+				content: evaluation ? evaluation.split("\n") : ["没有评估报告"],
+			},
+			{
+				id: "diff",
+				title: `Exact diff${diff ? ` · ${diff.split("\n").length} 行` : ""}`,
+				content: diff ? diff.split("\n") : ["没有可审阅 diff"],
+			},
+		];
+		const facts = [
+			`验证 ${validation ? "✓" : "–"}`,
+			`评估 ${evaluation ? "✓" : "–"}`,
+			...(proposal ? [`diff ${proposal.diffDigest.slice(0, 12)}…`] : []),
+		].join(" · ");
+		const lines = [
+			this.theme.fg("accent", this.theme.bold("Evo Component Canary 审批")),
+			"",
+			`${this.theme.bold("Component")}  ${this.item?.component ?? "unknown"}${this.theme.fg(
+				"dim",
+				` · ${run.canaryTargetAbi ?? "unknown ABI"} · r${proposal?.revision ?? "?"}`,
+			)}`,
+			`${this.theme.bold("目标")}  ${run.request ?? "定时演化"}`,
+			`${this.theme.fg("dim", "Changed paths")}  ${proposal?.changedPaths.join(", ") || "unknown"}`,
+			"",
+			`${this.theme.fg("warning", "风险")}  ${this.theme.fg("warning", summarize(proposal?.risk ?? "unknown"))}`,
+			this.theme.fg("dim", facts),
+			"",
+		];
+		this.pushSections(lines, sections);
+		return lines;
+	}
+
+	private canaryDecisionLines(): string[] {
+		const run = this.run;
+		if (!run) return [];
+		this.initializeCustomCanaryDefaults();
 		const proposal = this.proposal;
 		const metadataMatches =
 			proposal !== undefined &&
@@ -442,36 +629,9 @@ export class EvolutionProcessInspector implements Component {
 			proposal.parentBundleDigest === run.canaryParentDigest &&
 			proposal.candidateDigest === run.canaryCandidateDigest &&
 			proposal.targetAbi === run.canaryTargetAbi;
-		this.initializeCustomCanaryDefaults();
-		const evaluation = this.artifacts.evaluation?.trim() ?? "没有评估报告";
-		const validation = this.artifacts.validation?.trim() ?? "没有可执行验证报告";
-		const diff = proposal?.diff.trim() ?? "没有可审阅 diff";
 		return [
-			this.theme.fg("accent", this.theme.bold("Evo Component Canary 审批")),
-			"",
-			`${this.theme.bold("Component")}  ${this.item?.component ?? "unknown"}`,
-			`${this.theme.bold("目标")}  ${run.request ?? "定时演化"}`,
-			`${this.theme.bold("Revision")}  ${proposal?.revision ?? "?"}`,
-			`${this.theme.bold("ABI")}  ${run.canaryTargetAbi ?? "unknown"}`,
-			`${this.theme.bold("Changed paths")}  ${proposal?.changedPaths.join(", ") || "unknown"}`,
-			"",
-			this.theme.fg("warning", this.theme.bold("风险")),
-			proposal?.risk ?? "unknown",
-			"",
-			this.theme.bold("Canary 与回滚计划"),
-			proposal?.trialPlan ?? "unknown",
-			"回滚将恢复 Canary 启动前的 stable bundle。",
-			"",
-			this.theme.bold("可执行验证"),
-			...validation.split("\n"),
-			"",
-			this.theme.bold("独立评估"),
-			...evaluation.split("\n"),
-			"",
-			this.theme.bold("Exact diff"),
-			...diff.split("\n"),
-			"",
-			...(this.approvalError ? [this.theme.fg("error", this.approvalError), ""] : []),
+			this.theme.fg("dim", "─".repeat(40)),
+			...(this.approvalError ? [this.theme.fg("error", this.approvalError)] : []),
 			...this.approvalControlLines(metadataMatches, proposal?.artifacts.validation !== undefined),
 		];
 	}
@@ -487,41 +647,86 @@ export class EvolutionProcessInspector implements Component {
 		const currentSamples = comparison?.after.totals.sessions;
 		const duration = trial?.canary?.maximumDurationDays;
 		const progress =
-			minimumSamples === undefined || currentSamples === undefined
-				? "等待 session evidence"
-				: `${currentSamples}/${minimumSamples} candidate sessions`;
+			minimumSamples !== undefined && currentSamples !== undefined
+				? `${this.progressBar(currentSamples, minimumSamples)}  ${currentSamples}/${minimumSamples} sessions`
+				: "等待 session evidence";
+		const validation = this.artifacts.validation?.trim();
+		const evaluation = this.artifacts.evaluation?.trim();
+		const sections: InspectorSection[] = [
+			{
+				id: "risk",
+				title: "风险",
+				tone: "warning",
+				summary: summarize(proposal?.risk ?? "unknown", 48),
+				content: [proposal?.risk ?? "unknown"],
+			},
+			{
+				id: "rollback",
+				title: "Canary 与回滚计划",
+				summary: summarize(trial?.plan ?? proposal?.trialPlan ?? "unknown", 48),
+				content: [trial?.plan ?? proposal?.trialPlan ?? "unknown"],
+			},
+			{
+				id: "validation",
+				title: "可执行验证",
+				summary: validation ? "✓ 已完成" : "缺失",
+				content: validation ? validation.split("\n") : ["没有可执行 validation artifact"],
+			},
+			{
+				id: "evaluation",
+				title: "独立评估",
+				summary: evaluation ? "✓ 已完成" : "缺失",
+				content: evaluation ? evaluation.split("\n") : ["没有评估报告"],
+			},
+		];
+		const lines = [
+			this.theme.fg("accent", this.theme.bold("Evo Component Canary")),
+			"",
+			`${this.theme.bold("Component")}  ${surface}/${shortComponent}${this.theme.fg(
+				"dim",
+				` · ${trial?.canary?.customization === "custom" ? "自定义 Canary" : "默认 Canary"}`,
+			)}`,
+			`${this.theme.bold("进度")}  ${progress}${duration === undefined ? "" : ` · ≤${duration} 天`}`,
+			"",
+			`${this.theme.fg("warning", "风险")}  ${this.theme.fg("warning", summarize(proposal?.risk ?? "unknown"))}`,
+			"",
+		];
+		this.pushSections(lines, sections);
+		return lines;
+	}
+
+	private trialingDecisionLines(): string[] {
 		const decision = this.keepConfirming
 			? [
 					this.theme.fg("warning", this.theme.bold("立即正式上线将结束 Canary，不再等待剩余效果证据。")),
 					"当前 candidate 保持为 stable；parent 仍可通过 /evo rollback 恢复。",
-					this.theme.fg("accent", "再次按 Enter 确认正式上线；Esc 取消"),
+					this.theme.fg("accent", "再次按 Enter 确认正式上线 · Esc 取消"),
 				]
 			: [
-					this.theme.fg("accent", "按 Enter 选择立即正式上线（随后需要二次确认）"),
-					this.theme.fg("dim", "Esc 返回事项列表 • /evo rollback 可立即回滚"),
+					"按 Enter 立即正式上线（随后需要二次确认）",
+					this.theme.fg("dim", "Esc 返回事项列表 · /evo rollback 可立即回滚 · Tab 章节 · ↑↓ 滚动"),
 				];
 		return [
-			this.theme.fg("accent", this.theme.bold("Evo Component Canary")),
-			"",
-			`${this.theme.bold("Component")}  ${surface}/${shortComponent}`,
-			`${this.theme.bold("进度")}  ${progress}${duration === undefined ? "" : ` · 最长 ${duration} 天`}`,
-			`${this.theme.bold("模式")}  ${trial?.canary?.customization === "custom" ? "自定义 Canary" : "默认 Canary"}`,
-			"",
-			this.theme.fg("warning", this.theme.bold("风险")),
-			proposal?.risk ?? "unknown",
-			"",
-			this.theme.bold("Canary 与回滚计划"),
-			trial?.plan ?? proposal?.trialPlan ?? "unknown",
-			"",
-			this.theme.bold("可执行验证"),
-			...(this.artifacts.validation?.trim().split("\n") ?? ["没有可执行 validation artifact"]),
-			"",
-			this.theme.bold("独立评估"),
-			...(this.artifacts.evaluation?.trim().split("\n") ?? ["没有评估报告"]),
-			"",
-			...(this.keepError ? [this.theme.fg("error", this.keepError), ""] : []),
+			this.theme.fg("dim", "─".repeat(40)),
+			...(this.keepError ? [this.theme.fg("error", this.keepError)] : []),
 			...(this.keeping ? [this.theme.fg("accent", "正在正式上线……")] : decision),
 		];
+	}
+
+	private pinnedLines(): string[] {
+		if (this.mode === "tasks") {
+			return [this.theme.fg("dim", "─".repeat(40)), this.theme.fg("dim", "↑↓ 选择 · Enter 打开 · Esc 关闭")];
+		}
+		if (this.item?.kind === "proposal") return this.proposalActionLines(this.item.proposal);
+		if (this.run?.status === "awaiting-canary-approval") return this.canaryDecisionLines();
+		if (this.run?.status === "trialing" && this.item?.component) return this.trialingDecisionLines();
+		if (this.run) {
+			return [
+				this.theme.fg("dim", "─".repeat(40)),
+				this.theme.fg("dim", "↑↓ 滚动 · Tab 选择章节 · Enter/Space 展开收起 · Esc 返回 · 实时更新"),
+			];
+		}
+		return [];
 	}
 
 	private async readProposalArtifact(proposal: Proposal, kind: "review" | "validation"): Promise<string | undefined> {
@@ -544,46 +749,81 @@ export class EvolutionProcessInspector implements Component {
 	}
 
 	private proposalLines(proposal: Proposal): string[] {
-		const statusLabel =
-			{
-				pending: "等待处理",
-				deferred: "已推迟",
-				approved: "已批准",
-				trialing: "Trial 运行中",
-				kept: "已保留",
-				rejected: "已拒绝",
-				"rolled-back": "已回滚",
-			}[proposal.status] ?? proposal.status;
+		const status = this.proposalStatusMeta(proposal);
 		const diffLines = proposal.diff.split("\n");
 		const maxDiffLines = 400;
-		return [
-			this.theme.fg("accent", this.theme.bold("Evo Proposal")),
-			"",
-			...(this.item?.component ? [`${this.theme.bold("Component")}  ${this.item.component}`] : []),
-			`${this.theme.bold("状态")}  ${statusLabel} · ${proposal.tier}/${proposal.kind} · r${proposal.revision}`,
-			"",
-			this.theme.bold("目标"),
-			proposal.motivation,
-			"",
-			this.theme.bold("预期效果"),
-			proposal.expectedEffect,
-			"",
-			this.theme.fg("warning", this.theme.bold("风险")),
-			proposal.risk,
-			"",
-			this.theme.bold("验证计划"),
-			proposal.verifyPlan,
-			...(this.proposalValidation
-				? ["", this.theme.bold("可执行验证"), ...this.proposalValidation.split("\n")]
-				: []),
-			...(this.proposalReview ? ["", this.theme.bold("独立评审"), ...this.proposalReview.split("\n")] : []),
-			"",
-			this.theme.bold(`变更 · ${diffLines.length} 行`),
-			...diffLines.slice(0, maxDiffLines),
-			...(diffLines.length > maxDiffLines
-				? [this.theme.fg("dim", `… 其余 ${diffLines.length - maxDiffLines} 行见 /evo show ${proposal.id}`)]
-				: []),
+		const sections: InspectorSection[] = [
+			{
+				id: "detail",
+				title: "目标与预期效果",
+				summary: summarize(proposal.motivation, 48),
+				content: [
+					this.theme.bold("目标"),
+					proposal.motivation,
+					"",
+					this.theme.bold("预期效果"),
+					proposal.expectedEffect,
+				],
+			},
+			{
+				id: "risk",
+				title: "风险",
+				tone: "warning",
+				summary: summarize(proposal.risk, 48),
+				content: [proposal.risk],
+			},
+			{
+				id: "verify",
+				title: "验证计划",
+				summary: summarize(proposal.verifyPlan, 48),
+				content: [proposal.verifyPlan],
+			},
 		];
+		if (this.proposalValidation) {
+			sections.push({
+				id: "validation",
+				title: "可执行验证",
+				summary: "✓ 已完成",
+				content: this.proposalValidation.split("\n"),
+			});
+		}
+		if (this.proposalReview) {
+			sections.push({
+				id: "review",
+				title: "独立评审",
+				summary: "✓ 已完成",
+				content: this.proposalReview.split("\n"),
+			});
+		}
+		sections.push({
+			id: "diff",
+			title: `变更 · ${diffLines.length} 行`,
+			content: [
+				...diffLines.slice(0, maxDiffLines),
+				...(diffLines.length > maxDiffLines
+					? [this.theme.fg("dim", `… 其余 ${diffLines.length - maxDiffLines} 行见 /evo show ${proposal.id}`)]
+					: []),
+			],
+		});
+		const facts = [
+			`验证 ${this.proposalValidation ? "✓" : "–"}`,
+			`评审 ${this.proposalReview ? "✓" : "–"}`,
+			`diff ${proposal.diffDigest.slice(0, 12)}…`,
+		].join(" · ");
+		const lines = [
+			this.theme.fg("accent", this.theme.bold("Evo Proposal")) +
+				(this.item?.component ? this.theme.fg("dim", ` · ${this.item.component}`) : ""),
+			"",
+			`${this.tierBadge(proposal)} ${this.theme.fg(status.color, status.label)}${this.theme.fg("dim", ` · r${proposal.revision}`)}`,
+			"",
+			`${this.theme.fg("dim", "目标")}  ${summarize(proposal.motivation)}`,
+			`${this.theme.fg("dim", "预期")}  ${summarize(proposal.expectedEffect)}`,
+			`${this.theme.fg("warning", "风险")}  ${this.theme.fg("warning", summarize(proposal.risk))}`,
+			this.theme.fg("dim", facts),
+			"",
+		];
+		this.pushSections(lines, sections);
+		return lines;
 	}
 
 	private availableProposalActions(proposal: Proposal): Array<{ id: ProposalActionId; label: string }> {
@@ -640,25 +880,27 @@ export class EvolutionProcessInspector implements Component {
 					"warning",
 					`确认批准 ${proposal.tier}/${proposal.kind} 提案并应用 diff ${proposal.diffDigest.slice(0, 12)}…？`,
 				),
-				this.theme.fg("accent", "再次按 Enter 确认 • Esc 取消"),
+				this.theme.fg("accent", "再次按 Enter 确认 · Esc 取消"),
 			];
 		}
 		const actions = this.availableProposalActions(proposal);
 		if (actions.length === 0) {
-			return [divider, ...error, this.theme.fg("dim", "此提案已处理完毕 • ↑↓ 滚动 • Esc 返回事项列表")];
+			return [divider, ...error, this.theme.fg("dim", "此提案已处理完毕 · ↑↓ 滚动 · Esc 返回事项列表")];
 		}
 		const row = actions
-			.map((action, index) =>
-				index === this.proposalChoice
-					? this.theme.fg("accent", `[ ${action.label} ]`)
-					: this.theme.fg("muted", `  ${action.label}  `),
-			)
-			.join(" ");
+			.map((action, index) => {
+				const label = `[${PROPOSAL_ACTION_HOTKEYS[action.id]}] ${action.label}`;
+				return index === this.proposalChoice ? this.theme.fg("accent", label) : this.theme.fg("muted", label);
+			})
+			.join("  ");
+		const consequence = this.strictProposalDigest(proposal)
+			? "严格审批：批准需输入完整 digest"
+			: "批准后按冻结策略生效或进入 Trial · 可随时 /evo rollback";
 		return [
 			divider,
 			...error,
 			`${this.theme.bold("处理此提案")}  ${row}`,
-			this.theme.fg("dim", "←→ 选择 • Enter 执行 • ↑↓ 滚动 • Esc 返回事项列表"),
+			this.theme.fg("dim", `${consequence} · 快捷键或 ←→+Enter · Tab 章节 · Space 展开 · ↑↓ 滚动 · Esc 返回`),
 		];
 	}
 
@@ -746,6 +988,44 @@ export class EvolutionProcessInspector implements Component {
 			run.proposalId && "候选提案",
 			this.artifacts.evaluation && "评估报告",
 		].filter(Boolean) as string[];
+		const toolContent: string[] = [];
+		for (const [index, entry] of tools.entries()) {
+			toolContent.push(`${index + 1}. ${toolDescription(entry.call)}`);
+			if (entry.result) {
+				toolContent.push(
+					this.theme.fg(
+						entry.result.isError ? "error" : "success",
+						`   ${entry.result.isError ? "失败" : "完成"}`,
+					),
+				);
+				if (entry.result.text)
+					toolContent.push(
+						...entry.result.text
+							.split("\n")
+							.slice(0, 12)
+							.map((line) => this.theme.fg("dim", `   ${line}`)),
+					);
+			} else toolContent.push(this.theme.fg("warning", "   运行中"));
+		}
+		if (tools.length === 0) toolContent.push("尚无工具调用");
+		const outcomeContent: string[] = [];
+		if (this.artifacts.plan)
+			outcomeContent.push(
+				this.theme.fg("success", "✓ 研究计划"),
+				...this.artifacts.plan.split("\n").map((line) => `  ${line}`),
+			);
+		if (this.artifacts.experiment)
+			outcomeContent.push(
+				this.theme.fg("success", "✓ 冻结实验"),
+				...this.artifacts.experiment.split("\n").map((line) => `  ${line}`),
+			);
+		if (run.proposalId) outcomeContent.push(this.theme.fg("success", "✓ 候选提案"));
+		if (this.artifacts.evaluation)
+			outcomeContent.push(
+				this.theme.fg("success", "✓ 评估报告"),
+				...this.artifacts.evaluation.split("\n").map((line) => `  ${line}`),
+			);
+		if (outcomes.length === 0) outcomeContent.push("当前阶段尚未生成可审阅成果");
 		const lines = [
 			this.theme.fg("accent", this.theme.bold("Evo 工作流进度")),
 			"",
@@ -758,82 +1038,45 @@ export class EvolutionProcessInspector implements Component {
 			`${this.theme.bold("当前活动")}  ${currentActivity(this.events, run.status)}`,
 			"",
 		];
-		lines.push(this.sectionHeader(0, thinking ? `${thinking.length} 字符` : "尚无输出"));
-		if (this.expandedSection === 0) {
-			lines.push(
-				"",
-				...(thinking
-					? thinking.split("\n").map((line) => this.theme.fg("dim", `  ${line}`))
-					: ["  尚无 thinking 输出"]),
-				"",
-			);
-		}
-		lines.push(this.sectionHeader(1, tools.length > 0 ? `${tools.length} 次调用` : "尚未调用"));
-		if (this.expandedSection === 1) {
-			lines.push("");
-			for (const [index, entry] of tools.entries()) {
-				lines.push(`  ${index + 1}. ${toolDescription(entry.call)}`);
-				if (entry.result) {
-					lines.push(
-						this.theme.fg(
-							entry.result.isError ? "error" : "success",
-							`     ${entry.result.isError ? "失败" : "完成"}`,
-						),
-					);
-					if (entry.result.text)
-						lines.push(
-							...entry.result.text
-								.split("\n")
-								.slice(0, 12)
-								.map((line) => this.theme.fg("dim", `     ${line}`)),
-						);
-				} else lines.push(this.theme.fg("warning", "     运行中"));
-			}
-			if (tools.length === 0) lines.push("  尚无工具调用");
-			lines.push("");
-		}
-		lines.push(this.sectionHeader(2, outcomes.length > 0 ? outcomes.join("、") : "尚无阶段成果"));
-		if (this.expandedSection === 2) {
-			lines.push("");
-			if (this.artifacts.plan)
-				lines.push(
-					this.theme.fg("success", "  ✓ 研究计划"),
-					...this.artifacts.plan.split("\n").map((line) => `    ${line}`),
-				);
-			if (this.artifacts.experiment)
-				lines.push(
-					this.theme.fg("success", "  ✓ 冻结实验"),
-					...this.artifacts.experiment.split("\n").map((line) => `    ${line}`),
-				);
-			if (run.proposalId) lines.push(this.theme.fg("success", "  ✓ 候选提案"));
-			if (this.artifacts.evaluation)
-				lines.push(
-					this.theme.fg("success", "  ✓ 评估报告"),
-					...this.artifacts.evaluation.split("\n").map((line) => `    ${line}`),
-				);
-			if (outcomes.length === 0) lines.push("  当前阶段尚未生成可审阅成果");
-			lines.push("");
-		}
-		if (run.error) lines.push(this.theme.fg("error", `错误：${run.error}`), "");
-		lines.push(this.theme.fg("dim", "↑↓ 选择 • Enter 展开/收起 • Esc 返回任务列表 • 实时更新"));
+		this.pushSections(lines, [
+			{
+				id: "thinking",
+				title: "当前思考",
+				summary: thinking ? `${thinking.length} 字符` : "尚无输出",
+				content: thinking ? thinking.split("\n").map((line) => this.theme.fg("dim", line)) : ["尚无 thinking 输出"],
+			},
+			{
+				id: "tools",
+				title: "工具调用",
+				summary: tools.length > 0 ? `${tools.length} 次调用` : "尚未调用",
+				content: toolContent,
+			},
+			{
+				id: "outcomes",
+				title: "阶段成果",
+				summary: outcomes.length > 0 ? outcomes.join("、") : "尚无阶段成果",
+				content: outcomeContent,
+			},
+		]);
+		if (run.error) lines.push("", this.theme.fg("error", `错误：${run.error}`));
 		return lines;
 	}
 
 	render(width: number): string[] {
+		this.focusedSectionLine = -1;
 		const logical = this.mode === "tasks" ? this.taskLines() : this.runLines();
-		// The proposal action bar is pinned below the scrollable card so the
-		// available decisions stay visible while the user reads the details.
-		const pinned =
-			this.mode === "run" && this.item?.kind === "proposal"
-				? this.proposalActionLines(this.item.proposal).flatMap((line) =>
-						wrapTextWithAnsi(line, Math.max(1, width - 2)).map((part) => ` ${part}`),
-					)
-				: [];
+		// Decision controls and key hints stay pinned below the scrollable
+		// content so the next action is always visible to the user.
+		const pinned = this.pinnedLines().flatMap((line) =>
+			wrapTextWithAnsi(line, Math.max(1, width - 2)).map((part) => ` ${part}`),
+		);
 		const wrapped: string[] = [];
 		let selectedStart = 0;
 		let selectedEnd = 0;
+		let focusedStart = -1;
 		for (const [index, line] of logical.entries()) {
 			if (this.mode === "tasks" && index === this.selectedTaskLine) selectedStart = wrapped.length;
+			if (index === this.focusedSectionLine) focusedStart = wrapped.length;
 			for (const part of wrapTextWithAnsi(line, Math.max(1, width - 2))) wrapped.push(` ${part}`);
 			if (this.mode === "tasks" && index === this.selectedTaskLine) selectedEnd = wrapped.length;
 		}
@@ -846,10 +1089,26 @@ export class EvolutionProcessInspector implements Component {
 			if (selectedEnd > this.taskScrollTop + viewport) this.taskScrollTop = selectedEnd - viewport;
 			if (selectedStart < this.taskScrollTop) this.taskScrollTop = selectedStart;
 			this.taskScrollTop = Math.min(Math.max(0, this.taskScrollTop), maxStart);
-			return wrapped.slice(this.taskScrollTop, this.taskScrollTop + viewport);
+			return [...wrapped.slice(this.taskScrollTop, this.taskScrollTop + viewport), ...pinned];
 		}
-		const start = Math.max(0, maxStart - this.scrollFromBottom);
+		let start = Math.max(0, maxStart - this.scrollFromBottom);
+		if (this.followFocus && focusedStart >= 0) {
+			if (focusedStart < start) start = focusedStart;
+			else if (focusedStart >= start + viewport) start = focusedStart - viewport + 1;
+			start = Math.min(Math.max(0, start), maxStart);
+			this.scrollFromBottom = maxStart - start;
+		}
+		this.followFocus = false;
 		return [...wrapped.slice(start, start + viewport), ...pinned];
+	}
+
+	private activateApprovalChoice(choice: number): void {
+		if (this.approving) return;
+		this.approvalChoice = choice;
+		if (choice === 0) this.startComponentApproval({ mode: "canary", customization: "default" });
+		else if (choice === 1) this.approvalView = "custom";
+		else if (this.proposal?.artifacts.validation) this.approvalView = "direct-confirm";
+		else this.approvalError = "直接上线要求通过并绑定可执行 validation artifact";
 	}
 
 	private startComponentApproval(decision: ComponentApprovalDecision): void {
@@ -948,17 +1207,19 @@ export class EvolutionProcessInspector implements Component {
 		}
 		if (this.mode === "tasks") {
 			if (matchesKey(data, Key.up)) this.taskIndex = Math.max(0, this.taskIndex - 1);
-			else if (matchesKey(data, Key.down)) this.taskIndex = Math.min(this.items.length - 1, this.taskIndex + 1);
+			else if (matchesKey(data, Key.down))
+				this.taskIndex = Math.min(Math.max(0, this.displayItems.length - 1), this.taskIndex + 1);
 			else if (matchesKey(data, Key.enter)) {
-				const selected = this.items[this.taskIndex];
+				const selected = this.displayItems[this.taskIndex];
 				if (selected) {
 					this.itemKey = selected.key;
 					this.item = selected;
 					this.run = selected.kind === "run" ? selected.run : undefined;
 					this.mode = "run";
 					this.taskNotice = undefined;
-					this.sectionIndex = 0;
-					this.expandedSection = undefined;
+					this.sectionFocus = 0;
+					this.expandedSections = new Set();
+					this.followFocus = false;
 					// Proposal cards are static documents and open at the top; run
 					// views stay bottom-anchored to follow live progress.
 					this.scrollFromBottom = selected.kind === "proposal" ? Number.MAX_SAFE_INTEGER : 0;
@@ -1019,8 +1280,16 @@ export class EvolutionProcessInspector implements Component {
 				else if (matchesKey(data, Key.down)) this.scrollFromBottom = Math.max(0, this.scrollFromBottom - 1);
 				else if (matchesKey(data, Key.home)) this.scrollFromBottom = Number.MAX_SAFE_INTEGER;
 				else if (matchesKey(data, Key.end)) this.scrollFromBottom = 0;
+				else if (matchesKey(data, Key.tab)) this.focusNextSection();
+				else if (matchesKey(data, Key.space)) this.toggleFocusedSection();
 				else if (matchesKey(data, Key.enter) && actions.length > 0 && !this.proposalActing) {
 					this.startProposalAction(proposal);
+				} else if (data.length === 1 && !data.startsWith("\u001b") && !this.proposalActing) {
+					const hotkeyIndex = actions.findIndex((action) => PROPOSAL_ACTION_HOTKEYS[action.id] === data);
+					if (hotkeyIndex >= 0) {
+						this.proposalChoice = hotkeyIndex;
+						this.startProposalAction(proposal);
+					}
 				}
 				this.tui.requestRender();
 				return;
@@ -1030,6 +1299,8 @@ export class EvolutionProcessInspector implements Component {
 				else if (matchesKey(data, Key.down)) this.scrollFromBottom = Math.max(0, this.scrollFromBottom - 1);
 				else if (matchesKey(data, Key.home)) this.scrollFromBottom = Number.MAX_SAFE_INTEGER;
 				else if (matchesKey(data, Key.end)) this.scrollFromBottom = 0;
+				else if (matchesKey(data, Key.tab)) this.focusNextSection();
+				else if (matchesKey(data, Key.space)) this.toggleFocusedSection();
 				else if (matchesKey(data, Key.enter) && !this.keeping) {
 					if (this.keepConfirming) this.startDirectKeep();
 					else this.keepConfirming = true;
@@ -1067,23 +1338,19 @@ export class EvolutionProcessInspector implements Component {
 				else if (matchesKey(data, Key.down)) this.scrollFromBottom = Math.max(0, this.scrollFromBottom - 1);
 				else if (matchesKey(data, Key.home)) this.scrollFromBottom = Number.MAX_SAFE_INTEGER;
 				else if (matchesKey(data, Key.end)) this.scrollFromBottom = 0;
-				else if (matchesKey(data, Key.enter) && !this.approving) {
-					if (this.approvalChoice === 0) {
-						this.startComponentApproval({ mode: "canary", customization: "default" });
-					} else if (this.approvalChoice === 1) this.approvalView = "custom";
-					else if (this.proposal?.artifacts.validation) this.approvalView = "direct-confirm";
-					else this.approvalError = "直接上线要求通过并绑定可执行 validation artifact";
+				else if (matchesKey(data, Key.tab)) this.focusNextSection();
+				else if (matchesKey(data, Key.space)) this.toggleFocusedSection();
+				else if (matchesKey(data, Key.enter)) this.activateApprovalChoice(this.approvalChoice);
+				else if (data === "c" || data === "u" || data === "x") {
+					this.activateApprovalChoice(data === "c" ? 0 : data === "u" ? 1 : 2);
 				}
 				this.tui.requestRender();
 				return;
 			}
-			if (matchesKey(data, Key.up)) this.sectionIndex = Math.max(0, this.sectionIndex - 1);
-			else if (matchesKey(data, Key.down))
-				this.sectionIndex = Math.min(SECTION_NAMES.length - 1, this.sectionIndex + 1);
-			else if (matchesKey(data, Key.enter)) {
-				this.expandedSection = this.expandedSection === this.sectionIndex ? undefined : this.sectionIndex;
-				this.scrollFromBottom = 0;
-			}
+			if (matchesKey(data, Key.up)) this.scrollFromBottom++;
+			else if (matchesKey(data, Key.down)) this.scrollFromBottom = Math.max(0, this.scrollFromBottom - 1);
+			else if (matchesKey(data, Key.tab)) this.focusNextSection();
+			else if (matchesKey(data, Key.space) || matchesKey(data, Key.enter)) this.toggleFocusedSection();
 			if (matchesKey(data, Key.home)) this.scrollFromBottom = Number.MAX_SAFE_INTEGER;
 			else if (matchesKey(data, Key.end)) this.scrollFromBottom = 0;
 		}

@@ -377,7 +377,7 @@ lines.on("line", line => {
 		});
 		expect(result.proposals[0].artifacts.replay).toBeUndefined();
 		const activity = await listEvoActivityItems({ paths: f.paths, service: f.service });
-		expect(activity[0]?.text).toBe("Evo: compaction/test · 等待发布确认 · [↓ 后 Enter 展开]");
+		expect(activity[0]?.text).toBe("Evo: compaction/test · 等待发布确认 · [↓+Enter 处理]");
 		expect(activity[0]?.text).not.toContain(result.run.id);
 		expect(activity[0]?.text).not.toContain(result.proposals[0].id);
 		expect(runner.requests).toHaveLength(4);
@@ -482,8 +482,8 @@ lines.on("line", line => {
 		expect(canaryCard).toContain("Exact diff");
 		expect(canaryCard).toContain("test-compaction");
 		expect(canaryCard).not.toContain(retried.proposal.id);
-		expect(canaryCard).toContain("人工发布决策");
-		expect(canaryCard).toContain("直接上线，跳过 Canary");
+		expect(canaryCard).toContain("发布决策");
+		expect(canaryCard).toContain("[x] 直接上线");
 		inspector.handleInput("\r");
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(reviewedRun).toBe(retried.runId);

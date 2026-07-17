@@ -12,6 +12,30 @@ export type EvoActivityItem =
 	| { key: string; kind: "run"; text: string; run: EvolutionRun; proposal?: Proposal; component?: string }
 	| { key: string; kind: "proposal"; text: string; proposal: Proposal; component?: string };
 
+/** What the user should do with an item next: decide, watch, or nothing. */
+export type EvoActivityGroup = "action" | "running" | "history";
+
+export function activityGroup(item: EvoActivityItem): EvoActivityGroup {
+	if (item.kind === "proposal") {
+		const status = item.proposal.status;
+		return status === "pending" || status === "deferred" ? "action" : "running";
+	}
+	const status = item.run.status;
+	if (status === "awaiting-canary-approval" || status === "awaiting-decision") return "action";
+	return TERMINAL_RUN_STATUSES.has(status) ? "history" : "running";
+}
+
+/** Stable-reorder items: decisions first, then live work, then history. */
+export function groupActivityItems(items: EvoActivityItem[]): EvoActivityItem[] {
+	const rank: Record<EvoActivityGroup, number> = { action: 0, running: 1, history: 2 };
+	return items
+		.map((item, index) => ({ item, index }))
+		.sort(
+			(left, right) => rank[activityGroup(left.item)] - rank[activityGroup(right.item)] || left.index - right.index,
+		)
+		.map((entry) => entry.item);
+}
+
 function compact(value: string, maxLength = 54): string {
 	const normalized = value.replace(/\s+/g, " ").trim();
 	return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 1)}…`;
@@ -82,10 +106,10 @@ function runText(
 				? "comparison pending"
 				: `Canary ${trial ? `${trial.currentSessions}/${trial.minimumSessions}` : "运行中"}`;
 		const bound = trial ? ` · ≤${trial.maximumDurationDays}d` : "";
-		return `Evo: ${componentLabel(proposal, component)} · ${state}${bound} · [↓ 后 Enter 展开]`;
+		return `Evo: ${componentLabel(proposal, component)} · ${state}${bound} · [↓+Enter 查看]`;
 	}
 	if (component && run.status === "awaiting-canary-approval") {
-		return `Evo: ${componentLabel(proposal, component)} · 等待发布确认 · [↓ 后 Enter 展开]`;
+		return `Evo: ${componentLabel(proposal, component)} · 等待发布确认 · [↓+Enter 处理]`;
 	}
 	return `Evo: ${runStatusLabel(run)} · ${compact(run.request ?? "定时演化")}`;
 }
@@ -98,7 +122,7 @@ function proposalText(proposal: Proposal, component: string | undefined, trial: 
 				? "comparison pending"
 				: `Canary ${trial ? `${trial.currentSessions}/${trial.minimumSessions}` : "运行中"}`;
 		const bound = trial ? ` · ≤${trial.maximumDurationDays}d` : "";
-		return `Evo: ${componentLabel(proposal, component)} · ${status}${bound} · [↓ 后 Enter 展开]`;
+		return `Evo: ${componentLabel(proposal, component)} · ${status}${bound} · [↓+Enter 查看]`;
 	}
 	if (proposal.status === "trialing") {
 		const status = proposal.artifacts.retrospective
