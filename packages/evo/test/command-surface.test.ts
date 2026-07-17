@@ -8,7 +8,7 @@ import { EvoCapabilityBroker } from "../src/components/capabilities/broker.ts";
 import { readEvoControlConfig } from "../src/evolve/config.ts";
 import { loadEvoPack } from "../src/pack/pack.ts";
 import { getEvoPaths } from "../src/paths.ts";
-import { proposalApproval } from "../src/proposal.ts";
+import { attachProposalArtifact, proposalApproval, saveProposal, stageProposal } from "../src/proposal.ts";
 import { createRecorderStore } from "../src/recorder/store.ts";
 import { BundleRegistry } from "../src/registry/registry.ts";
 import { writeScheduleConfig } from "../src/scheduler.ts";
@@ -123,6 +123,58 @@ describe("evo command surface", () => {
 		const workflows = captureCliOutput();
 		await runEvoCli(["workflows"], { paths, service, io: workflows.io });
 		expect(workflows.messages.join("\n")).toContain("/deepcode");
+	});
+
+	it("keeps a validated component trial directly without a retrospective", async () => {
+		const root = await temporary("evo-cmd-keep-component-");
+		const { paths, service } = await seedActiveBundle(root);
+		let proposal = await stageProposal({
+			paths,
+			parentDigest: (await service.registry.readStableDigest()) ?? "",
+			observationsMarkdown: "A component trial awaiting conclusion.",
+			draft: {
+				motivation: "Component canary to conclude",
+				expectedEffect: "The component stays live",
+				risk: "None",
+				verifyPlan: "Executable validation",
+				trialPlan: "Reversible canary",
+				source: "pattern",
+				evidence: [],
+				inboxReferences: [],
+				replayScenarios: [],
+				changes: [{ path: "memory/component.md", content: "Component trial.\n" }],
+			},
+		});
+		proposal = await attachProposalArtifact({
+			paths,
+			proposalId: proposal.id,
+			expected: proposalApproval(proposal),
+			kind: "validation",
+			content: "Executable validation passed.",
+			allowedStatuses: ["pending"],
+		});
+		proposal.status = "trialing";
+		proposal.targetAbi = "workflow/v1";
+		await saveProposal(paths, proposal);
+		if (!proposal.candidateDigest) throw new Error("missing candidate digest");
+		await service.registry.activateTrial({
+			digest: proposal.candidateDigest,
+			proposalId: proposal.id,
+			plan: proposal.trialPlan,
+		});
+
+		const messages: string[] = [];
+		const io: EvoCliIO = {
+			interactive: true,
+			write: (message) => messages.push(message),
+			writeError: (message) => messages.push(message),
+			question: async () => "y",
+		};
+		// keep must conclude the component trial directly — no model retrospective.
+		await runEvoCli(["keep"], { paths, service, io });
+		expect(messages.join("\n")).toContain(`Kept ${proposal.id}`);
+		expect((await service.getProposal(proposal.id)).status).toBe("kept");
+		expect(await service.registry.readTrial()).toBeUndefined();
 	});
 
 	it("reports no active workflows on a fresh bundle", async () => {

@@ -26,6 +26,7 @@
 
 ### Changed
 
+- `keep` now concludes a validated component trial directly (one confirmation, `human-direct-keep` audit) instead of requiring a model retrospective; data trials keep the retrospective flow. This gives the Inspector's "立即正式上线" a command-line equivalent.
 - Approved workflow components now activate directly instead of entering a Canary trial: a sandboxed slash command has no product-behavior metrics a Canary could observe, so once the executable dry run passed, approval makes it live immediately — still rollbackable via `/evo rollback` and audited as `human-direct-keep`.
 - Changed Evo activity into a dedicated final status line that names active Canary components, stays separate from provider quota status, and can be entered with Down from the end of a draft to open runs, trials, and proposals.
 - Raised default pack capability budgets (spawn-agent: 100 calls, 64-turn children, sized for parallel large-context reservations) and expanded the `workflow/v1` capability ceiling with `memory-read`/`memory-write` for persistent workflow state.

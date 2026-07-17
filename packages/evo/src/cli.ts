@@ -466,6 +466,19 @@ async function stagePackImport(
 	});
 }
 
+/**
+ * The active trial's proposal when it is a validated component selection.
+ * Component trials need no model retrospective to conclude: the executable
+ * validation is the gate, so `keep` concludes them directly.
+ */
+async function findDirectKeepableTrial(dependencies: EvoCommandDependencies): Promise<Proposal | undefined> {
+	const trial = await dependencies.service.registry.readTrial();
+	if (!trial) return undefined;
+	const proposal = await dependencies.service.getProposal(trial.proposalId);
+	if (proposal.status !== "trialing" || !proposal.targetAbi || !proposal.artifacts.validation) return undefined;
+	return proposal;
+}
+
 function describePermitOutcome(proposal: Proposal, trigger?: string): string {
 	if (proposal.status === "trialing") {
 		return trigger
@@ -1353,6 +1366,24 @@ async function dispatchExtensionCommand(
 		}
 		case "keep": {
 			if (!ctx.hasUI) throw new Error("Keeping a trial requires an interactive UI");
+			const componentTrial = await findDirectKeepableTrial(dependencies);
+			if (componentTrial) {
+				if (
+					!(await ctx.ui.confirm(
+						`Keep ${componentTrial.id}`,
+						"立即正式上线这个已通过可执行验证的组件并结束 Canary？（/evo rollback 可回滚）",
+					))
+				) {
+					ctx.ui.notify("Trial remains active", "info");
+					return;
+				}
+				const kept = await dependencies.service.directKeepComponentTrial(
+					componentTrial.id,
+					rest || "Human directly kept the validated component trial via /evo keep",
+				);
+				ctx.ui.notify(`Kept ${kept.id}`, "info");
+				return;
+			}
 			const retrospective = await runRetrospective(modelRunOptions(dependencies));
 			sendCustomCard(pi, "evo.retrospective", retrospective.retrospectiveMarkdown, {
 				proposalId: retrospective.proposal.id,
@@ -1893,6 +1924,24 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 		}
 		case "keep": {
 			requireInteractive(io);
+			const componentTrial = await findDirectKeepableTrial(dependencies);
+			if (componentTrial) {
+				if (
+					!(await confirmLocalMutation(
+						io,
+						"立即正式上线这个已通过可执行验证的组件并结束 Canary？（rollback 可回滚）",
+					))
+				) {
+					io.write("Trial remains active");
+					return;
+				}
+				const kept = await dependencies.service.directKeepComponentTrial(
+					componentTrial.id,
+					rest || "Human directly kept the validated component trial via keep",
+				);
+				io.write(`Kept ${kept.id}`);
+				return;
+			}
 			const retrospective = await runRetrospective(modelRunOptions(dependencies));
 			io.write(retrospective.retrospectiveMarkdown);
 			const answer = await io.question(`Keep trial ${retrospective.proposal.id}? [y/N] `);
