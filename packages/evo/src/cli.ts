@@ -1,10 +1,12 @@
+import { readdir } from "node:fs/promises";
+import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import type { ExtensionCommandContext, ExtensionContext, ExtensionFactory } from "@ch1nyzzz/pi-coding-agent";
 import { loadCompiledBundle } from "./bundle/compile.ts";
 import { DEFAULT_SPAWN_AGENT_TOOL_NAMES } from "./bundle/runtime.ts";
-import { renderTrialComparisonMarkdown, type TrialComparison } from "./comparison.ts";
+import { parseTrialDurationDays, renderTrialComparisonMarkdown, type TrialComparison } from "./comparison.ts";
 import type { EvoBudgetedCapabilityGrant, EvoCapabilityGrant } from "./components/capabilities/broker.ts";
-import { parseEvoCapabilityGrants } from "./components/capabilities/broker.ts";
+import { EvoCapabilityBroker, parseEvoCapabilityGrants } from "./components/capabilities/broker.ts";
 import { canUseEvoComponentSandbox } from "./components/process-runtime.ts";
 import type { EvoDiscoveredPack } from "./discovery/client.ts";
 import { getEvoPackDiscoveryConfigPath, readEvoPackDiscoveryConfig } from "./discovery/config.ts";
@@ -24,17 +26,32 @@ import {
 	resumeBackgroundEvolution,
 	startBackgroundEvolution,
 } from "./evolve/background.ts";
-import { readEvoControlConfig, readEvolutionWorkflow, resetEvolutionWorkflow } from "./evolve/config.ts";
+import {
+	readEvoControlConfig,
+	readEvolutionWorkflow,
+	resetEvolutionWorkflow,
+	updateEvoControlConfigValue,
+} from "./evolve/config.ts";
 import { runEvolutionCycle, runUnknownAbiBuilderCycle, type UnknownAbiBuilderCycleResult } from "./evolve/cycle.ts";
 import { EvolutionProcessInspector } from "./evolve/inspect-ui.ts";
 import { changesComponentSelection } from "./evolve/release.ts";
 import { retryEvolutionFromValidation } from "./evolve/retry.ts";
-import { listEvolutionRuns, readEvolutionRun, updateEvolutionRun } from "./evolve/run.ts";
+import {
+	listEvolutionRuns,
+	readEvolutionRun,
+	readFrozenExperimentForProposal,
+	updateEvolutionRun,
+} from "./evolve/run.ts";
 import type { UnknownAbiBuilderRequest } from "./evolve/unknown-abi.ts";
+import { readInboxEntry, readInboxLifecycleStates } from "./inbox.ts";
 import { readBundlePreferenceMemory } from "./memory/preferences.ts";
 import { exportEvoPack } from "./pack/export.ts";
 import { type EvoPackImportPreflight, type EvoPackImportResult, importEvoPack } from "./pack/import.ts";
 import { type EvoPackManifest, loadEvoPack } from "./pack/pack.ts";
+import { DEEP_RESEARCH_TRIGGER, writeDeepResearchPack } from "./pack/templates/deep-research.ts";
+import { DEEP_REVIEW_TRIGGER, writeDeepReviewPack } from "./pack/templates/deep-review.ts";
+import { DEEPCODE_TRIGGER, writeDeepcodePack } from "./pack/templates/deepcode.ts";
+import type { WrittenWorkflowPack } from "./pack/templates/write-pack.ts";
 import { type EvoPaths, getEvoPaths } from "./paths.ts";
 import { proposalApproval } from "./proposal.ts";
 import { readEvaluationArtifact } from "./proposal-artifacts.ts";
@@ -47,17 +64,25 @@ import {
 } from "./reflect/permit.ts";
 import { runReport } from "./reflect/reflector.ts";
 import { runRetrospective } from "./reflect/retrospective.ts";
+import { renderModelUsageSummary, summarizeModelUsage } from "./reflect/usage.ts";
 import {
 	type EvoScheduleConfig,
 	type EvoScheduleStatus,
 	getScheduleStatus,
 	parseScheduleCadence,
+	readScheduleConfig,
 	runConfiguredImprove,
 	type ScheduledImproveResult,
 	writeScheduleConfig,
 } from "./scheduler.ts";
 import { EvoService } from "./service.ts";
-import type { EvoStatus, Proposal, ProposalArtifactKind } from "./types.ts";
+import type {
+	CanaryTrialControl,
+	ComponentApprovalDecision,
+	EvoStatus,
+	Proposal,
+	ProposalArtifactKind,
+} from "./types.ts";
 
 const SUBCOMMANDS = [
 	"help",
@@ -77,6 +102,12 @@ const SUBCOMMANDS = [
 	"scheduled-improve",
 	"schedule",
 	"workflow",
+	"playbook",
+	"workflows",
+	"packs",
+	"config",
+	"inbox",
+	"usage",
 	"list",
 	"show",
 	"note",
@@ -117,7 +148,12 @@ const EVO_HELP = `Usage: /evo <command>
   retry <run-id>               Reuse a built component and continue from validation
   scheduled-improve            Run one guarded background evolution attempt
   schedule [cadence]           Show or set the evolution cadence (daily, 3d, weekly, manual)
-  workflow [reset]             Show or reset the user-editable evolution workflow
+  playbook [reset]             Show or reset the evolution playbook (guides research)
+  workflows                    List active workflow components and their triggers
+  packs [init <name> [dir]]    List bundled workflow pack templates or write one
+  config [set <key> <value>]   Show or update the evo control config
+  inbox                        List inbox entries with lifecycle status
+  usage [<n>d]                 Show model usage and cost by phase (default 7d)
   list                         List proposals
   show <proposal-id>           Show a proposal card
   note <text>                  Record an explicit note
@@ -450,6 +486,112 @@ function formatRegistryPackInstallResult(
 	].join("\n");
 }
 
+const WORKFLOW_PACK_TEMPLATES: Record<
+	string,
+	{ trigger: string; description: string; write(directory: string): Promise<WrittenWorkflowPack> }
+> = {
+	"deep-review": {
+		trigger: DEEP_REVIEW_TRIGGER,
+		description: "Voting-style code review: per-file reviewers plus adversarial verification",
+		write: writeDeepReviewPack,
+	},
+	"deep-research": {
+		trigger: DEEP_RESEARCH_TRIGGER,
+		description: "Multi-source research: parallel searchers, adversarial claim verification, cited report",
+		write: writeDeepResearchPack,
+	},
+	deepcode: {
+		trigger: DEEPCODE_TRIGGER,
+		description: "Multi-agent coding: parallel explorers, frozen step plan, serial implementation, verify-fix loop",
+		write: writeDeepcodePack,
+	},
+};
+
+function formatWorkflowPackTemplates(): string {
+	return [
+		"Bundled workflow pack templates:",
+		...Object.entries(WORKFLOW_PACK_TEMPLATES).map(
+			([name, template]) => `- ${name} (${template.trigger}): ${template.description}`,
+		),
+		"",
+		"Write one with 'packs init <template> [directory]', then import the directory to stage it.",
+	].join("\n");
+}
+
+async function initWorkflowPackTemplate(name: string, directory: string | undefined): Promise<string> {
+	const template = WORKFLOW_PACK_TEMPLATES[name];
+	if (!template) {
+		throw new Error(
+			`Unknown pack template: ${name || "(none)"}. Available: ${Object.keys(WORKFLOW_PACK_TEMPLATES).join(", ")}`,
+		);
+	}
+	const target = resolve(directory ?? `${name}-pack`);
+	const written = await template.write(target);
+	return [
+		`Wrote ${written.manifest.name}@${written.manifest.version} (${template.trigger}) to ${target}`,
+		`Integrity: ${written.integrity}`,
+		`Next: run 'import ${target}' to stage the workflow proposal.`,
+	].join("\n");
+}
+
+async function formatActiveWorkflows(dependencies: EvoCommandDependencies): Promise<string> {
+	const digest = await requireActiveBundleDigest(dependencies);
+	const bundle = await loadCompiledBundle(dependencies.paths, digest);
+	const workflows = bundle.policy.workflows ?? [];
+	if (workflows.length === 0) {
+		return "No workflow components are active in the current bundle. Use 'packs' to see bundled templates.";
+	}
+	const broker = await new EvoCapabilityBroker({ paths: dependencies.paths }).getState();
+	const lines = workflows.map((selection) => {
+		const spawn = (selection.grants ?? []).find((grant) => grant.capability === "spawn-agent");
+		const grantLabel =
+			spawn && "models" in spawn
+				? `spawn-agent \u2264${spawn.maxCalls} calls \u00b7 ${spawn.models.join(",")}`
+				: "no spawn-agent grant";
+		const usage = broker.components
+			.find((component) => component.id === selection.id && component.artifactDigest === selection.artifactDigest)
+			?.usage.find((entry) => entry.capability === "spawn-agent");
+		const usageLabel = usage ? ` \u00b7 used ${usage.calls} call(s)` : "";
+		return `- ${selection.trigger} \u2192 ${selection.id} (${selection.artifactDigest.slice(0, 12)}) \u00b7 ${grantLabel}${usageLabel}`;
+	});
+	return [`Active workflows in bundle ${digest.slice(0, 12)}:`, ...lines].join("\n");
+}
+
+async function formatInboxListing(paths: EvoPaths): Promise<string> {
+	const states = await readInboxLifecycleStates(paths);
+	const files = (await readdir(paths.inbox)).filter((file) => file.endsWith(".json")).sort();
+	if (files.length === 0) return "Inbox is empty.";
+	const lines: string[] = [];
+	for (const file of files) {
+		try {
+			const entry = await readInboxEntry(paths, file);
+			const state = states.get(file);
+			const preview = entry.text.replaceAll("\n", " ").slice(0, 96);
+			lines.push(`- [${state?.status ?? "open"}/${state?.kind ?? entry.kind ?? "unclassified"}] ${file}`);
+			lines.push(`    ${preview}`);
+		} catch {
+			lines.push(`- [unreadable] ${file}`);
+		}
+	}
+	return [`Inbox entries (${files.length}):`, ...lines].join("\n");
+}
+
+async function formatUsageSummary(paths: EvoPaths, rest: string): Promise<string> {
+	const trimmed = rest.trim();
+	const match = /^([1-9][0-9]*)d$/.exec(trimmed);
+	if (trimmed && !match) throw new Error("Usage: usage [<n>d]");
+	const days = match ? Number(match[1]) : 7;
+	const summary = await summarizeModelUsage(paths, {
+		since: new Date(Date.now() - days * 24 * 60 * 60 * 1_000),
+	});
+	return [`Model usage over the last ${days}d:`, "", renderModelUsageSummary(summary)].join("\n");
+}
+
+async function formatControlConfig(paths: EvoPaths): Promise<string> {
+	const config = await readEvoControlConfig(paths);
+	return [`Config file: ${paths.config}`, "", JSON.stringify(config, undefined, 2)].join("\n");
+}
+
 async function requireActiveBundleDigest(dependencies: EvoCommandDependencies): Promise<string> {
 	const digest = await dependencies.service.registry.readStableDigest();
 	if (!digest) throw new Error("Evo-Pi is not initialized; run evo-pi init first");
@@ -711,11 +853,22 @@ export async function refreshEvoStatusIndicator(
 	ctx.ui.setStatusItems(
 		"evo",
 		items.length > 0
-			? items.map((item) => ({
-					id: item.key,
-					text: item.text,
-					onSelect: () => openEvolutionInspector(dependencies, ctx, item.key),
-				}))
+			? items.map((item) => {
+					const status = item.kind === "run" ? item.run.status : item.proposal.status;
+					const text =
+						status === "failed" || status === "cancelled"
+							? ctx.ui.theme.fg("error", item.text)
+							: status === "awaiting-canary-approval" || status === "awaiting-decision"
+								? ctx.ui.theme.fg("warning", item.text)
+								: status === "trialing"
+									? ctx.ui.theme.fg("accent", item.text)
+									: item.text;
+					return {
+						id: item.key,
+						text,
+						onSelect: () => openEvolutionInspector(dependencies, ctx, item.key),
+					};
+				})
 			: undefined,
 	);
 }
@@ -877,9 +1030,49 @@ async function runExtensionPermit(
 	}
 }
 
+async function resolveCanaryControl(
+	dependencies: { paths: EvoPaths },
+	proposalId: string,
+	decision: Extract<ComponentApprovalDecision, { mode: "canary" }>,
+): Promise<CanaryTrialControl> {
+	if (decision.customization === "custom") {
+		if (
+			!Number.isSafeInteger(decision.minimumSamples) ||
+			decision.minimumSamples <= 0 ||
+			decision.minimumSamples > 10_000 ||
+			!Number.isSafeInteger(decision.maximumDurationDays) ||
+			decision.maximumDurationDays <= 0 ||
+			decision.maximumDurationDays > 365
+		) {
+			throw new Error("Custom Canary controls must use 1-10000 sessions and 1-365 days");
+		}
+		return {
+			customization: "custom",
+			minimumSamples: decision.minimumSamples,
+			maximumDurationDays: decision.maximumDurationDays,
+		};
+	}
+	const [schedule, experiment] = await Promise.all([
+		readScheduleConfig(dependencies.paths),
+		readFrozenExperimentForProposal(dependencies.paths, proposalId),
+	]);
+	const online = experiment?.evidenceStrategy.online;
+	const contractDays = online && online.mode !== "none" ? parseTrialDurationDays(online.maximumDuration) : undefined;
+	return {
+		customization: "default",
+		minimumSamples:
+			online && online.mode !== "none"
+				? Math.max(schedule.trialDueAfterSessions, online.minimumSamples)
+				: schedule.trialDueAfterSessions,
+		maximumDurationDays:
+			contractDays === undefined ? schedule.trialDueAfterDays : Math.min(schedule.trialDueAfterDays, contractDays),
+	};
+}
+
 export async function approveCanaryRun(
 	dependencies: { service: EvoService; paths: EvoPaths },
 	runId: string,
+	decision: ComponentApprovalDecision = { mode: "canary", customization: "default" },
 ): Promise<void> {
 	const run = await readEvolutionRun(dependencies.paths, runId);
 	if (run.status !== "awaiting-canary-approval" || !run.proposalId) {
@@ -897,28 +1090,120 @@ export async function approveCanaryRun(
 		throw new Error("Canary review metadata no longer matches the exact proposal");
 	}
 	const stable = await dependencies.service.registry.readStableDigest();
-	if (!stable || stable !== proposal.parentBundleDigest) {
-		throw new Error("Stable bundle changed; rebuild and review the Canary against the new baseline");
-	}
 	if (proposal.status === "trialing") {
+		if (decision.mode === "direct") throw new Error("The component is already running as a Canary");
 		const trial = await dependencies.service.registry.readTrial();
-		if (!trial || trial.proposalId !== proposal.id || trial.digest !== proposal.candidateDigest) {
+		if (
+			!stable ||
+			stable !== proposal.candidateDigest ||
+			!trial ||
+			trial.proposalId !== proposal.id ||
+			trial.digest !== proposal.candidateDigest
+		) {
 			throw new Error("Component proposal and active Canary state disagree");
 		}
 		await updateEvolutionRun(dependencies.paths, run.id, {
 			status: "trialing",
 			canaryApprovalDigest: proposal.approvalDigest,
-			canaryStableDigest: stable,
+			canaryStableDigest: proposal.parentBundleDigest,
+			componentApprovalMode: trial.canary?.customization === "custom" ? "custom-canary" : "default-canary",
+			...(trial.canary
+				? {
+						canaryMinimumSamples: trial.canary.minimumSamples,
+						canaryMaximumDurationDays: trial.canary.maximumDurationDays,
+					}
+				: {}),
+		});
+		return;
+	}
+	if (proposal.status === "kept") {
+		if (!stable || stable !== proposal.candidateDigest || (await dependencies.service.registry.readTrial())) {
+			throw new Error("Directly activated component state disagrees with the reviewed proposal");
+		}
+		await updateEvolutionRun(dependencies.paths, run.id, {
+			status: "completed",
+			canaryApprovalDigest: proposal.approvalDigest,
+			canaryStableDigest: proposal.parentBundleDigest,
+			componentApprovalMode: "direct",
 		});
 		return;
 	}
 	if (proposal.status !== "pending") throw new Error(`Component proposal is ${proposal.status}`);
-	const approved = await dependencies.service.approve(proposal.id, proposalApproval(proposal));
+	if (!stable || stable !== proposal.parentBundleDigest) {
+		throw new Error("Stable bundle changed; rebuild and review the Canary against the new baseline");
+	}
+	const canary =
+		decision.mode === "canary" ? await resolveCanaryControl(dependencies, proposal.id, decision) : undefined;
+	const approved = await dependencies.service.approveComponent(
+		proposal.id,
+		proposalApproval(proposal),
+		decision.mode === "direct" ? { mode: "direct" } : { mode: "trial", canary },
+	);
 	await updateEvolutionRun(dependencies.paths, run.id, {
-		status: "trialing",
+		status: decision.mode === "direct" ? "completed" : "trialing",
 		canaryApprovedAt: new Date().toISOString(),
 		canaryApprovalDigest: approved.approvalDigest,
 		canaryStableDigest: stable,
+		componentApprovalMode:
+			decision.mode === "direct"
+				? "direct"
+				: canary?.customization === "custom"
+					? "custom-canary"
+					: "default-canary",
+		...(canary
+			? {
+					canaryMinimumSamples: canary.minimumSamples,
+					canaryMaximumDurationDays: canary.maximumDurationDays,
+				}
+			: {}),
+	});
+}
+
+export async function directKeepCanaryRun(
+	dependencies: { service: EvoService; paths: EvoPaths },
+	runId: string,
+): Promise<void> {
+	const run = await readEvolutionRun(dependencies.paths, runId);
+	if (run.status !== "trialing" || !run.proposalId) {
+		throw new Error(`Evolution task ${runId} is not running a component Canary`);
+	}
+	const proposal = await dependencies.service.getProposal(run.proposalId);
+	if (!changesComponentSelection(proposal) || !proposal.candidateDigest || !proposal.targetAbi) {
+		throw new Error("The active trial does not replace a component");
+	}
+	if (
+		run.canaryParentDigest !== proposal.parentBundleDigest ||
+		run.canaryCandidateDigest !== proposal.candidateDigest ||
+		run.canaryTargetAbi !== proposal.targetAbi
+	) {
+		throw new Error("Canary run metadata no longer matches the exact proposal");
+	}
+	const [stable, trial] = await Promise.all([
+		dependencies.service.registry.readStableDigest(),
+		dependencies.service.registry.readTrial(),
+	]);
+	if (proposal.status === "kept") {
+		if (stable !== proposal.candidateDigest || trial) {
+			throw new Error("Directly kept component state disagrees with the reviewed proposal");
+		}
+	} else {
+		if (
+			proposal.status !== "trialing" ||
+			stable !== proposal.candidateDigest ||
+			!trial ||
+			trial.proposalId !== proposal.id ||
+			trial.digest !== proposal.candidateDigest
+		) {
+			throw new Error("Component proposal and active Canary state disagree");
+		}
+		await dependencies.service.directKeepComponentTrial(
+			proposal.id,
+			"Human directly kept the active validated component and ended Canary evidence collection",
+		);
+	}
+	await updateEvolutionRun(dependencies.paths, run.id, {
+		status: "completed",
+		componentApprovalMode: "direct",
 	});
 }
 
@@ -937,7 +1222,8 @@ async function openEvolutionInspector(
 				dependencies.service,
 				itemKey,
 				() => done(undefined),
-				(runId) => approveCanaryRun(dependencies, runId),
+				(runId, decision) => approveCanaryRun(dependencies, runId, decision),
+				(runId) => directKeepCanaryRun(dependencies, runId),
 			),
 	);
 }
@@ -1207,11 +1493,52 @@ async function dispatchExtensionCommand(
 			ctx.ui.notify(`Evo-Pi schedule updated — ${describeScheduleCadence(updated)}`, "info");
 			return;
 		}
-		case "workflow": {
+		// "workflow" is a deprecated alias: the evolution playbook is unrelated to
+		// workflow components, which live under "workflows" and "packs".
+		case "workflow":
+		case "playbook": {
 			if (rest === "reset") await resetEvolutionWorkflow(dependencies.paths);
-			else if (rest) throw new Error("Usage: /evo workflow [reset]");
-			const workflow = await readEvolutionWorkflow(dependencies.paths);
-			sendCustomCard(pi, "evo.workflow", workflow, { path: dependencies.paths.workflow });
+			else if (rest) throw new Error("Usage: /evo playbook [reset]");
+			const playbook = await readEvolutionWorkflow(dependencies.paths);
+			sendCustomCard(pi, "evo.playbook", playbook, { path: dependencies.paths.workflow });
+			return;
+		}
+		case "workflows": {
+			sendCustomCard(pi, "evo.workflows", await formatActiveWorkflows(dependencies), {});
+			return;
+		}
+		case "packs": {
+			const parts = rest.split(/\s+/).filter(Boolean);
+			if (parts.length === 0) {
+				sendCustomCard(pi, "evo.packs", formatWorkflowPackTemplates(), {});
+				return;
+			}
+			if (parts[0] !== "init") throw new Error("Usage: /evo packs [init <template> [directory]]");
+			sendCustomCard(pi, "evo.packs", await initWorkflowPackTemplate(parts[1] ?? "", parts[2]), {
+				template: parts[1],
+			});
+			return;
+		}
+		case "config": {
+			const parts = rest.split(/\s+/).filter(Boolean);
+			if (parts[0] === "set") {
+				const key = parts[1];
+				const value = parts.slice(2).join(" ");
+				if (!key || !value) throw new Error("Usage: /evo config set <key> <value>");
+				await updateEvoControlConfigValue(dependencies.paths, key, value);
+				ctx.ui.notify(`Config updated: ${key} = ${value}`, "info");
+				return;
+			}
+			if (parts.length > 0) throw new Error("Usage: /evo config [set <key> <value>]");
+			sendCustomCard(pi, "evo.config", await formatControlConfig(dependencies.paths), {});
+			return;
+		}
+		case "inbox": {
+			sendCustomCard(pi, "evo.inbox", await formatInboxListing(dependencies.paths), {});
+			return;
+		}
+		case "usage": {
+			sendCustomCard(pi, "evo.usage", await formatUsageSummary(dependencies.paths, rest), {});
 			return;
 		}
 		case "list": {
@@ -1814,10 +2141,49 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 			io.write(`Evo-Pi schedule updated — ${describeScheduleCadence(updated)}`);
 			return;
 		}
-		case "workflow": {
+		// "workflow" is a deprecated alias for "playbook"; workflow components
+		// live under "workflows" and "packs".
+		case "workflow":
+		case "playbook": {
 			if (rest === "reset") await resetEvolutionWorkflow(dependencies.paths);
-			else if (rest) throw new Error("Usage: evo-pi workflow [reset]");
+			else if (rest) throw new Error("Usage: evo-pi playbook [reset]");
 			io.write(`${dependencies.paths.workflow}\n\n${await readEvolutionWorkflow(dependencies.paths)}`);
+			return;
+		}
+		case "workflows": {
+			io.write(await formatActiveWorkflows(dependencies));
+			return;
+		}
+		case "packs": {
+			const parts = rest.split(/\s+/).filter(Boolean);
+			if (parts.length === 0) {
+				io.write(formatWorkflowPackTemplates());
+				return;
+			}
+			if (parts[0] !== "init") throw new Error("Usage: evo-pi packs [init <template> [directory]]");
+			io.write(await initWorkflowPackTemplate(parts[1] ?? "", parts[2]));
+			return;
+		}
+		case "config": {
+			const parts = rest.split(/\s+/).filter(Boolean);
+			if (parts[0] === "set") {
+				const key = parts[1];
+				const value = parts.slice(2).join(" ");
+				if (!key || !value) throw new Error("Usage: evo-pi config set <key> <value>");
+				await updateEvoControlConfigValue(dependencies.paths, key, value);
+				io.write(`Config updated: ${key} = ${value}`);
+				return;
+			}
+			if (parts.length > 0) throw new Error("Usage: evo-pi config [set <key> <value>]");
+			io.write(await formatControlConfig(dependencies.paths));
+			return;
+		}
+		case "inbox": {
+			io.write(await formatInboxListing(dependencies.paths));
+			return;
+		}
+		case "usage": {
+			io.write(await formatUsageSummary(dependencies.paths, rest));
 			return;
 		}
 		case "list": {

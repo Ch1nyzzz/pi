@@ -148,6 +148,45 @@ export async function readEvoControlConfig(paths: EvoPaths): Promise<EvoControlC
 	return parseEvoControlConfig(JSON.parse(await readFile(paths.config, "utf8")));
 }
 
+const SETTABLE_CONFIG_KEY_PATTERN =
+	/^(grants\.approval|triage\.everyNSessions|models\.(researchPlanner|builder|evaluator|triage)\.(model|thinkingLevel)|release\.(autoApplyT0|autoStartDataTrial|autoStartComponentTrial|autoKeepSuccessfulTrial))$/;
+
+function coerceConfigValue(raw: string): unknown {
+	if (raw === "true") return true;
+	if (raw === "false") return false;
+	if (/^[0-9]+$/.test(raw)) return Number(raw);
+	return raw;
+}
+
+/**
+ * Set one whitelisted dotted config key and persist the result. The updated
+ * object is re-validated through the same fail-closed parser as reads, so an
+ * invalid value can never reach disk.
+ */
+export async function updateEvoControlConfigValue(
+	paths: EvoPaths,
+	key: string,
+	rawValue: string,
+): Promise<EvoControlConfig> {
+	if (!SETTABLE_CONFIG_KEY_PATTERN.test(key)) {
+		throw new Error(
+			`Unsupported config key: ${key}. Settable keys: grants.approval, triage.everyNSessions, models.<role>.model, models.<role>.thinkingLevel, release.<flag>`,
+		);
+	}
+	const current = await readEvoControlConfig(paths);
+	const next = JSON.parse(JSON.stringify(current)) as Record<string, unknown>;
+	const segments = key.split(".");
+	let cursor: Record<string, unknown> = next;
+	for (const segment of segments.slice(0, -1)) {
+		cursor[segment] ??= {};
+		cursor = cursor[segment] as Record<string, unknown>;
+	}
+	cursor[segments[segments.length - 1] as string] = coerceConfigValue(rawValue);
+	const validated = parseEvoControlConfig(next);
+	await atomicWriteJson(paths.config, validated);
+	return validated;
+}
+
 export async function readEvolutionWorkflow(paths: EvoPaths): Promise<string> {
 	await ensureEvolutionConfiguration(paths);
 	const workflow = await readFile(paths.workflow, "utf8");

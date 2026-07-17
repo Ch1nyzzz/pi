@@ -11,7 +11,7 @@ export const DEEP_RESEARCH_TRIGGER = "/deep-research";
  * the public web through evo_research_search / evo_research_fetch
  * (arXiv/Crossref/GitHub) and bash curl for general pages.
  */
-export const DEEP_RESEARCH_WORKFLOW_BODY = String.raw`
+export const DEEP_RESEARCH_WORKFLOW_BODY = `
 const ANGLES_SCHEMA = {
 	type: "object",
 	required: ["angles"],

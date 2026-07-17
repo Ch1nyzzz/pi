@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added `packs init`, `workflows`, `config get/set`, `inbox`, and `usage` commands; `workflow` is renamed to `playbook` (deprecated alias kept).
 - Added the bundled `/deep-research` (multi-source research with adversarial claim verification) and `/deepcode` (multi-agent coding: parallel exploration, frozen plan, verify-fix loop) workflow pack templates alongside `/deep-review`.
 - Added the workflow SDK and the bundled `/deep-review` workflow pack template: workflow components can now be written with `runWorkflow()`/`agent()`/`parallel()`/`pipeline()` instead of raw JSONL-RPC, and child agents run with the host's real coding tools.
 - Added streaming session triage (cheap-model hypothesis scouting every N sessions), dual-channel research (narrow request runs vs triage-fed scheduled runs), and guardrail-metric rollback for trials.
