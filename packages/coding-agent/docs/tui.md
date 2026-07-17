@@ -749,7 +749,7 @@ ctx.ui.setStatusItems("my-ext", [
 ctx.ui.setStatusItems("my-ext", undefined);
 ```
 
-Interactive status item IDs are internal stable identities and are not rendered. Interactive activity is rendered on its own final line, separate from passive extension statuses. At the end of a focused draft, the configured `tui.select.down` binding enters the activity list; selection then uses `tui.select.up`, `tui.select.down`, `tui.select.confirm`, and `tui.select.cancel`. Editor movement and autocomplete retain the down key before the draft end.
+Interactive status item IDs are internal stable identities and are not rendered. Interactive activity is rendered on its own final line, separate from passive extension statuses. At the end of a focused draft, the configured `tui.select.down` binding enters the activity list; selection then uses `tui.select.up`, `tui.select.down`, `tui.select.confirm`, and `tui.select.cancel`. Editor movement and autocomplete retain the down key before the draft end, and `tui.select.up` past the first item exits the list back to the editor, where the up key keeps its native cursor/history behavior.
 
 **Examples:** [status-line.ts](../examples/extensions/status-line.ts), [plan-mode/index.ts](../examples/extensions/plan-mode/index.ts), [preset.ts](../examples/extensions/preset.ts)
 

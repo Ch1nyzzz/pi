@@ -1561,6 +1561,8 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 				const normalizedId = kimiAliases.has(modelId) ? "kimi-for-coding" : modelId;
 				const normalizedName = kimiAliases.has(modelId) ? "Kimi For Coding" : m.name || normalizedId;
 
+				const isK3 = normalizedId === "k3";
+
 				models.push({
 					id: normalizedId,
 					name: normalizedName,
@@ -1570,6 +1572,10 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: "https://api.kimi.com/coding",
 					headers: { ...KIMI_STATIC_HEADERS },
 					reasoning: m.reasoning === true,
+					...(isK3 ? {
+						compat: {forceAdaptiveThinking: true},
+						thinkingLevelMap: {"max":"max"},
+					} : {}),
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,

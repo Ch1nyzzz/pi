@@ -245,7 +245,7 @@ export class FooterComponent implements Component {
 			const position =
 				interactiveStatus.total > 1 ? ` ${interactiveStatus.index + 1}/${interactiveStatus.total}` : "";
 			const hint = interactiveStatus.navigating
-				? ` · ${keyText("tui.select.confirm")} open · ${keyText("tui.select.cancel")} cancel`
+				? ` · ${keyText("tui.select.up")} back · ${keyText("tui.select.confirm")} open · ${keyText("tui.select.cancel")} cancel`
 				: ` · ${keyText("tui.select.down")} browse`;
 			const statusLine = `${marker}${sanitizeStatusText(interactiveStatus.item.text)}${position}${hint}`;
 			lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));

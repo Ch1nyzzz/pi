@@ -168,8 +168,14 @@ export default function codexQuotaExtension(pi: ExtensionAPI): void {
 	let inFlight: Promise<CodexQuotaSnapshot> | undefined;
 	let stopped = true;
 
+	const isCodexActive = (ctx: ExtensionContext): boolean => ctx.model?.provider === CODEX_PROVIDER;
+
 	const updateStatus = (ctx: ExtensionContext): void => {
 		if (!ctx.hasUI) return;
+		if (!isCodexActive(ctx)) {
+			ctx.ui.setStatus(STATUS_KEY, undefined);
+			return;
+		}
 		if (!snapshot) {
 			ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("dim", "Codex quota --"));
 			return;
@@ -204,6 +210,7 @@ export default function codexQuotaExtension(pi: ExtensionAPI): void {
 	};
 
 	const refreshSilently = (ctx: ExtensionContext): void => {
+		if (!isCodexActive(ctx)) return;
 		void refresh(ctx).catch(() => {
 			if (!stopped) updateStatus(ctx);
 		});
@@ -237,7 +244,10 @@ export default function codexQuotaExtension(pi: ExtensionAPI): void {
 		postTurnTimer.unref?.();
 	});
 
-	pi.on("model_select", (_event, ctx) => refreshSilently(ctx));
+	pi.on("model_select", (_event, ctx) => {
+		updateStatus(ctx);
+		refreshSilently(ctx);
+	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		stopped = true;

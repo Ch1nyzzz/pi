@@ -1,0 +1,13 @@
+{
+	"schemaVersion": 1,
+	"id": "deepcode",
+	"version": "1.0.0",
+	"entrypointSha256": "e7cf8fdfd1e15df35df71a25ed4e2b0b7d765362a8c50576e836ab7c5c1f2fb6",
+	"abi": "workflow/v1",
+	"activationBoundary": "invocation",
+	"capabilities": [
+		"spawn-agent"
+	],
+	"entrypoint": "component.mjs",
+	"artifactDigest": "2c26d026cd7dfe63f9d6929e4639ef00c0f23971f7fb5772e278ad9d3d038ff4"
+}

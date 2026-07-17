@@ -1900,13 +1900,18 @@ export class InteractiveMode {
 				? cursor.line === lines.length - 1 && cursor.col === (lines[cursor.line]?.length ?? 0)
 				: !text.includes("\n"));
 
-		if (this.keybindings.matches(data, "tui.select.up") && (status.navigating || !text.trim())) {
-			if (!this.footerDataProvider.moveInteractiveExtensionStatusSelection(-1)) return undefined;
+		// ↑/↓ move freely between the editor and the status bar below it. The bar
+		// never traps the keys: ↑ past its first item returns to the editor, and ↑
+		// inside the editor keeps its native meaning (cursor move / prompt history).
+		if (this.keybindings.matches(data, "tui.select.up") && status.navigating) {
+			if (!this.footerDataProvider.moveInteractiveExtensionStatusSelection(-1)) {
+				this.footerDataProvider.cancelInteractiveExtensionStatusNavigation();
+			}
 			this.ui.requestRender();
 			return { consume: true };
 		}
 		if (this.keybindings.matches(data, "tui.select.down") && (status.navigating || canEnterFromEditor)) {
-			if (!this.footerDataProvider.moveInteractiveExtensionStatusSelection(1)) return undefined;
+			this.footerDataProvider.moveInteractiveExtensionStatusSelection(1);
 			this.ui.requestRender();
 			return { consume: true };
 		}

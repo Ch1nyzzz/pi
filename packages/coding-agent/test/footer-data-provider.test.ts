@@ -119,6 +119,24 @@ describe("FooterDataProvider interactive extension statuses", () => {
 		}
 	});
 
+	it("does not wrap around at the list boundaries", () => {
+		const provider = new FooterDataProvider(process.cwd());
+		try {
+			provider.setInteractiveExtensionStatus("evo", [
+				{ id: "one", text: "One", onSelect: () => {} },
+				{ id: "two", text: "Two", onSelect: () => {} },
+			]);
+			provider.moveInteractiveExtensionStatusSelection(1);
+			expect(provider.moveInteractiveExtensionStatusSelection(-1)).toBe(false);
+			expect(provider.getInteractiveExtensionStatus()?.index).toBe(0);
+			provider.moveInteractiveExtensionStatusSelection(1);
+			expect(provider.moveInteractiveExtensionStatusSelection(1)).toBe(false);
+			expect(provider.getInteractiveExtensionStatus()?.index).toBe(1);
+		} finally {
+			provider.dispose();
+		}
+	});
+
 	it("preserves selection across status refreshes by item id", () => {
 		const provider = new FooterDataProvider(process.cwd());
 		try {

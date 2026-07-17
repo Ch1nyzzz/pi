@@ -98,4 +98,34 @@ describe("interactive footer statuses", () => {
 		expect(handleInteractiveStatusInput.call(editing.context, "\x1b[B")).toBeUndefined();
 		expect(editing.selected).toEqual([]);
 	});
+
+	it("leaves the up key to the editor when not navigating the status bar", () => {
+		const harness = createContext();
+		expect(handleInteractiveStatusInput.call(harness.context, "\x1b[A")).toBeUndefined();
+		expect(harness.context.footerDataProvider.getInteractiveExtensionStatus()?.navigating).toBe(false);
+	});
+
+	it("returns to the editor when pressing up past the first status item", () => {
+		const harness = createContext();
+		expect(handleInteractiveStatusInput.call(harness.context, "\x1b[B")).toEqual({ consume: true });
+		expect(harness.context.footerDataProvider.getInteractiveExtensionStatus()).toMatchObject({
+			index: 0,
+			navigating: true,
+		});
+		expect(handleInteractiveStatusInput.call(harness.context, "\x1b[A")).toEqual({ consume: true });
+		expect(harness.context.footerDataProvider.getInteractiveExtensionStatus()?.navigating).toBe(false);
+		expect(handleInteractiveStatusInput.call(harness.context, "\x1b[A")).toBeUndefined();
+	});
+
+	it("stays on the last status item when pressing down at the bottom", () => {
+		const harness = createContext();
+		handleInteractiveStatusInput.call(harness.context, "\x1b[B");
+		handleInteractiveStatusInput.call(harness.context, "\x1b[B");
+		expect(harness.context.footerDataProvider.getInteractiveExtensionStatus()?.index).toBe(1);
+		expect(handleInteractiveStatusInput.call(harness.context, "\x1b[B")).toEqual({ consume: true });
+		expect(harness.context.footerDataProvider.getInteractiveExtensionStatus()).toMatchObject({
+			index: 1,
+			navigating: true,
+		});
+	});
 });

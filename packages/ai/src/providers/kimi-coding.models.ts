@@ -29,7 +29,9 @@ export const KIMI_CODING_MODELS = {
 		provider: "kimi-coding",
 		baseUrl: "https://api.kimi.com/coding",
 		headers: {"User-Agent":"KimiCLI/1.5"},
+		compat: {"forceAdaptiveThinking":true},
 		reasoning: true,
+		thinkingLevelMap: {"max":"max"},
 		input: ["text", "image"],
 		cost: {
 			input: 0,

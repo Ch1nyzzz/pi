@@ -160,7 +160,11 @@ export class FooterDataProvider {
 			(entry) => entry.key === this.interactiveSelection?.key && entry.item.id === this.interactiveSelection.itemId,
 		);
 		if (!this.interactiveNavigationActive || index < 0) index = delta === 1 ? 0 : items.length - 1;
-		else index = (index + delta + items.length) % items.length;
+		else {
+			const next = index + delta;
+			if (next < 0 || next >= items.length) return false;
+			index = next;
+		}
 		const selected = items[index]!;
 		this.interactiveSelection = { key: selected.key, itemId: selected.item.id };
 		this.interactiveNavigationActive = true;
