@@ -377,7 +377,7 @@ lines.on("line", line => {
 		});
 		expect(result.proposals[0].artifacts.replay).toBeUndefined();
 		const activity = await listEvoActivityItems({ paths: f.paths, service: f.service });
-		expect(activity[0]?.text).toBe("Evo: compaction/test · 等待发布确认 · [↓+Enter 处理]");
+		expect(activity[0]?.text).toBe("Evo: 等待发布确认 · compaction/test");
 		expect(activity[0]?.text).not.toContain(result.run.id);
 		expect(activity[0]?.text).not.toContain(result.proposals[0].id);
 		expect(runner.requests).toHaveLength(4);

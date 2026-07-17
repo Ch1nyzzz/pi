@@ -27,7 +27,7 @@ import {
 	EvoPackRegistryService,
 } from "./discovery/service.ts";
 import { type EvoDiscoveryFetch, EvoPackDiscoveryTransport } from "./discovery/transport.ts";
-import { listEvoActivityItems } from "./evolve/activity.ts";
+import { type EvoActivityItem, listEvoActivityItems } from "./evolve/activity.ts";
 import { formatEvolutionRuns, inspectBackgroundEvolutions } from "./evolve/background.ts";
 import { readEvoControlConfig } from "./evolve/config.ts";
 import { runUnknownAbiBuilderCycle, type UnknownAbiBuilderCycleResult } from "./evolve/cycle.ts";
@@ -607,6 +607,27 @@ function createDependencies(options: EvoCommandExtensionOptions): EvoCommandDepe
 	};
 }
 
+/**
+ * Footer status-line glyph per activity urgency. The footer appends its own
+ * navigation hint, so the item text itself carries no embedded key hints.
+ */
+function statusGlyph(item: EvoActivityItem): { icon: string; color: "warning" | "accent" | "error" | "muted" } {
+	const status = item.kind === "run" ? item.run.status : item.proposal.status;
+	if (status === "failed" || status === "cancelled") return { icon: "✗", color: "error" };
+	if (status === "trialing") {
+		const comparisonReady =
+			item.kind === "run" ? item.proposal?.artifacts.retrospective : item.proposal.artifacts.retrospective;
+		return comparisonReady ? { icon: "●", color: "warning" } : { icon: "◆", color: "accent" };
+	}
+	if (
+		item.kind === "proposal"
+			? status === "pending"
+			: status === "awaiting-canary-approval" || status === "awaiting-decision"
+	)
+		return { icon: "●", color: "warning" };
+	return { icon: status === "paused" || status === "deferred" ? "○" : "▶", color: "muted" };
+}
+
 export async function refreshEvoStatusIndicator(
 	dependencies: { service: EvoService; paths: EvoPaths },
 	ctx: ExtensionContext,
@@ -622,22 +643,18 @@ export async function refreshEvoStatusIndicator(
 		"evo",
 		items.length > 0
 			? items.map((item) => {
-					const status = item.kind === "run" ? item.run.status : item.proposal.status;
-					const needsDecision =
-						item.kind === "proposal"
-							? item.proposal.status === "pending"
-							: status === "awaiting-canary-approval" || status === "awaiting-decision";
-					const text =
-						status === "failed" || status === "cancelled"
-							? ctx.ui.theme.fg("error", item.text)
-							: needsDecision
-								? ctx.ui.theme.fg("warning", item.text)
-								: status === "trialing"
-									? ctx.ui.theme.fg("accent", item.text)
-									: item.text;
+					const glyph = statusGlyph(item);
+					// item.text is "Evo: {headline} · {detail}": recolor each segment
+					// so the state pops and the subject stays quiet.
+					const splitAt = item.text.indexOf(" · ");
+					const headline = splitAt === -1 ? item.text.slice(5) : item.text.slice(5, splitAt);
+					const detail = splitAt === -1 ? "" : item.text.slice(splitAt);
 					return {
 						id: item.key,
-						text,
+						text:
+							ctx.ui.theme.fg("dim", "Evo: ") +
+							ctx.ui.theme.fg(glyph.color, `${glyph.icon} ${headline}`) +
+							ctx.ui.theme.fg("dim", detail),
 						onSelect: () => openEvolutionInspector(dependencies, ctx, item.key),
 					};
 				})

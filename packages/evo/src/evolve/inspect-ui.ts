@@ -418,7 +418,7 @@ export class EvolutionProcessInspector implements Component {
 			if (selected) this.selectedTaskLine = lines.length;
 			const marker = selected ? this.theme.fg("accent", "›") : " ";
 			const glyph = this.itemGlyph(item);
-			const text = item.text.replace(/^Evo: /, "").replace(/ · \[.*\]$/, "");
+			const text = item.text.replace(/^Evo: /, "");
 			const textColor = group === "history" ? "muted" : "text";
 			const suffix = item.kind === "run" ? this.theme.fg("dim", `  ${elapsed(item.run.startedAt)}`) : "";
 			lines.push(`${marker} ${this.theme.fg(glyph.color, glyph.icon)} ${this.theme.fg(textColor, text)}${suffix}`);

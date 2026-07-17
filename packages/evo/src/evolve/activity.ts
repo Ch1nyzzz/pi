@@ -93,6 +93,12 @@ function componentLabel(proposal: Proposal | undefined, component: string): stri
 	return `${surface}/${short}`;
 }
 
+function canaryStateText(proposal: Proposal | undefined, trial: TrialDisplay | undefined, noun: string): string {
+	if (proposal?.artifacts.retrospective) return "comparison ready";
+	if (trial?.due) return "comparison pending";
+	return trial ? `${noun} ${trial.currentSessions}/${trial.minimumSessions}` : `${noun} 运行中`;
+}
+
 function runText(
 	run: EvolutionRun,
 	component: string | undefined,
@@ -100,40 +106,25 @@ function runText(
 	trial: TrialDisplay | undefined,
 ): string {
 	if (component && run.status === "trialing") {
-		const state = proposal?.artifacts.retrospective
-			? "comparison ready"
-			: trial?.due
-				? "comparison pending"
-				: `Canary ${trial ? `${trial.currentSessions}/${trial.minimumSessions}` : "运行中"}`;
 		const bound = trial ? ` · ≤${trial.maximumDurationDays}d` : "";
-		return `Evo: ${componentLabel(proposal, component)} · ${state}${bound} · [↓+Enter 查看]`;
+		return `Evo: ${canaryStateText(proposal, trial, "Canary")} · ${componentLabel(proposal, component)}${bound}`;
 	}
 	if (component && run.status === "awaiting-canary-approval") {
-		return `Evo: ${componentLabel(proposal, component)} · 等待发布确认 · [↓+Enter 处理]`;
+		return `Evo: 等待发布确认 · ${componentLabel(proposal, component)}`;
 	}
-	return `Evo: ${runStatusLabel(run)} · ${compact(run.request ?? "定时演化")}`;
+	return `Evo: ${runStatusLabel(run)} · ${compact(run.request ?? "定时演化", 48)}`;
 }
 
 function proposalText(proposal: Proposal, component: string | undefined, trial: TrialDisplay | undefined): string {
 	if (component && proposal.status === "trialing") {
-		const status = proposal.artifacts.retrospective
-			? "comparison ready"
-			: trial?.due
-				? "comparison pending"
-				: `Canary ${trial ? `${trial.currentSessions}/${trial.minimumSessions}` : "运行中"}`;
 		const bound = trial ? ` · ≤${trial.maximumDurationDays}d` : "";
-		return `Evo: ${componentLabel(proposal, component)} · ${status}${bound} · [↓+Enter 查看]`;
+		return `Evo: ${canaryStateText(proposal, trial, "Canary")} · ${componentLabel(proposal, component)}${bound}`;
 	}
 	if (proposal.status === "trialing") {
-		const status = proposal.artifacts.retrospective
-			? "Trial comparison ready"
-			: trial?.due
-				? "Trial comparison pending"
-				: "Trial 运行中";
-		return `Evo: ${status} · ${compact(proposal.motivation)}`;
+		return `Evo: ${canaryStateText(proposal, trial, "Trial")} · ${compact(proposal.motivation, 48)}`;
 	}
 	const status = proposal.status === "deferred" ? "已推迟" : "等待处理";
-	return `Evo: ${status} · ${compact(proposal.motivation)}`;
+	return `Evo: ${status} · ${compact(proposal.motivation, 48)}`;
 }
 
 export async function listEvoActivityItems(

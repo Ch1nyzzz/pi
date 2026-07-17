@@ -785,14 +785,14 @@ describe("Evo CLI extension", () => {
 
 		await refreshEvoStatusIndicator(dependencies, harness.context);
 		let item = harness.statusItems.at(-1)?.items?.[0];
-		expect(item?.text).toContain("Trial 运行中");
+		expect(item?.text).toContain("Trial 0/10");
 		expect(item?.text).toContain("Exercise the due-trial status");
 		expect(item?.text).not.toContain(proposal.id);
 
 		const eightDaysLater = () => new Date(Date.now() + 8 * 24 * 60 * 60 * 1000);
 		await refreshEvoStatusIndicator(dependencies, harness.context, eightDaysLater);
 		item = harness.statusItems.at(-1)?.items?.[0];
-		expect(item?.text).toContain("Trial comparison pending");
+		expect(item?.text).toContain("comparison pending");
 		expect(item?.text).not.toContain(proposal.id);
 	});
 });
