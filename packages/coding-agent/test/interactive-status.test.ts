@@ -87,8 +87,17 @@ describe("interactive footer statuses", () => {
 		expect(harness.selected).toEqual(["canary"]);
 	});
 
-	it("preserves editor and autocomplete down-key handling before the draft end", () => {
-		const editing = createContext({ text: "draft", cursor: { line: 0, col: 2 } });
+	it("enters status navigation from anywhere on the last draft line", () => {
+		const midLine = createContext({ text: "draft", cursor: { line: 0, col: 2 } });
+		expect(handleInteractiveStatusInput.call(midLine.context, "\x1b[B")).toEqual({ consume: true });
+		expect(midLine.context.footerDataProvider.getInteractiveExtensionStatus()?.navigating).toBe(true);
+
+		const multiLine = createContext({ text: "first\nsecond", cursor: { line: 1, col: 0 } });
+		expect(handleInteractiveStatusInput.call(multiLine.context, "\x1b[B")).toEqual({ consume: true });
+	});
+
+	it("preserves editor and autocomplete down-key handling above the last line", () => {
+		const editing = createContext({ text: "first\nsecond", cursor: { line: 0, col: 2 } });
 		expect(handleInteractiveStatusInput.call(editing.context, "\x1b[B")).toBeUndefined();
 
 		const completing = createContext({ text: "draft", autocomplete: true });
@@ -127,5 +136,81 @@ describe("interactive footer statuses", () => {
 			index: 1,
 			navigating: true,
 		});
+	});
+});
+
+interface RestoreContext {
+	activePromptText?: string;
+	editor: { getText(): string; setText(text: string): void };
+	clearAllQueues(): { steering: string[]; followUp: string[] };
+	updatePendingMessagesDisplay(): void;
+	agent: { abort(): void };
+}
+
+const restoreQueuedMessagesToEditor = (
+	InteractiveMode.prototype as unknown as {
+		restoreQueuedMessagesToEditor(this: RestoreContext, options?: { abort?: boolean; currentText?: string }): number;
+	}
+).restoreQueuedMessagesToEditor;
+
+function createRestoreContext(options: {
+	activePrompt?: string;
+	draft?: string;
+	steering?: string[];
+	followUp?: string[];
+}) {
+	let text = options.draft ?? "";
+	let aborted = false;
+	const context: RestoreContext = {
+		activePromptText: options.activePrompt,
+		editor: {
+			getText: () => text,
+			setText: (value: string) => {
+				text = value;
+			},
+		},
+		clearAllQueues: () => ({ steering: options.steering ?? [], followUp: options.followUp ?? [] }),
+		updatePendingMessagesDisplay: () => {},
+		agent: {
+			abort: () => {
+				aborted = true;
+			},
+		},
+	};
+	return { context, getText: () => text, wasAborted: () => aborted };
+}
+
+describe("abort prompt restore", () => {
+	it("restores the in-flight prompt into an empty editor on abort", () => {
+		const harness = createRestoreContext({ activePrompt: "fix the flaky test" });
+		restoreQueuedMessagesToEditor.call(harness.context, { abort: true });
+		expect(harness.getText()).toBe("fix the flaky test");
+		expect(harness.context.activePromptText).toBeUndefined();
+		expect(harness.wasAborted()).toBe(true);
+	});
+
+	it("prepends the aborted prompt to queued messages and the current draft", () => {
+		const harness = createRestoreContext({
+			activePrompt: "original prompt",
+			draft: "current draft",
+			followUp: ["queued note"],
+		});
+		restoreQueuedMessagesToEditor.call(harness.context, { abort: true });
+		expect(harness.getText()).toBe("original prompt\n\nqueued note\n\ncurrent draft");
+	});
+
+	it("keeps the in-flight prompt when dequeuing without abort", () => {
+		const harness = createRestoreContext({ activePrompt: "still running", followUp: ["queued note"] });
+		restoreQueuedMessagesToEditor.call(harness.context, {});
+		expect(harness.getText()).toBe("queued note");
+		expect(harness.context.activePromptText).toBe("still running");
+		expect(harness.wasAborted()).toBe(false);
+	});
+
+	it("leaves the editor untouched on abort when nothing is in flight", () => {
+		const harness = createRestoreContext({ draft: "keep me" });
+		restoreQueuedMessagesToEditor.call(harness.context, { abort: true });
+		expect(harness.getText()).toBe("keep me");
+		expect(harness.wasAborted()).toBe(true);
 	});
 });

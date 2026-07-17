@@ -2459,7 +2459,7 @@ ctx.ui.setStatus("my-ext", "Processing...");
 ctx.ui.setStatus("my-ext", undefined);  // Clear
 
 // Interactive footer items use a dedicated final line. Down enters it from
-// the end of a draft; selection keys browse and the confirm key opens an item.
+// anywhere on the last draft line; selection keys browse and the confirm key opens an item.
 ctx.ui.setStatusItems("my-ext", [
   { id: "build", text: "Build running", onSelect: () => openBuildDetails() },
   { id: "review", text: "Review pending", onSelect: () => openReview() },

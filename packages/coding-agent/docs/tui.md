@@ -741,7 +741,7 @@ ctx.ui.setStatus("my-ext", ctx.ui.theme.fg("accent", "● active"));
 // Clear status
 ctx.ui.setStatus("my-ext", undefined);
 
-// Publish a dedicated final status line. Down enters it from the end of a draft.
+// Publish a dedicated final status line. Down enters it from the last draft line.
 ctx.ui.setStatusItems("my-ext", [
   { id: "task-1", text: "Task 1 running", onSelect: () => openTask("task-1") },
   { id: "task-2", text: "Task 2 waiting", onSelect: () => openTask("task-2") },

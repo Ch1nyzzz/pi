@@ -32,7 +32,7 @@ Then use Pi normally. The Recorder writes session evidence without making live o
 /evo permit <proposal-id>
 ```
 
-Pending proposals and background work appear on a dedicated final Pi status line; startup never opens an approval dialog. Press Down at the end of a draft to enter those status items, then use the configured selection keys and Enter to open the selected run, proposal, or Canary directly. Canary entries show the selected component name rather than internal run, proposal, or bundle IDs. `/evo inspect` opens the same unified activity list. In an idle interactive TUI, `Ctrl+Alt+E` applies the exact first pending T0 proposal without entering `/evo permit`. The same deterministic eligibility, revision, and artifact checks still run; non-T0 proposals require the normal review flow.
+Pending proposals and background work appear on a dedicated final Pi status line; startup never opens an approval dialog. Press Down on the last draft line to enter those status items, then use the configured selection keys and Enter to open the selected run, proposal, or Canary directly. Canary entries show the selected component name rather than internal run, proposal, or bundle IDs. `/evo inspect` opens the same unified activity list. In an idle interactive TUI, `Ctrl+Alt+E` applies the exact first pending T0 proposal without entering `/evo permit`. The same deterministic eligibility, revision, and artifact checks still run; non-T0 proposals require the normal review flow.
 
 ## Commands
 

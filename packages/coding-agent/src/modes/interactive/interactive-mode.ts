@@ -365,6 +365,8 @@ export class InteractiveMode {
 	private isInitialized = false;
 	private onInputCallback?: (text: string) => void;
 	private pendingUserInputs: string[] = [];
+	/** The prompt currently being processed; restored into the editor on abort. */
+	private activePromptText: string | undefined;
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
 	private readonly idleStatus = new IdleStatus();
 	private workingMessage: string | undefined = undefined;
@@ -922,10 +924,15 @@ export class InteractiveMode {
 		while (true) {
 			const userInput = await this.getUserInput();
 			try {
+				// Remember the in-flight prompt so Esc (abort) can restore it into
+				// the editor for immediate editing instead of a blank input.
+				this.activePromptText = userInput;
 				await this.session.prompt(userInput);
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
+			} finally {
+				this.activePromptText = undefined;
 			}
 		}
 	}
@@ -1894,11 +1901,12 @@ export class InteractiveMode {
 		const text = this.editor.getText();
 		const lines = this.editor.getLines?.();
 		const cursor = this.editor.getCursor?.();
+		// Down enters the status bar from anywhere on the last draft line —
+		// there is no line below to move to, so the key is free regardless of
+		// the cursor column (Claude Code style). Lines above keep native moves.
 		const canEnterFromEditor =
 			!this.editor.isShowingAutocomplete?.() &&
-			(lines && cursor
-				? cursor.line === lines.length - 1 && cursor.col === (lines[cursor.line]?.length ?? 0)
-				: !text.includes("\n"));
+			(lines && cursor ? cursor.line === lines.length - 1 : !text.includes("\n"));
 
 		// ↑/↓ move freely between the editor and the status bar below it. The bar
 		// never traps the keys: ↑ past its first item returns to the editor, and ↑
@@ -4061,7 +4069,11 @@ export class InteractiveMode {
 	private restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
 		const { steering, followUp } = this.clearAllQueues();
 		const allQueued = [...steering, ...followUp];
-		if (allQueued.length === 0) {
+		// On abort, also bring the in-flight prompt back into the editor so the
+		// user can edit and resend it instead of retyping it from history.
+		const abortedPrompt = options?.abort ? this.activePromptText : undefined;
+		if (options?.abort) this.activePromptText = undefined;
+		if (allQueued.length === 0 && !abortedPrompt) {
 			this.updatePendingMessagesDisplay();
 			if (options?.abort) {
 				this.agent.abort();
@@ -4070,7 +4082,7 @@ export class InteractiveMode {
 		}
 		const queuedText = allQueued.join("\n\n");
 		const currentText = options?.currentText ?? this.editor.getText();
-		const combinedText = [queuedText, currentText].filter((t) => t.trim()).join("\n\n");
+		const combinedText = [abortedPrompt, queuedText, currentText].filter((t) => t?.trim()).join("\n\n");
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
 		if (options?.abort) {
