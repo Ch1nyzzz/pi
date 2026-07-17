@@ -163,6 +163,8 @@ interface EvoCommandDependencies {
 	agentDir?: string;
 	model?: string;
 	spawnAgentToolNames?: readonly string[];
+	/** Sandbox override for imported-pack executable validation (tests/automation). */
+	sandbox?: boolean;
 	getDiscoveryService(): Promise<EvoCommandDiscoveryService>;
 }
 
@@ -184,6 +186,8 @@ export interface EvoCommandExtensionOptions {
 	model?: string;
 	/** Exact trusted tool names available through the runtime spawn-agent host. */
 	spawnAgentToolNames?: readonly string[];
+	/** Sandbox override for imported-pack executable validation (tests/automation). */
+	sandbox?: boolean;
 	/** Local registry/trust config and injectable discovery dependencies. */
 	discovery?: EvoCommandDiscoveryOptions;
 }
@@ -445,15 +449,37 @@ async function stagePackImport(
 	grantsByComponent?: Readonly<Record<string, readonly EvoCapabilityGrant[]>>,
 	parentDigest?: string,
 	beforeStage?: (preflight: EvoPackImportPreflight) => Promise<void>,
+	sandbox?: boolean,
 ): Promise<EvoPackImportResult> {
 	return importEvoPack({
 		paths: dependencies.paths,
 		parentDigest: parentDigest ?? (await requireActiveBundleDigest(dependencies)),
 		packDir: packDirectory,
 		expectedIntegrity,
+		...(sandbox === undefined ? {} : { sandbox }),
 		...(grantsByComponent ? { grantsByComponent } : {}),
 		...(beforeStage ? { beforeStage } : {}),
 	});
+}
+
+const PACK_DIRECT_VALIDATION_PROMPT =
+	"The OS sandbox is unavailable. Allow the imported pack components to run directly once for executable validation with your user permissions? This grant is not saved and does not activate anything.";
+
+/**
+ * Decide the sandbox mode for a pack's post-stage executable validation.
+ * Returns "cancelled" when the sandbox is unavailable and the user declines
+ * the one-time direct-execution permission.
+ */
+async function resolvePackValidationSandbox(
+	dependencies: EvoCommandDependencies,
+	manifest: EvoPackManifest,
+	confirmDirect: () => Promise<boolean>,
+): Promise<{ sandbox?: boolean } | "cancelled"> {
+	if (dependencies.sandbox !== undefined) return { sandbox: dependencies.sandbox };
+	const executableParts = manifest.contents.components.length + manifest.contents.workflows.length;
+	if (executableParts === 0 || (await canUseEvoComponentSandbox())) return {};
+	if (!(await confirmDirect())) return "cancelled";
+	return { sandbox: false };
 }
 
 async function stageUnknownPackAbis(
@@ -547,6 +573,7 @@ function createDependencies(options: EvoCommandExtensionOptions): EvoCommandDepe
 		agentDir: options.agentDir,
 		model: options.model,
 		spawnAgentToolNames: options.spawnAgentToolNames,
+		sandbox: options.sandbox,
 		getDiscoveryService: async () => {
 			if (discoveryService) return discoveryService;
 			const config = await readEvoPackDiscoveryConfig(
@@ -1026,6 +1053,18 @@ async function dispatchExtensionCommand(
 					});
 				}
 			}
+			const sandboxDecision = await resolvePackValidationSandbox(dependencies, inspection.manifest, () => {
+				if (!ctx.hasUI) {
+					throw new Error(
+						"Component sandbox is unavailable and one-time direct execution requires an interactive UI",
+					);
+				}
+				return ctx.ui.confirm("One-time component permission", PACK_DIRECT_VALIDATION_PROMPT);
+			});
+			if (sandboxDecision === "cancelled") {
+				ctx.ui.notify("Pack install cancelled; no component permission was granted", "info");
+				return;
+			}
 			let unknownAbiResults: UnknownAbiBuilderCycleResult[] = [];
 			const result = await discovery.install({
 				name: inspection.entry.name,
@@ -1034,6 +1073,7 @@ async function dispatchExtensionCommand(
 				paths: dependencies.paths,
 				parentDigest,
 				grantsByComponent: preview.grantsByComponent,
+				...(sandboxDecision.sandbox === undefined ? {} : { sandbox: sandboxDecision.sandbox }),
 				beforeStage: async ({ preflight }) => {
 					unknownAbiResults = await stageUnknownPackAbis(dependencies, parentDigest, preflight.unknownAbiRequests);
 				},
@@ -1072,6 +1112,18 @@ async function dispatchExtensionCommand(
 					});
 				}
 			}
+			const sandboxDecision = await resolvePackValidationSandbox(dependencies, preview.manifest, () => {
+				if (!ctx.hasUI) {
+					throw new Error(
+						"Component sandbox is unavailable and one-time direct execution requires an interactive UI",
+					);
+				}
+				return ctx.ui.confirm("One-time component permission", PACK_DIRECT_VALIDATION_PROMPT);
+			});
+			if (sandboxDecision === "cancelled") {
+				ctx.ui.notify("Pack import cancelled; no component permission was granted", "info");
+				return;
+			}
 			let unknownAbiResults: UnknownAbiBuilderCycleResult[] = [];
 			const result = await stagePackImport(
 				dependencies,
@@ -1082,6 +1134,7 @@ async function dispatchExtensionCommand(
 				async (preflight) => {
 					unknownAbiResults = await stageUnknownPackAbis(dependencies, parentDigest, preflight.unknownAbiRequests);
 				},
+				sandboxDecision.sandbox,
 			);
 			sendCustomCard(pi, "evo.pack-import", formatPackImportResult(result, unknownAbiResults), {
 				pack: result.manifest.name,
@@ -1548,6 +1601,13 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 					io.write("Capability grants auto-approved (grants.approval is 'auto')");
 				}
 			}
+			const sandboxDecision = await resolvePackValidationSandbox(dependencies, inspection.manifest, () =>
+				confirmLocalMutation(io, PACK_DIRECT_VALIDATION_PROMPT),
+			);
+			if (sandboxDecision === "cancelled") {
+				io.write("Pack install cancelled; no component permission was granted");
+				return;
+			}
 			let unknownAbiResults: UnknownAbiBuilderCycleResult[] = [];
 			const result = await discovery.install({
 				name: inspection.entry.name,
@@ -1556,6 +1616,7 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 				paths: dependencies.paths,
 				parentDigest,
 				grantsByComponent: preview.grantsByComponent,
+				...(sandboxDecision.sandbox === undefined ? {} : { sandbox: sandboxDecision.sandbox }),
 				beforeStage: async ({ preflight }) => {
 					unknownAbiResults = await stageUnknownPackAbis(dependencies, parentDigest, preflight.unknownAbiRequests);
 				},
@@ -1583,6 +1644,13 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 					io.write("Capability grants auto-approved (grants.approval is 'auto')");
 				}
 			}
+			const sandboxDecision = await resolvePackValidationSandbox(dependencies, preview.manifest, () =>
+				confirmLocalMutation(io, PACK_DIRECT_VALIDATION_PROMPT),
+			);
+			if (sandboxDecision === "cancelled") {
+				io.write("Pack import cancelled; no component permission was granted");
+				return;
+			}
 			let unknownAbiResults: UnknownAbiBuilderCycleResult[] = [];
 			const result = await stagePackImport(
 				dependencies,
@@ -1593,6 +1661,7 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 				async (preflight) => {
 					unknownAbiResults = await stageUnknownPackAbis(dependencies, parentDigest, preflight.unknownAbiRequests);
 				},
+				sandboxDecision.sandbox,
 			);
 			io.write(formatPackImportResult(result, unknownAbiResults));
 			return;

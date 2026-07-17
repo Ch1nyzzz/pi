@@ -76,6 +76,35 @@ async function writePluralCodePack(
 			directory: "workflows/release-check",
 		},
 	];
+	// A minimal protocol-speaking component: import-time executable validation
+	// health-probes tools and dry-runs workflows, so a mute entrypoint would
+	// (correctly) be rejected. Invoke answers with a clean structured error,
+	// which the workflow dry run accepts as a passing protocol exchange.
+	const entrypointContent = [
+		'let buffer = "";',
+		'process.stdin.setEncoding("utf8");',
+		'process.stdin.on("data", (chunk) => {',
+		"	buffer += chunk;",
+		'	let index = buffer.indexOf("\\n");',
+		"	while (index >= 0) {",
+		"		const line = buffer.slice(0, index);",
+		"		buffer = buffer.slice(index + 1);",
+		"		if (line.trim()) {",
+		"			const message = JSON.parse(line);",
+		'			if (message.method === "invoke") {',
+		"				process.stdout.write(",
+		'					JSON.stringify({ id: message.id, ok: false, error: "unavailable: fixture component" }) + "\\n",',
+		"				);",
+		"			} else {",
+		'				process.stdout.write(JSON.stringify({ id: message.id, ok: true, result: {} }) + "\\n");',
+		'				if (message.method === "shutdown") process.exit(0);',
+		"			}",
+		"		}",
+		'		index = buffer.indexOf("\\n");',
+		"	}",
+		"});",
+		"",
+	].join("\n");
 	for (const definition of definitions) {
 		const artifact = await publishEvoComponentArtifact(sourcePaths, {
 			id: definition.id,
@@ -83,7 +112,7 @@ async function writePluralCodePack(
 			abi: definition.abi,
 			activationBoundary: definition.activationBoundary,
 			capabilities: [],
-			entrypointContent: "process.stdin.resume();\n",
+			entrypointContent,
 		});
 		await copyArtifact(packDirectory, definition.directory, artifact);
 	}

@@ -8,6 +8,7 @@ import { EvoCapabilityBroker } from "../src/components/capabilities/broker.ts";
 import { readEvoControlConfig } from "../src/evolve/config.ts";
 import { loadEvoPack } from "../src/pack/pack.ts";
 import { getEvoPaths } from "../src/paths.ts";
+import { proposalApproval } from "../src/proposal.ts";
 import { createRecorderStore } from "../src/recorder/store.ts";
 import { BundleRegistry } from "../src/registry/registry.ts";
 import { writeScheduleConfig } from "../src/scheduler.ts";
@@ -71,6 +72,22 @@ describe("evo command surface", () => {
 		await expect(runEvoCli(["packs", "init", "nope"], { paths, service, io: init.io })).rejects.toThrow(
 			"Unknown pack template",
 		);
+	});
+
+	it("imports a workflow pack whose proposal is immediately approvable", async () => {
+		const root = await temporary("evo-cmd-import-approve-");
+		const { paths, service } = await seedActiveBundle(root);
+		const target = join(root, "deepcode-pack");
+		const { io } = captureCliOutput();
+		await runEvoCli(["packs", "init", "deepcode", target], { paths, service, io });
+		await runEvoCli(["import", target], { paths, service, io, model: "test/model", sandbox: false });
+		const proposal = (await service.listProposals()).find((entry) => entry.motivation.includes("deepcode"));
+		if (!proposal) throw new Error("Imported pack proposal is missing");
+		// Import attaches the executable-validation, replay, and review artifacts
+		// so the tiered approval checks can actually pass without an evolution run.
+		expect(Object.keys(proposal.artifacts)).toEqual(expect.arrayContaining(["validation", "replay", "review"]));
+		const approved = await service.approve(proposal.id, proposalApproval(proposal));
+		expect(approved.status).toBe("trialing");
 	});
 
 	it("reports no active workflows on a fresh bundle", async () => {

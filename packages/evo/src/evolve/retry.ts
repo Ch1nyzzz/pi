@@ -64,7 +64,7 @@ async function readBoundArtifact(paths: EvoPaths, proposal: Proposal, kind: "rev
 export async function validateComponentCandidate(
 	paths: EvoPaths,
 	proposal: Proposal,
-	options: { sandbox?: boolean } = {},
+	options: { sandbox?: boolean; requestTimeoutMs?: number } = {},
 ): Promise<string> {
 	if (!proposal.candidateDigest || !proposal.targetAbi)
 		throw new Error("Retry candidate is not a component selection");
@@ -91,7 +91,10 @@ export async function validateComponentCandidate(
 	if (!selection) throw new Error(`Candidate bundle does not select ${abi.surface}`);
 	const config = registry.validateSelection(abi.surface, selection);
 	const artifact = await validateEvoComponentSelection(paths, abi.surface, selection, registry);
-	const process = new EvoComponentProcess(artifact, abi, config, { sandbox: options.sandbox });
+	const process = new EvoComponentProcess(artifact, abi, config, {
+		sandbox: options.sandbox,
+		...(options.requestTimeoutMs === undefined ? {} : { requestTimeoutMs: options.requestTimeoutMs }),
+	});
 	try {
 		await process.start();
 		await process.health();

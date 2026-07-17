@@ -38,6 +38,7 @@
 
 ### Fixed
 
+- Fixed imported optimization packs staging proposals that could never be approved ("missing required review artifact"): pack import now runs the real executable validation per component (workflow protocol dry run, compaction fixture, or runtime health probe for fixture-less ABIs, each with a 30s request timeout) and attaches the validation, replay, and review artifacts the tiered approval requires; a component that fails validation is rejected instead of left pending. When the OS sandbox is unavailable, import/install ask for the same one-time direct-execution permission as retry.
 - Fixed the Inspector polling a permanent "正在连接后台任务……" screen when the opened status item no longer exists (for example a proposal processed elsewhere): it now falls back to the live task list with a notice, and load errors are shown instead of swallowed.
 - Fixed the Inspector task list hiding its highest-priority entries (active runs and pending proposals sort first) on small terminals: the list is now top-anchored and scrolls only as far as needed to keep the selection visible.
 - Fixed proposal detail cards opening scrolled to the bottom; they now open at the top while live run views stay bottom-anchored.

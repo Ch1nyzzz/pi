@@ -52,6 +52,8 @@ export interface EvoPackRegistryInstallOptions {
 	signal?: AbortSignal;
 	/** Runs after full pack preflight and before any pack-owned artifact or proposal is persisted. */
 	beforeStage?: (context: EvoPackRegistryBeforeStageContext) => Promise<void>;
+	/** Sandbox mode for the post-stage executable validation of imported components. */
+	sandbox?: boolean;
 }
 
 export interface EvoPackRegistryInspection {
@@ -224,6 +226,7 @@ export class EvoPackRegistryService {
 				parentDigest: options.parentDigest,
 				packDir: materialized.directory,
 				expectedIntegrity: options.expectedIntegrity,
+				...(options.sandbox === undefined ? {} : { sandbox: options.sandbox }),
 				...(options.grantsByComponent === undefined ? {} : { grantsByComponent: options.grantsByComponent }),
 				...(beforeStage === undefined
 					? {}

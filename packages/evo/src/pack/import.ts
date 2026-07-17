@@ -21,9 +21,12 @@ import {
 	type InspectedEvoComponentArtifact,
 	inspectEvoComponentArtifact,
 	publishInspectedEvoComponentArtifact,
+	validateEvoComponentSelection,
 } from "../components/artifact.ts";
 import { type EvoCapabilityGrant, parseEvoCapabilityGrants } from "../components/capabilities/broker.ts";
+import { EvoComponentProcess } from "../components/process-runtime.ts";
 import { createDefaultEvoAbiRegistry } from "../components/registry.ts";
+import { validateComponentCandidate } from "../evolve/retry.ts";
 import { createUnknownAbiBuilderRequestsFromPack, type UnknownAbiBuilderRequest } from "../evolve/unknown-abi.ts";
 import {
 	PREFERENCES_PATH,
@@ -32,7 +35,14 @@ import {
 	readBundlePreferenceMemory,
 } from "../memory/preferences.ts";
 import { type EvoPaths, ensureEvoLayout, getEvoPaths } from "../paths.ts";
-import { type DraftChange, type DraftProposal, stageProposal } from "../proposal.ts";
+import {
+	attachProposalArtifact,
+	type DraftChange,
+	type DraftProposal,
+	proposalApproval,
+	rejectProposal,
+	stageProposal,
+} from "../proposal.ts";
 import { copyRegularFileNoFollow, readRegularDirectoryNoFollow, resolveRegularDirectory } from "../secure-file.ts";
 import type { BundlePolicy, Proposal } from "../types.ts";
 import {
@@ -454,16 +464,134 @@ async function prepareRegisteredCodeParts(options: {
 	return { prepared, unregisteredAbis: [...unregisteredAbis].sort(), pendingWorkflows };
 }
 
+/**
+ * Executable validation for an imported component proposal. Workflows run the
+ * full protocol dry run and compaction components their deterministic fixture;
+ * other host ABIs have no fixture, so they get the generic runtime check: the
+ * exact artifact must start under the component runtime and answer the health
+ * probe. Semantic behavior always remains Canary evidence.
+ */
+const IMPORT_VALIDATION_REQUEST_TIMEOUT_MS = 30_000;
+
+async function validateImportedComponentCandidate(
+	paths: EvoPaths,
+	proposal: Proposal,
+	componentId: string,
+	options: { sandbox?: boolean },
+): Promise<string> {
+	if (!proposal.candidateDigest || !proposal.targetAbi) {
+		throw new Error("Imported component proposal is not a component selection");
+	}
+	const registry = createDefaultEvoAbiRegistry();
+	const abi = registry.require(proposal.targetAbi);
+	if (abi.id === "workflow/v1" || abi.id === "compaction/v1") {
+		return validateComponentCandidate(paths, proposal, {
+			...options,
+			requestTimeoutMs: IMPORT_VALIDATION_REQUEST_TIMEOUT_MS,
+		});
+	}
+	const bundle = await loadCompiledBundle(paths, proposal.candidateDigest);
+	// Plural surfaces (tool/v1) select into an array; singular surfaces into
+	// policy.components keyed by surface name.
+	const selection =
+		abi.id === "tool/v1"
+			? (bundle.policy.tools ?? []).find((entry) => entry.id === componentId)
+			: bundle.policy.components?.[abi.surface];
+	if (!selection) throw new Error(`Candidate bundle does not select ${componentId} on ${abi.surface}`);
+	const config = registry.validateSelection(abi.surface, selection);
+	const artifact = await validateEvoComponentSelection(paths, abi.surface, selection, registry);
+	const process = new EvoComponentProcess(artifact, abi, config, {
+		requestTimeoutMs: IMPORT_VALIDATION_REQUEST_TIMEOUT_MS,
+		...(options.sandbox === undefined ? {} : { sandbox: options.sandbox }),
+	});
+	try {
+		await process.start();
+		await process.health();
+	} finally {
+		await process.shutdown().catch(() => undefined);
+	}
+	return [
+		"# Imported component executable validation",
+		"",
+		`- ABI: ${abi.id}`,
+		`- Artifact: ${selection.artifactDigest}`,
+		"- The exact content-addressed artifact started under the component runtime and answered the health probe.",
+		`- ${abi.id} declares no deterministic fixture; semantic behavior remains Canary evidence.`,
+		"",
+	].join("\n");
+}
+
+/**
+ * Attach the approval-gating artifacts to a freshly staged pack proposal.
+ * Imports never run an evolution cycle, so without these the staged proposal
+ * could never pass the tiered approval checks. The executable validation is
+ * real (workflow dry run, deterministic fixture, or runtime health probe);
+ * the review and replay artifacts document exactly which trust anchors
+ * replace the model critic.
+ */
+async function attachImportApprovalArtifacts(options: {
+	paths: EvoPaths;
+	packName: string;
+	packVersion: string;
+	proposal: Proposal;
+	componentId: string;
+	sandbox?: boolean;
+}): Promise<Proposal> {
+	const validation = await validateImportedComponentCandidate(options.paths, options.proposal, options.componentId, {
+		...(options.sandbox === undefined ? {} : { sandbox: options.sandbox }),
+	});
+	let reviewed = await attachProposalArtifact({
+		paths: options.paths,
+		proposalId: options.proposal.id,
+		expected: proposalApproval(options.proposal),
+		kind: "validation",
+		content: validation,
+		allowedStatuses: ["pending"],
+	});
+	reviewed = await attachProposalArtifact({
+		paths: options.paths,
+		proposalId: reviewed.id,
+		expected: proposalApproval(reviewed),
+		kind: "replay",
+		content: `${validation}\nThis trusted executable component replay replaces the unavailable pre-validation model replay. Provider and live-session effects remain Canary evidence.\n`,
+		allowedStatuses: ["pending"],
+	});
+	return attachProposalArtifact({
+		paths: options.paths,
+		proposalId: reviewed.id,
+		expected: proposalApproval(reviewed),
+		kind: "review",
+		content: [
+			"# Pack import review",
+			"",
+			"## Origin",
+			"",
+			`Imported from optimization pack "${options.packName}@${options.packVersion}". No independent model critic ran; trust derives from the pack integrity digest, the explicitly persisted capability grants, sandboxed execution, and the reversible Canary.`,
+			"",
+			"## Trusted executable-validation addendum",
+			"",
+			"The exact content-addressed artifact passed executable ABI protocol validation (workflow dry run or deterministic fixture). Benefit and semantic quality remain unverified, so activation is limited to the reversible Canary trial.",
+			"",
+			"Recommendation: needs-evidence",
+			"",
+		].join("\n"),
+		allowedStatuses: ["pending"],
+	});
+}
+
 async function stagePreparedCodePart(options: {
 	paths: EvoPaths;
 	parentDigest: string;
 	packName: string;
 	packVersion: string;
 	prepared: PreparedPackCodePart;
+	/** Skipped during the shadow preflight; the real staging pass validates. */
+	validate: boolean;
+	sandbox?: boolean;
 }): Promise<ImportedPackComponent> {
 	const part = options.prepared.codePart.part;
 	const artifact = await publishInspectedEvoComponentArtifact(options.paths, options.prepared.artifact);
-	const proposal = await stageProposal({
+	const staged = await stageProposal({
 		paths: options.paths,
 		parentDigest: options.parentDigest,
 		draft: {
@@ -482,6 +610,26 @@ async function stagePreparedCodePart(options: {
 		},
 		observationsMarkdown: `Imported component from optimization pack ${options.packName}@${options.packVersion}.`,
 	});
+	let proposal = staged;
+	if (options.validate) {
+		try {
+			proposal = await attachImportApprovalArtifacts({
+				paths: options.paths,
+				packName: options.packName,
+				packVersion: options.packVersion,
+				proposal: staged,
+				componentId: part.id,
+				...(options.sandbox === undefined ? {} : { sandbox: options.sandbox }),
+			});
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			// Fail closed without leaving an unapprovable pending proposal behind.
+			await rejectProposal(options.paths, staged.id, `Pack import executable validation failed: ${message}`).catch(
+				() => undefined,
+			);
+			throw new Error(`Imported component ${part.id} failed executable validation: ${message}`);
+		}
+	}
 	return {
 		surface: options.prepared.surface,
 		abi: options.prepared.abi,
@@ -530,6 +678,7 @@ async function preflightPackStages(options: {
 			packName: options.manifest.name,
 			packVersion: options.manifest.version,
 			prepared,
+			validate: false,
 		});
 		if (!imported.proposal.candidateDigest) {
 			throw new Error(`Pack component preflight proposal has no candidate bundle: ${prepared.codePart.part.id}`);
@@ -560,6 +709,12 @@ export async function importEvoPack(options: {
 	 * transaction and are not deleted by this importer.
 	 */
 	beforeStage?: (preflight: EvoPackImportPreflight) => Promise<void>;
+	/**
+	 * Sandbox mode for the post-stage executable validation of imported
+	 * components (workflow dry run / deterministic fixture). Pass false only
+	 * after an explicit one-time direct-execution permission.
+	 */
+	sandbox?: boolean;
 }): Promise<EvoPackImportResult> {
 	const preflight = await loadEvoPack(options.packDir);
 	if (!preflight.integrity.ok) {
@@ -646,6 +801,8 @@ export async function importEvoPack(options: {
 				packName: preflight.manifest.name,
 				packVersion: preflight.manifest.version,
 				prepared,
+				validate: true,
+				...(options.sandbox === undefined ? {} : { sandbox: options.sandbox }),
 			});
 			importedComponents.push(imported);
 			if (!imported.proposal.candidateDigest) {

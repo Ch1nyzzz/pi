@@ -56,7 +56,7 @@ export interface WorkflowDryRunOutcome {
 export async function dryRunWorkflowSelection(
 	paths: EvoPaths,
 	selection: EvoWorkflowSelection,
-	options: { sandbox?: boolean } = {},
+	options: { sandbox?: boolean; requestTimeoutMs?: number } = {},
 ): Promise<WorkflowDryRunOutcome> {
 	const registry = createDefaultEvoAbiRegistry();
 	const artifact = await validateEvoComponentSelection(paths, "workflow", selection, registry);
@@ -66,6 +66,7 @@ export async function dryRunWorkflowSelection(
 		{},
 		{
 			sandbox: options.sandbox,
+			...(options.requestTimeoutMs === undefined ? {} : { requestTimeoutMs: options.requestTimeoutMs }),
 			capabilityBroker: {
 				request: async (_identity, frame) => stubCapabilityResult(frame.capability, frame.payload),
 			},
