@@ -220,6 +220,9 @@ const config: EvoControlConfig = {
 	grants: {
 		approval: "auto",
 	},
+	verification: {
+		approval: "ask",
+	},
 	triage: {
 		everyNSessions: 5,
 	},

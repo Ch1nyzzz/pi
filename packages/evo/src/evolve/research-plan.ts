@@ -145,9 +145,27 @@ function parseEvidenceStrategy(
 						"evidenceStrategy.historicalReplay.minimumSamples",
 					),
 				}
-			: historical.mode === "optional" || historical.mode === "not-applicable"
-				? { mode: historical.mode, reason: string(historical.reason, "evidenceStrategy.historicalReplay.reason") }
-				: undefined;
+			: historical.mode === "recommended"
+				? {
+						mode: "recommended" as const,
+						profiles: profileArray(
+							historical.profiles,
+							"evidenceStrategy.historicalReplay.profiles",
+							declarableProfiles(HISTORICAL_PROFILE_CAPABILITIES, candidateKind),
+						) as Array<Extract<EvoCheckProfile, "paired-replay" | "session-comparison" | "compaction-replay">>,
+						datasets: nonEmptyStringArray(historical.datasets, "evidenceStrategy.historicalReplay.datasets"),
+						minimumSamples: positiveInteger(
+							historical.minimumSamples,
+							"evidenceStrategy.historicalReplay.minimumSamples",
+						),
+						reason: string(historical.reason, "evidenceStrategy.historicalReplay.reason"),
+					}
+				: historical.mode === "optional" || historical.mode === "not-applicable"
+					? {
+							mode: historical.mode,
+							reason: string(historical.reason, "evidenceStrategy.historicalReplay.reason"),
+						}
+					: undefined;
 	if (!parsedHistorical) throw new Error("evidenceStrategy.historicalReplay.mode is invalid");
 	const online = asRecord(root.online, "ResearchPlanner output.experiment.evidenceStrategy.online");
 	const parsedOnline: EvoEvidenceStrategy["online"] | undefined =
@@ -174,7 +192,9 @@ function parseEvidenceStrategy(
 	const selected = new Set(checkProfiles);
 	for (const profile of [
 		...(parsedOffline.mode === "required" ? parsedOffline.profiles : []),
-		...(parsedHistorical.mode === "required" ? parsedHistorical.profiles : []),
+		...(parsedHistorical.mode === "required" || parsedHistorical.mode === "recommended"
+			? parsedHistorical.profiles
+			: []),
 	]) {
 		if (!selected.has(profile)) throw new Error(`Evidence strategy profile ${profile} is missing from checkProfiles`);
 	}
@@ -425,7 +445,8 @@ export async function runEvolutionResearchPlan(
 		"Classify every supplied explicit inbox input in inboxDecisions as preference, request, note, or task-local. A preference instruction must be an exact user-authored substring. Feature requests are requests even when they contain words such as every or always. Do not classify the same file twice.",
 		"Open durable preferences should be prioritized as a narrow data candidate that appends memory/preferences.json; cite the inbox file and exact source event. Requests remain open until a linked candidate is kept.",
 		"A component candidate must target a pre-defined ABI. A missing ABI requires an infrastructure code plan and cannot be activated automatically.",
-		"Allowed checkProfiles: bundle-compile, repo-check, related-tests, paired-replay, session-comparison, compaction-replay. evidenceStrategy must classify patchClass; mark offline and historicalReplay required or explicitly not applicable with a concrete causal reason; choose online none, shadow, or canary with sample bounds; and choose the matching direct, shadow-first, or canary-first rollout. Offline infeasibility never implies direct rollout. Component replacement cannot use direct rollout. Do not emit shell commands.",
+		"Allowed checkProfiles: bundle-compile, repo-check, related-tests, paired-replay, session-comparison, compaction-replay. evidenceStrategy must classify patchClass; mark offline required or explicitly not applicable with a concrete causal reason; mark historicalReplay required, recommended, optional, or not-applicable; choose online none, shadow, or canary with sample bounds; and choose the matching direct, shadow-first, or canary-first rollout. Offline infeasibility never implies direct rollout. Component replacement cannot use direct rollout. Do not emit shell commands.",
+		"Reserve historicalReplay required for evidence without which the candidate must not release; the harness executes it inline and its absence blocks release. Use recommended (with profiles, datasets, minimumSamples, and a reason stating what the replay would add and what it cannot prove) when replay evidence is useful but not release-blocking: scheduled runs execute the recommendation automatically, while request runs pause after evaluation so the user decides execute, skip, or reject. For a reversible T0 data change, prefer recommended or optional over required.",
 		"Use research as a hypothesis source and cite concrete sources in planMarkdown. State when external research is unavailable.",
 		"",
 		...(options.activePreferences

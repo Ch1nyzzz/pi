@@ -17,7 +17,7 @@ import {
 	resolveInboxEntry,
 	settleProposalInbox,
 } from "./inbox.ts";
-import { PREFERENCES_PATH, readBundlePreferenceMemory } from "./memory/preferences.ts";
+import { deterministicPreferenceId, PREFERENCES_PATH, readBundlePreferenceMemory } from "./memory/preferences.ts";
 import {
 	type EvoBundleMigrationOptions,
 	inferAgentDirectoryForEvoRoot,
@@ -215,7 +215,7 @@ export class EvoService {
 			await garbageCollectInbox(this.paths);
 			return undefined;
 		}
-		const id = `pref-${sha256(state.instruction).slice(0, 16)}`;
+		const id = deterministicPreferenceId(state.instruction);
 		if (memory.preferences.some((preference) => preference.id === id)) {
 			throw new Error(`Durable preference id collision: ${id}`);
 		}

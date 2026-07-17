@@ -341,6 +341,18 @@ export interface EvoEvidenceStrategy {
 				datasets: string[];
 				minimumSamples: number;
 		  }
+		| {
+				/**
+				 * The researcher recommends this replay evidence without freezing it as a
+				 * release blocker. Scheduled runs execute it automatically; request runs
+				 * pause after evaluation so the user decides execute, skip, or reject.
+				 */
+				mode: "recommended";
+				profiles: Array<Extract<EvoCheckProfile, "paired-replay" | "session-comparison" | "compaction-replay">>;
+				datasets: string[];
+				minimumSamples: number;
+				reason: string;
+		  }
 		| { mode: "optional" | "not-applicable"; reason: string };
 	online: { mode: "none" } | { mode: "shadow" | "canary"; minimumSamples: number; maximumDuration: string };
 	rollout: "direct" | "shadow-first" | "canary-first";
@@ -438,6 +450,15 @@ export interface EvoControlConfig {
 		 * still shown); "prompt" requires interactive confirmation.
 		 */
 		approval: "auto" | "prompt";
+	};
+	verification: {
+		/**
+		 * How recommended (non-required) replay evidence is handled on
+		 * request-triggered runs. "ask" pauses after evaluation for an explicit
+		 * execute/skip/reject decision; "auto" executes the recommendation
+		 * inline. Scheduled runs always execute recommendations automatically.
+		 */
+		approval: "ask" | "auto";
 	};
 	triage: {
 		/** Run the streaming session triage after this many new complete sessions. */

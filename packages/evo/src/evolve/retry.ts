@@ -28,6 +28,7 @@ import { type EvolutionEvaluationVerdict, runEvolutionEvaluator } from "./evalua
 import { applyEvolutionReleasePolicy, type EvolutionReleaseResult, RELEASE_ACTION_RUN_STATUS } from "./release.ts";
 import { readMaterializedCorpus } from "./research-corpus.ts";
 import { createEvolutionRun, evolutionRunDirectory, readEvolutionRun, updateEvolutionRun } from "./run.ts";
+import { clearPendingVerification } from "./verification-decision.ts";
 import { dryRunWorkflowSelection } from "./workflow-dry-run.ts";
 
 async function candidateChanges(
@@ -344,12 +345,16 @@ export async function resumeEvolutionEvidence(options: {
 	const service = new EvoService(options.paths);
 
 	const strategy = plan.experiment.evidenceStrategy;
-	const required: EvoCheckProfile[] = [
+	// Resumption executes what the frozen plan declared: required profiles plus
+	// recommended ones, which reach this path through an explicit execute decision.
+	const declared: EvoCheckProfile[] = [
 		...(strategy.offline.mode === "required" ? strategy.offline.profiles : []),
-		...(strategy.historicalReplay.mode === "required" ? strategy.historicalReplay.profiles : []),
+		...(strategy.historicalReplay.mode === "required" || strategy.historicalReplay.mode === "recommended"
+			? strategy.historicalReplay.profiles
+			: []),
 	];
 	const receipts = await readProfileReceipts(options.paths, run.id);
-	const missing = required.filter((profile) => receipts.get(profile)?.passed !== true);
+	const missing = declared.filter((profile) => receipts.get(profile)?.passed !== true);
 	const executedProfilesNow: EvoCheckProfile[] = [];
 
 	let replay: CounterfactualReplayResult | undefined;
@@ -417,7 +422,15 @@ export async function resumeEvolutionEvidence(options: {
 	const finalRun = await updateEvolutionRun(options.paths, run.id, {
 		status: RELEASE_ACTION_RUN_STATUS[release.action],
 		proposalId: release.proposal.id,
+		...(release.action === "awaiting-canary-approval"
+			? {
+					canaryCandidateDigest: release.proposal.candidateDigest,
+					canaryParentDigest: release.proposal.parentBundleDigest,
+					canaryTargetAbi: release.proposal.targetAbi,
+				}
+			: {}),
 	});
+	await clearPendingVerification(options.paths, run.id);
 	await rm(join(directory, "release-intent.json"), { force: true });
 	return { run: finalRun, release, verdict: evaluation.verdict, executedProfilesNow };
 }

@@ -17,6 +17,9 @@ import {
 	listEvoActivityItems,
 } from "./activity.ts";
 import { evolutionRunDirectory, readEvolutionRun } from "./run.ts";
+import { type PendingVerification, readPendingVerification } from "./verification-decision.ts";
+
+export type VerificationDecision = "execute" | "skip" | "reject";
 
 interface TranscriptEvent {
 	timestamp: string;
@@ -233,6 +236,11 @@ export class EvolutionProcessInspector implements Component {
 	private readonly close: () => void;
 	private readonly approveCanary: (runId: string, decision: ComponentApprovalDecision) => Promise<void>;
 	private readonly directKeepCanary: (runId: string) => Promise<void>;
+	private readonly decideVerification: (runId: string, decision: VerificationDecision) => Promise<void>;
+	private pendingVerification?: PendingVerification;
+	private verificationChoice = 0;
+	private verificationActing = false;
+	private verificationError?: string;
 	private approving = false;
 	private approvalError?: string;
 	private approvalView: "choice" | "custom" | "direct-confirm" = "choice";
@@ -274,6 +282,9 @@ export class EvolutionProcessInspector implements Component {
 		directKeepCanary: (runId: string) => Promise<void> = async () => {
 			throw new Error("Direct keep is unavailable");
 		},
+		decideVerification: (runId: string, decision: VerificationDecision) => Promise<void> = async () => {
+			throw new Error("Verification decisions are unavailable");
+		},
 	) {
 		this.tui = tui;
 		this.theme = theme;
@@ -283,6 +294,7 @@ export class EvolutionProcessInspector implements Component {
 		this.close = close;
 		this.approveCanary = approveCanary;
 		this.directKeepCanary = directKeepCanary;
+		this.decideVerification = decideVerification;
 		this.mode = itemKey ? "run" : "tasks";
 		this.pendingInitialScroll = Boolean(itemKey);
 		void this.refresh();
@@ -352,6 +364,10 @@ export class EvolutionProcessInspector implements Component {
 							join(this.paths.proposals, this.proposal.id, this.proposal.artifacts.review.file),
 						);
 					}
+					this.pendingVerification =
+						this.run.status === "awaiting-evidence"
+							? await readPendingVerification(this.paths, this.run.id)
+							: undefined;
 					const status = await this.service.status();
 					this.trial = status.trial?.proposalId === this.proposal?.id ? status.trial : undefined;
 					if (this.trial && this.proposal && Date.now() >= this.nextTrialComparisonRefresh) {
@@ -701,6 +717,56 @@ export class EvolutionProcessInspector implements Component {
 		return lines;
 	}
 
+	private verificationDecisionLines(): string[] {
+		const pending = this.pendingVerification;
+		if (!pending) return [];
+		const verdictLabel =
+			pending.verdict === "verified"
+				? "verified"
+				: pending.verdict === "needs-evidence"
+					? "needs-evidence"
+					: pending.verdict;
+		const choices = [
+			{ key: "e", label: "执行验证", note: `补跑 ${pending.profiles.join(", ")} 后重新评估` },
+			{ key: "s", label: "跳过并发布", note: `按当前评估结果（${verdictLabel}）走标准发布策略` },
+			{ key: "r", label: "拒绝候选", note: "不再投入验证，直接拒绝" },
+		];
+		const header = [
+			this.theme.fg("dim", "─".repeat(40)),
+			this.theme.bold("研究者建议执行验证（非发布阻塞）"),
+			`${this.theme.fg("warning", "建议理由")}  ${summarize(pending.reason, 120)}`,
+			this.theme.fg(
+				"dim",
+				`profiles: ${pending.profiles.join(", ")} · datasets: ${pending.datasets.length} 个 · 最少样本 ${pending.minimumSamples} · 当前评估 ${verdictLabel}`,
+			),
+		];
+		if (this.verificationActing) return [...header, this.theme.fg("accent", "正在应用验证决策……")];
+		return [
+			...header,
+			...(this.verificationError ? [this.theme.fg("error", this.verificationError)] : []),
+			...choices.map((choice, index) => {
+				const marker = index === this.verificationChoice ? this.theme.fg("accent", "›") : " ";
+				return `${marker} ${this.theme.fg("accent", `[${choice.key}]`)} ${choice.label}  ${this.theme.fg("muted", choice.note)}`;
+			}),
+			this.theme.fg("dim", "快捷键或 ←→+Enter · Tab 章节 · ↑↓ 滚动 · Esc 返回"),
+		];
+	}
+
+	private startVerificationDecision(decision: VerificationDecision): void {
+		if (!this.run || this.verificationActing) return;
+		this.verificationActing = true;
+		this.verificationError = undefined;
+		void this.decideVerification(this.run.id, decision)
+			.then(() => this.refresh())
+			.catch((error) => {
+				this.verificationError = error instanceof Error ? error.message : String(error);
+			})
+			.finally(() => {
+				this.verificationActing = false;
+				this.tui.requestRender();
+			});
+	}
+
 	private trialingDecisionLines(): string[] {
 		const decision = this.keepConfirming
 			? [
@@ -725,6 +791,7 @@ export class EvolutionProcessInspector implements Component {
 		}
 		if (this.item?.kind === "proposal") return this.proposalActionLines(this.item.proposal);
 		if (this.run?.status === "awaiting-canary-approval") return this.canaryDecisionLines();
+		if (this.run?.status === "awaiting-evidence" && this.pendingVerification) return this.verificationDecisionLines();
 		if (this.run?.status === "trialing" && this.item?.component) return this.trialingDecisionLines();
 		if (this.run) {
 			return [
@@ -1315,6 +1382,26 @@ export class EvolutionProcessInspector implements Component {
 				else if (matchesKey(data, Key.enter) && !this.keeping) {
 					if (this.keepConfirming) this.startDirectKeep();
 					else this.keepConfirming = true;
+				}
+				this.tui.requestRender();
+				return;
+			}
+			if (this.run?.status === "awaiting-evidence" && this.pendingVerification) {
+				if (matchesKey(data, Key.left)) this.verificationChoice = Math.max(0, this.verificationChoice - 1);
+				else if (matchesKey(data, Key.right)) this.verificationChoice = Math.min(2, this.verificationChoice + 1);
+				else if (matchesKey(data, Key.up)) this.scrollFromBottom++;
+				else if (matchesKey(data, Key.down)) this.scrollFromBottom = Math.max(0, this.scrollFromBottom - 1);
+				else if (matchesKey(data, Key.home)) this.scrollFromBottom = Number.MAX_SAFE_INTEGER;
+				else if (matchesKey(data, Key.end)) this.scrollFromBottom = 0;
+				else if (matchesKey(data, Key.tab)) this.focusNextSection();
+				else if (matchesKey(data, Key.space)) this.toggleFocusedSection();
+				else if (matchesKey(data, Key.enter)) {
+					this.startVerificationDecision(
+						this.verificationChoice === 0 ? "execute" : this.verificationChoice === 1 ? "skip" : "reject",
+					);
+				} else if (data === "e" || data === "s" || data === "r") {
+					this.verificationChoice = data === "e" ? 0 : data === "s" ? 1 : 2;
+					this.startVerificationDecision(data === "e" ? "execute" : data === "s" ? "skip" : "reject");
 				}
 				this.tui.requestRender();
 				return;

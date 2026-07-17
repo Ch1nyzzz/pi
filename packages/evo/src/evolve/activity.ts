@@ -5,11 +5,21 @@ import { readScheduleConfig } from "../scheduler.ts";
 import type { EvoService } from "../service.ts";
 import type { EvolutionRun, Proposal } from "../types.ts";
 import { listEvolutionRuns } from "./run.ts";
+import { readPendingVerification } from "./verification-decision.ts";
 
 const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
 export type EvoActivityItem =
-	| { key: string; kind: "run"; text: string; run: EvolutionRun; proposal?: Proposal; component?: string }
+	| {
+			key: string;
+			kind: "run";
+			text: string;
+			run: EvolutionRun;
+			proposal?: Proposal;
+			component?: string;
+			/** The run is parked on a recommended-verification execute/skip/reject decision. */
+			pendingVerification?: boolean;
+	  }
 	| { key: string; kind: "proposal"; text: string; proposal: Proposal; component?: string };
 
 /** What the user should do with an item next: decide, watch, or nothing. */
@@ -22,6 +32,7 @@ export function activityGroup(item: EvoActivityItem): EvoActivityGroup {
 	}
 	const status = item.run.status;
 	if (status === "awaiting-canary-approval" || status === "awaiting-decision") return "action";
+	if (status === "awaiting-evidence" && item.pendingVerification) return "action";
 	return TERMINAL_RUN_STATUSES.has(status) ? "history" : "running";
 }
 
@@ -104,6 +115,7 @@ function runText(
 	component: string | undefined,
 	proposal: Proposal | undefined,
 	trial: TrialDisplay | undefined,
+	pendingVerification = false,
 ): string {
 	if (component && run.status === "trialing") {
 		const bound = trial ? ` · ≤${trial.maximumDurationDays}d` : "";
@@ -111,6 +123,9 @@ function runText(
 	}
 	if (component && run.status === "awaiting-canary-approval") {
 		return `Evo: 等待发布确认 · ${componentLabel(proposal, component)}`;
+	}
+	if (run.status === "awaiting-evidence" && pendingVerification) {
+		return `Evo: 等待验证决策 · ${compact(run.request ?? "定时演化", 48)}`;
 	}
 	return `Evo: ${runStatusLabel(run)} · ${compact(run.request ?? "定时演化", 48)}`;
 }
@@ -174,13 +189,23 @@ export async function listEvoActivityItems(
 		const proposal = run.proposalId ? proposalById.get(run.proposalId) : undefined;
 		if (proposal && !TERMINAL_RUN_STATUSES.has(run.status)) linkedProposalIds.add(proposal.id);
 		const component = await componentName(proposal);
+		const pendingVerification =
+			run.status === "awaiting-evidence" &&
+			(await readPendingVerification(dependencies.paths, run.id)) !== undefined;
 		items.push({
 			key: `run:${run.id}`,
 			kind: "run",
-			text: runText(run, component, proposal, proposal?.id === status.trial?.proposalId ? trialDisplay : undefined),
+			text: runText(
+				run,
+				component,
+				proposal,
+				proposal?.id === status.trial?.proposalId ? trialDisplay : undefined,
+				pendingVerification,
+			),
 			run,
 			...(proposal ? { proposal } : {}),
 			...(component ? { component } : {}),
+			...(pendingVerification ? { pendingVerification: true } : {}),
 		});
 	}
 	for (const proposal of proposals) {
@@ -200,6 +225,7 @@ export async function listEvoActivityItems(
 			const status = item.kind === "run" ? item.run.status : item.proposal.status;
 			if (status === "trialing") return 0;
 			if (status === "awaiting-canary-approval") return 1;
+			if (item.kind === "run" && item.pendingVerification) return 1;
 			if (item.kind === "run" && !TERMINAL_RUN_STATUSES.has(item.run.status)) return 2;
 			if (status === "pending" || status === "deferred") return 3;
 			return 4;

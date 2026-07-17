@@ -28,10 +28,14 @@ import {
 } from "./discovery/service.ts";
 import { type EvoDiscoveryFetch, EvoPackDiscoveryTransport } from "./discovery/transport.ts";
 import { type EvoActivityItem, listEvoActivityItems } from "./evolve/activity.ts";
-import { formatEvolutionRuns, inspectBackgroundEvolutions } from "./evolve/background.ts";
+import {
+	formatEvolutionRuns,
+	inspectBackgroundEvolutions,
+	startBackgroundEvidenceResumption,
+} from "./evolve/background.ts";
 import { readEvoControlConfig } from "./evolve/config.ts";
 import { runUnknownAbiBuilderCycle, type UnknownAbiBuilderCycleResult } from "./evolve/cycle.ts";
-import { EvolutionProcessInspector } from "./evolve/inspect-ui.ts";
+import { EvolutionProcessInspector, type VerificationDecision } from "./evolve/inspect-ui.ts";
 import { changesComponentSelection } from "./evolve/release.ts";
 import { retryEvolutionFromValidation } from "./evolve/retry.ts";
 import {
@@ -41,6 +45,11 @@ import {
 	updateEvolutionRun,
 } from "./evolve/run.ts";
 import type { UnknownAbiBuilderRequest } from "./evolve/unknown-abi.ts";
+import {
+	readPendingVerification,
+	rejectPendingVerification,
+	skipPendingVerification,
+} from "./evolve/verification-decision.ts";
 import { exportEvoPack } from "./pack/export.ts";
 import { type EvoPackImportPreflight, type EvoPackImportResult, importEvoPack } from "./pack/import.ts";
 import { type EvoPackManifest, loadEvoPack } from "./pack/pack.ts";
@@ -150,6 +159,7 @@ const EVO_HELP = `Usage: /evo <command>
   reject <proposal-id> <why>   Reject a pending proposal
   rollback [digest] [why]      Roll back the active trial or stable bundle
   keep [why]                   Run retrospective, then keep the active trial
+  verify [run-id] <execute|skip|reject>  Decide a pending recommended verification
   retrospect                   Run and show the active-trial retrospective`;
 
 const EVO_CLI_HELP = EVO_HELP.replaceAll("/evo", "evo-pi")
@@ -1009,8 +1019,58 @@ export async function directKeepCanaryRun(
 	});
 }
 
+/**
+ * Apply a user's execute/skip/reject decision for a run parked on a
+ * recommended verification. Execute spawns a detached worker (replay plus
+ * re-evaluation take minutes); skip and reject resolve synchronously.
+ */
+export async function decideVerificationRun(
+	dependencies: { service: EvoService; paths: EvoPaths; cwd?: string },
+	runId: string,
+	decision: VerificationDecision,
+): Promise<void> {
+	if (decision === "execute") {
+		await startBackgroundEvidenceResumption({
+			paths: dependencies.paths,
+			cwd: dependencies.cwd ?? process.cwd(),
+			runId,
+		});
+		return;
+	}
+	if (decision === "skip") {
+		const config = await readEvoControlConfig(dependencies.paths);
+		await skipPendingVerification({ paths: dependencies.paths, service: dependencies.service, config, runId });
+		return;
+	}
+	await rejectPendingVerification({ paths: dependencies.paths, service: dependencies.service, runId });
+}
+
+async function soleRunAwaitingVerification(dependencies: { paths: EvoPaths }): Promise<string> {
+	const pending: string[] = [];
+	for (const run of await listEvolutionRuns(dependencies.paths)) {
+		if (run.status !== "awaiting-evidence") continue;
+		if (await readPendingVerification(dependencies.paths, run.id)) pending.push(run.id);
+	}
+	if (pending.length === 1 && pending[0]) return pending[0];
+	if (pending.length === 0) throw new Error("No run is awaiting a verification decision");
+	throw new Error(`Multiple runs await a verification decision; pass one of: ${pending.join(", ")}`);
+}
+
+function parseVerificationDecisionWord(word: string | undefined): VerificationDecision {
+	if (word === "execute" || word === "run") return "execute";
+	if (word === "skip") return "skip";
+	if (word === "reject") return "reject";
+	throw new Error("Usage: verify [run-id] execute|skip|reject");
+}
+
+function describeVerificationDecision(runId: string, decision: VerificationDecision): string {
+	if (decision === "execute") return `已启动后台验证 ${runId}；完成后按发布策略自动处理`;
+	if (decision === "skip") return `已跳过推荐验证，${runId} 按当前评估结果走标准发布策略`;
+	return `已拒绝 ${runId} 的候选`;
+}
+
 async function openEvolutionInspector(
-	dependencies: { service: EvoService; paths: EvoPaths },
+	dependencies: { service: EvoService; paths: EvoPaths; cwd?: string },
 	ctx: ExtensionContext,
 	initialItem?: string,
 ): Promise<void> {
@@ -1026,6 +1086,7 @@ async function openEvolutionInspector(
 				() => done(undefined),
 				(runId, decision) => approveCanaryRun(dependencies, runId, decision),
 				(runId) => directKeepCanaryRun(dependencies, runId),
+				(runId, decision) => decideVerificationRun(dependencies, runId, decision),
 			),
 	);
 }
@@ -1400,6 +1461,15 @@ async function dispatchExtensionCommand(
 			ctx.ui.notify(`Kept ${kept.id}`, "info");
 			return;
 		}
+		case "verify": {
+			const { first, rest: trailing } = splitFirst(rest);
+			const explicitRunId = first.startsWith("r-") ? first : undefined;
+			const decision = parseVerificationDecisionWord((explicitRunId ? trailing : first).trim().toLowerCase());
+			const runId = explicitRunId ?? (await soleRunAwaitingVerification(dependencies));
+			await decideVerificationRun(dependencies, runId, decision);
+			ctx.ui.notify(describeVerificationDecision(runId, decision), "info");
+			return;
+		}
 		default:
 			throw new Error(`Unknown /evo command: ${command}`);
 	}
@@ -1420,9 +1490,19 @@ export function createEvoCommandExtension(options: EvoCommandExtensionOptions = 
 				try {
 					await refreshEvoStatusIndicator(dependencies, ctx, () => new Date(), false);
 					if (canPromptForCanary && ctx.mode === "tui" && !canaryInspectorOpen) {
-						const awaiting = (await listEvolutionRuns(dependencies.paths)).find(
+						const runs = await listEvolutionRuns(dependencies.paths);
+						let awaiting = runs.find(
 							(run) => run.status === "awaiting-canary-approval" && !promptedCanaryRuns.has(run.id),
 						);
+						if (!awaiting) {
+							for (const run of runs) {
+								if (run.status !== "awaiting-evidence" || promptedCanaryRuns.has(run.id)) continue;
+								if (await readPendingVerification(dependencies.paths, run.id)) {
+									awaiting = run;
+									break;
+								}
+							}
+						}
 						if (awaiting) {
 							promptedCanaryRuns.add(awaiting.id);
 							canaryInspectorOpen = true;
@@ -1950,6 +2030,14 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 				return;
 			}
 			io.write(`Kept ${(await dependencies.service.keep(rest || "User kept trial after retrospective")).id}`);
+			return;
+		}
+		case "verify": {
+			const explicitRunId = args[1]?.startsWith("r-") ? args[1] : undefined;
+			const decision = parseVerificationDecisionWord((explicitRunId ? args[2] : args[1])?.trim().toLowerCase());
+			const runId = explicitRunId ?? (await soleRunAwaitingVerification(dependencies));
+			await decideVerificationRun(dependencies, runId, decision);
+			io.write(describeVerificationDecision(runId, decision));
 			return;
 		}
 		default:

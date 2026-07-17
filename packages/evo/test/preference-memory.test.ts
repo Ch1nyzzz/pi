@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { loadCompiledBundle } from "../src/bundle/compile.ts";
 import { renderRuntimeBundle } from "../src/bundle/runtime.ts";
 import { applyInboxDecisions, initializeInboxLifecycle, readInboxLifecycleStates } from "../src/inbox.ts";
+import { deterministicPreferenceId } from "../src/memory/preferences.ts";
 import { getEvoPaths } from "../src/paths.ts";
 import { proposalApproval, stageProposal } from "../src/proposal.ts";
 import { createRecorderStore } from "../src/recorder/store.ts";
@@ -61,7 +62,7 @@ describe("durable preference memory", () => {
 			schemaVersion: 1,
 			preferences: [
 				{
-					id: "design-first",
+					id: deterministicPreferenceId(instruction),
 					instruction,
 					source: { sessionId, sequence: feedback.sequence, quote: userText },
 					addedAt: "2026-07-15T00:00:00.000Z",

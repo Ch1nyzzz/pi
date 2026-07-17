@@ -44,6 +44,7 @@ import {
 	parseUnknownAbiBuilderRequest,
 	type UnknownAbiBuilderRequest,
 } from "./unknown-abi.ts";
+import { writePendingVerification } from "./verification-decision.ts";
 
 export interface RunEvolutionCycleOptions {
 	paths: EvoPaths;
@@ -265,8 +266,19 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 			});
 		}
 		await linkProposalInbox(options.paths, proposal);
+		// Replay execution is contract-driven: the frozen plan requires it, or it
+		// recommends it and this run auto-executes recommendations (scheduled runs
+		// always do; request runs only when configured). A recommendation that is
+		// not auto-executed is deferred to an explicit user decision after
+		// evaluation instead of silently blocking or silently skipping.
+		const historicalReplay = research.plan.experiment.evidenceStrategy.historicalReplay;
+		const autoExecuteRecommended = run.trigger === "scheduled" || config.verification.approval === "auto";
+		const replayDeclared =
+			(historicalReplay.mode === "required" ||
+				(historicalReplay.mode === "recommended" && autoExecuteRecommended)) &&
+			historicalReplay.profiles.includes("paired-replay");
 		let replay: CounterfactualReplayResult | undefined;
-		if (proposal.tier === "T2") {
+		if (proposal.tier === "T2" || (replayDeclared && proposal.replayScenarios.length > 0)) {
 			await updateEvolutionRun(options.paths, run.id, { status: "replaying", proposalId: proposal.id });
 			replay = await runCounterfactualReplay({
 				paths: options.paths,
@@ -290,6 +302,13 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 			await readEvolutionRun(options.paths, run.id),
 			research.plan.experiment,
 		);
+		const deferredProfiles =
+			historicalReplay.mode === "recommended" && !autoExecuteRecommended
+				? await (async () => {
+						const receipts = await readProfileReceipts(options.paths, run.id);
+						return historicalReplay.profiles.filter((profile) => receipts.get(profile)?.passed !== true);
+					})()
+				: [];
 		await updateEvolutionRun(options.paths, run.id, { status: "evaluating", proposalId: proposal.id });
 		const evaluation = await runEvolutionEvaluator({
 			paths: options.paths,
@@ -298,6 +317,7 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 			corpus,
 			materializedCorpus,
 			...(replay ? { replay } : {}),
+			...(deferredProfiles.length > 0 ? { deferredProfiles } : {}),
 			runner: options.runner,
 			cwd,
 			...(options.agentDir ? { agentDir: options.agentDir } : {}),
@@ -308,6 +328,34 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 		});
 		proposal = evaluation.proposal;
 		await atomicWriteFile(join(evolutionRunDirectory(options.paths, run.id), "evaluation.md"), evaluation.markdown);
+		if (
+			deferredProfiles.length > 0 &&
+			historicalReplay.mode === "recommended" &&
+			evaluation.verdict !== "invalid" &&
+			evaluation.verdict !== "unsupported"
+		) {
+			// Park the run for an explicit execute/skip/reject decision. No release
+			// intent is written: the registry has not been touched yet, and both the
+			// skip and execute paths apply the release policy themselves later.
+			await writePendingVerification(options.paths, {
+				schemaVersion: 1,
+				runId: run.id,
+				proposalId: proposal.id,
+				profiles: deferredProfiles,
+				datasets: historicalReplay.datasets,
+				minimumSamples: historicalReplay.minimumSamples,
+				reason: historicalReplay.reason,
+				verdict: evaluation.verdict,
+				evaluatedAt: new Date().toISOString(),
+			});
+			await advanceEvidenceReviewCursor(options.paths, corpus.nextReviewCursor);
+			await garbageCollectInbox(options.paths);
+			const parked = await updateEvolutionRun(options.paths, run.id, {
+				status: "awaiting-evidence",
+				proposalId: proposal.id,
+			});
+			return { run: parked, proposals: [proposal], evaluation };
+		}
 		// The intent file marks the non-atomic window between "release policy may have
 		// mutated the registry" and "the final run status is on disk"; crash reconcile
 		// derives the truth from the proposal whenever this file exists.

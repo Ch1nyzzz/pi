@@ -84,6 +84,11 @@ export async function runEvolutionEvaluator(options: {
 	/** On-disk corpus tree; when present the prompt carries only its index. */
 	materializedCorpus?: MaterializedCorpus;
 	replay?: CounterfactualReplayResult;
+	/**
+	 * Recommended (non-required) evidence profiles the harness deferred to an
+	 * explicit user decision. Their absence bounds claims but is not a defect.
+	 */
+	deferredProfiles?: readonly string[];
 	runner: ModelRunner;
 	cwd: string;
 	agentDir?: string;
@@ -126,6 +131,14 @@ export async function runEvolutionEvaluator(options: {
 					"</evidence_corpus>",
 				]),
 		...(options.replay ? ["", "<paired_replay>", options.replay.markdown, "</paired_replay>"] : []),
+		...(options.deferredProfiles && options.deferredProfiles.length > 0
+			? [
+					"",
+					"<deferred_recommended_evidence>",
+					`The frozen plan marks these evidence profiles as recommended, not required: ${options.deferredProfiles.join(", ")}. The harness deferred their execution to an explicit user decision that happens after this evaluation. Their absence is not a candidate or experiment defect and must not lower the verdict on its own; state instead which claims remain unproven without them.`,
+					"</deferred_recommended_evidence>",
+				]
+			: []),
 	].join("\n");
 	const common = {
 		cwd: options.cwd,

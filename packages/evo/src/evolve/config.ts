@@ -25,6 +25,9 @@ const DEFAULT_EVO_CONTROL_CONFIG: Readonly<EvoControlConfig> = {
 	grants: {
 		approval: "auto",
 	},
+	verification: {
+		approval: "ask",
+	},
 	triage: {
 		everyNSessions: 5,
 	},
@@ -59,7 +62,7 @@ function parseRole(value: unknown, label: string): EvoRoleModelConfig {
 
 function parseEvoControlConfig(value: unknown): EvoControlConfig {
 	const config = asRecord(value, "Evo control config");
-	exactKeys(config, ["schemaVersion", "models", "release", "grants", "triage"], "Evo control config");
+	exactKeys(config, ["schemaVersion", "models", "release", "grants", "verification", "triage"], "Evo control config");
 	if (config.schemaVersion !== 1) throw new Error("Evo control config schemaVersion must be 1");
 	const models = asRecord(config.models, "Evo control config.models");
 	exactKeys(models, ["researchPlanner", "builder", "evaluator", "triage"], "Evo control config.models");
@@ -85,6 +88,15 @@ function parseEvoControlConfig(value: unknown): EvoControlConfig {
 			throw new Error("Evo control config.grants.approval must be 'auto' or 'prompt'");
 		}
 		grantApproval = grants.approval;
+	}
+	let verificationApproval: "ask" | "auto" = "ask";
+	if (config.verification !== undefined) {
+		const verification = asRecord(config.verification, "Evo control config.verification");
+		exactKeys(verification, ["approval"], "Evo control config.verification");
+		if (verification.approval !== "ask" && verification.approval !== "auto") {
+			throw new Error("Evo control config.verification.approval must be 'ask' or 'auto'");
+		}
+		verificationApproval = verification.approval;
 	}
 	let triageEveryNSessions = DEFAULT_EVO_CONTROL_CONFIG.triage.everyNSessions;
 	if (config.triage !== undefined) {
@@ -114,6 +126,9 @@ function parseEvoControlConfig(value: unknown): EvoControlConfig {
 		},
 		grants: {
 			approval: grantApproval,
+		},
+		verification: {
+			approval: verificationApproval,
 		},
 		triage: {
 			everyNSessions: triageEveryNSessions,
@@ -149,7 +164,7 @@ export async function readEvoControlConfig(paths: EvoPaths): Promise<EvoControlC
 }
 
 const SETTABLE_CONFIG_KEY_PATTERN =
-	/^(grants\.approval|triage\.everyNSessions|models\.(researchPlanner|builder|evaluator|triage)\.(model|thinkingLevel)|release\.(autoApplyT0|autoStartDataTrial|autoStartComponentTrial|autoKeepSuccessfulTrial))$/;
+	/^(grants\.approval|verification\.approval|triage\.everyNSessions|models\.(researchPlanner|builder|evaluator|triage)\.(model|thinkingLevel)|release\.(autoApplyT0|autoStartDataTrial|autoStartComponentTrial|autoKeepSuccessfulTrial))$/;
 
 function coerceConfigValue(raw: string): unknown {
 	if (raw === "true") return true;
@@ -170,7 +185,7 @@ export async function updateEvoControlConfigValue(
 ): Promise<EvoControlConfig> {
 	if (!SETTABLE_CONFIG_KEY_PATTERN.test(key)) {
 		throw new Error(
-			`Unsupported config key: ${key}. Settable keys: grants.approval, triage.everyNSessions, models.<role>.model, models.<role>.thinkingLevel, release.<flag>`,
+			`Unsupported config key: ${key}. Settable keys: grants.approval, verification.approval, triage.everyNSessions, models.<role>.model, models.<role>.thinkingLevel, release.<flag>`,
 		);
 	}
 	const current = await readEvoControlConfig(paths);

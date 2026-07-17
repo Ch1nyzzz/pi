@@ -11,7 +11,9 @@ import { applyEvolutionReleasePolicy } from "../src/evolve/release.ts";
 import { parseEvolutionResearchPlanValue } from "../src/evolve/research-plan.ts";
 import { resumeEvolutionEvidence, retryEvolutionFromValidation } from "../src/evolve/retry.ts";
 import { evolutionRunDirectory, listEvolutionRuns, readEvolutionRun, updateEvolutionRun } from "../src/evolve/run.ts";
+import { skipPendingVerification } from "../src/evolve/verification-decision.ts";
 import { initializeInboxLifecycle, readInboxLifecycleStates } from "../src/inbox.ts";
+import { deterministicPreferenceId } from "../src/memory/preferences.ts";
 import { getEvoPaths } from "../src/paths.ts";
 import { createRecorderStore } from "../src/recorder/store.ts";
 import type { ModelRunner, ModelRunRequest, ModelRunResult } from "../src/reflect/model-runner.ts";
@@ -81,6 +83,9 @@ const config: EvoControlConfig = {
 	grants: {
 		approval: "auto",
 	},
+	verification: {
+		approval: "ask",
+	},
 	triage: {
 		everyNSessions: 5,
 	},
@@ -101,7 +106,7 @@ async function fixture() {
 			schemaVersion: 1,
 			preferences: [
 				{
-					id: "design-first",
+					id: deterministicPreferenceId("Prefer design-first implementation."),
 					instruction: "Prefer design-first implementation.",
 					source: {
 						sessionId: "preference-source",
@@ -590,7 +595,7 @@ lines.on("line", line => {
 		expect(history.some((entry) => entry.action === "human-direct-keep")).toBe(true);
 	});
 
-	it("resumes an awaiting-evidence run by executing the missing replay receipt", async () => {
+	it("executes a required replay inline regardless of proposal tier", async () => {
 		const f = await fixture();
 		const plan = {
 			...JSON.parse(planResponse()),
@@ -607,6 +612,8 @@ lines.on("line", line => {
 		const cycleRunner = new FakeRunner([
 			{ submission: plan },
 			{ submission: builder },
+			"old bundle answer",
+			"candidate bundle answer",
 			{ submission: { verdict: "verified", summary: "Deterministic checks pass.", findings: [] } },
 			{ submission: { verdict: "verified", summary: "No falsification found.", findings: [] } },
 		]);
@@ -617,9 +624,58 @@ lines.on("line", line => {
 			cwd: f.root,
 			config,
 		});
-		// The required paired-replay receipt is missing, so the deterministic gate holds.
+		// The frozen plan required the replay, so the T0 data candidate replayed
+		// inline and released with a complete receipt set.
+		expect(result.release?.action).toBe("review");
+		expect(result.run.status).toBe("awaiting-decision");
+		const receipt = JSON.parse(
+			await readFile(join(evolutionRunDirectory(f.paths, result.run.id), "receipts", "paired-replay.json"), "utf8"),
+		);
+		expect(receipt).toMatchObject({ profile: "paired-replay", passed: true });
+	});
+
+	it("defers a recommended replay on a request run and resumes by executing it", async () => {
+		const f = await fixture();
+		const plan = {
+			...JSON.parse(planResponse()),
+		};
+		plan.experiment.checkProfiles = ["bundle-compile", "paired-replay"];
+		plan.experiment.evidenceStrategy.historicalReplay = {
+			mode: "recommended",
+			profiles: ["paired-replay"],
+			datasets: ["evidence-session"],
+			minimumSamples: 1,
+			reason: "The replay shows the first-response shift but cannot prove end-to-end behavior.",
+		};
+		const builder = JSON.parse(builderResponse());
+		builder.proposals[0].replayScenarios = [{ sessionId: "evidence-session", sequence: 3 }];
+		const cycleRunner = new FakeRunner([
+			{ submission: plan },
+			{ submission: builder },
+			{ submission: { verdict: "verified", summary: "Deterministic checks pass.", findings: [] } },
+			{ submission: { verdict: "verified", summary: "No falsification found.", findings: [] } },
+		]);
+		const result = await runEvolutionCycle({
+			paths: f.paths,
+			service: f.service,
+			runner: cycleRunner,
+			cwd: f.root,
+			config,
+			request: "please improve this narrowly",
+		});
+		// The recommendation is deferred to an explicit user decision: the run
+		// parks before any release policy runs, with the decision context on disk.
 		expect(result.run.status).toBe("awaiting-evidence");
-		expect(result.release?.reason).toContain("paired-replay");
+		expect(result.release).toBeUndefined();
+		expect(cycleRunner.requests[2]?.prompt).toContain("<deferred_recommended_evidence>");
+		const pending = JSON.parse(
+			await readFile(join(evolutionRunDirectory(f.paths, result.run.id), "pending-verification.json"), "utf8"),
+		);
+		expect(pending).toMatchObject({
+			profiles: ["paired-replay"],
+			verdict: "verified",
+			proposalId: result.proposals[0]?.id,
+		});
 
 		const resumeRunner = new FakeRunner([
 			"old bundle answer",
@@ -639,6 +695,90 @@ lines.on("line", line => {
 		// automatic data trials are disabled in this test config.
 		expect(resumed.release.action).toBe("review");
 		expect(resumed.run.status).toBe("awaiting-decision");
+		const receipt = JSON.parse(
+			await readFile(join(evolutionRunDirectory(f.paths, result.run.id), "receipts", "paired-replay.json"), "utf8"),
+		);
+		expect(receipt).toMatchObject({ profile: "paired-replay", passed: true });
+		await expect(
+			readFile(join(evolutionRunDirectory(f.paths, result.run.id), "pending-verification.json"), "utf8"),
+		).rejects.toThrow();
+	});
+
+	it("skips a deferred recommended verification and releases on the stored verdict", async () => {
+		const f = await fixture();
+		const plan = {
+			...JSON.parse(planResponse()),
+		};
+		plan.experiment.checkProfiles = ["bundle-compile", "paired-replay"];
+		plan.experiment.evidenceStrategy.historicalReplay = {
+			mode: "recommended",
+			profiles: ["paired-replay"],
+			datasets: ["evidence-session"],
+			minimumSamples: 1,
+			reason: "Useful confirmation, not a release blocker.",
+		};
+		const builder = JSON.parse(builderResponse());
+		builder.proposals[0].replayScenarios = [{ sessionId: "evidence-session", sequence: 3 }];
+		const cycleRunner = new FakeRunner([
+			{ submission: plan },
+			{ submission: builder },
+			{ submission: { verdict: "verified", summary: "Deterministic checks pass.", findings: [] } },
+			{ submission: { verdict: "verified", summary: "No falsification found.", findings: [] } },
+		]);
+		const result = await runEvolutionCycle({
+			paths: f.paths,
+			service: f.service,
+			runner: cycleRunner,
+			cwd: f.root,
+			config,
+			request: "please improve this narrowly",
+		});
+		expect(result.run.status).toBe("awaiting-evidence");
+		const release = await skipPendingVerification({
+			paths: f.paths,
+			service: f.service,
+			config,
+			runId: result.run.id,
+		});
+		expect(release.action).toBe("review");
+		expect((await readEvolutionRun(f.paths, result.run.id)).status).toBe("awaiting-decision");
+		await expect(
+			readFile(join(evolutionRunDirectory(f.paths, result.run.id), "pending-verification.json"), "utf8"),
+		).rejects.toThrow();
+	});
+
+	it("executes a recommended replay inline on scheduled runs", async () => {
+		const f = await fixture();
+		const plan = {
+			...JSON.parse(planResponse()),
+		};
+		plan.experiment.checkProfiles = ["bundle-compile", "paired-replay"];
+		plan.experiment.evidenceStrategy.historicalReplay = {
+			mode: "recommended",
+			profiles: ["paired-replay"],
+			datasets: ["evidence-session"],
+			minimumSamples: 1,
+			reason: "Scheduled runs execute recommendations without waiting for the user.",
+		};
+		const builder = JSON.parse(builderResponse());
+		builder.proposals[0].replayScenarios = [{ sessionId: "evidence-session", sequence: 3 }];
+		const cycleRunner = new FakeRunner([
+			{ submission: plan },
+			{ submission: builder },
+			"old bundle answer",
+			"candidate bundle answer",
+			{ submission: { verdict: "verified", summary: "Deterministic checks pass.", findings: [] } },
+			{ submission: { verdict: "verified", summary: "No falsification found.", findings: [] } },
+		]);
+		const result = await runEvolutionCycle({
+			paths: f.paths,
+			service: f.service,
+			runner: cycleRunner,
+			cwd: f.root,
+			config,
+		});
+		expect(result.release?.action).toBe("review");
+		expect(result.run.status).toBe("awaiting-decision");
 		const receipt = JSON.parse(
 			await readFile(join(evolutionRunDirectory(f.paths, result.run.id), "receipts", "paired-replay.json"), "utf8"),
 		);

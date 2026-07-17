@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { compileBundle } from "../src/bundle/compile.ts";
 import { publishEvoComponentArtifact } from "../src/components/artifact.ts";
+import { deterministicPreferenceId } from "../src/memory/preferences.ts";
 import { exportEvoPack } from "../src/pack/export.ts";
 import { loadEvoPack } from "../src/pack/pack.ts";
 import { getEvoPaths } from "../src/paths.ts";
@@ -45,7 +46,7 @@ describe("optimization pack export", () => {
 				schemaVersion: 1,
 				preferences: [
 					{
-						id: "focused-review",
+						id: deterministicPreferenceId("Review focused changes."),
 						instruction: "Review focused changes.",
 						source: {
 							sessionId: "export-session",

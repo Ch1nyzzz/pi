@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { sha256 } from "../storage.ts";
 import type { CompiledBundle } from "../types.ts";
 
 export const PREFERENCES_PATH = "memory/preferences.json";
@@ -34,6 +35,15 @@ export interface DurablePreference {
 export interface PreferenceMemory {
 	schemaVersion: 1;
 	preferences: DurablePreference[];
+}
+
+/**
+ * Canonical id for a session-sourced durable preference. Content-addressing the
+ * instruction makes ids reproducible across independent writers and lets the
+ * schema reject ids invented from unrelated identifiers such as inbox UUIDs.
+ */
+export function deterministicPreferenceId(instruction: string): string {
+	return `pref-${sha256(instruction).slice(0, 16)}`;
 }
 
 function asRecord(value: unknown, label: string): Record<string, unknown> {
@@ -74,6 +84,11 @@ export function parsePreferenceMemory(value: unknown): PreferenceMemory {
 			throw new Error(`${label}.addedAt is invalid`);
 		}
 		const source = parsePreferenceSource(entry.source, entry.instruction, `${label}.source`);
+		if ("sessionId" in source && entry.id !== deterministicPreferenceId(entry.instruction)) {
+			throw new Error(
+				`${label}.id must be the deterministic instruction hash ${deterministicPreferenceId(entry.instruction)}`,
+			);
+		}
 		return {
 			id: entry.id,
 			instruction: entry.instruction,

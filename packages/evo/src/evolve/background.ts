@@ -8,6 +8,7 @@ import { loadProposal } from "../proposal.ts";
 import { createPiModelRunner } from "../reflect/model-runner.ts";
 import type { EvolutionRun, EvolutionRunActiveStatus } from "../types.ts";
 import { runEvolutionCycle } from "./cycle.ts";
+import { resumeEvolutionEvidence } from "./retry.ts";
 import {
 	createEvolutionRun,
 	deleteEvolutionRun,
@@ -103,7 +104,12 @@ async function appendWorkerProgress(paths: EvoPaths, runId: string, event: Recor
 	);
 }
 
-export async function runEvolutionWorker(options: { paths: EvoPaths; runId: string; cwd: string }): Promise<void> {
+type WorkerRunner = { run: ReturnType<typeof createPiModelRunner>["run"] };
+
+async function runTrackedWorker(
+	options: { paths: EvoPaths; runId: string },
+	work: (runner: WorkerRunner, run: EvolutionRun, signal: AbortSignal) => Promise<void>,
+): Promise<void> {
 	const controller = new AbortController();
 	let transcript: WriteStream | undefined;
 	const abort = () => controller.abort(new Error("Evolution worker terminated"));
@@ -120,7 +126,7 @@ export async function runEvolutionWorker(options: { paths: EvoPaths; runId: stri
 			mode: 0o600,
 		});
 		const baseRunner = createPiModelRunner();
-		const runner = {
+		const runner: WorkerRunner = {
 			run: async (request: Parameters<typeof baseRunner.run>[0]) => {
 				const phase = (await readEvolutionRun(options.paths, options.runId)).status;
 				await appendWorkerProgress(options.paths, options.runId, {
@@ -155,15 +161,7 @@ export async function runEvolutionWorker(options: { paths: EvoPaths; runId: stri
 				}
 			},
 		};
-		await runEvolutionCycle({
-			paths: options.paths,
-			runner,
-			cwd: options.cwd,
-			...(run.request ? { request: run.request } : {}),
-			trigger: run.trigger,
-			runId: run.id,
-			signal: controller.signal,
-		});
+		await work(runner, run, controller.signal);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		await updateEvolutionRun(options.paths, options.runId, {
@@ -176,6 +174,75 @@ export async function runEvolutionWorker(options: { paths: EvoPaths; runId: stri
 		process.off("SIGINT", abort);
 		if (transcript) await new Promise<void>((resolve) => transcript?.end(resolve));
 		await updateEvolutionRun(options.paths, options.runId, { workerPid: undefined }).catch(() => undefined);
+	}
+}
+
+export async function runEvolutionWorker(options: { paths: EvoPaths; runId: string; cwd: string }): Promise<void> {
+	await runTrackedWorker(options, (runner, run, signal) =>
+		runEvolutionCycle({
+			paths: options.paths,
+			runner,
+			cwd: options.cwd,
+			...(run.request ? { request: run.request } : {}),
+			trigger: run.trigger,
+			runId: run.id,
+			signal,
+		}).then(() => undefined),
+	);
+}
+
+/** Detached worker that executes a user-approved evidence resumption. */
+export async function runEvidenceResumptionWorker(options: {
+	paths: EvoPaths;
+	runId: string;
+	cwd: string;
+}): Promise<void> {
+	await runTrackedWorker(options, (runner, run, signal) =>
+		resumeEvolutionEvidence({
+			paths: options.paths,
+			runner,
+			runId: run.id,
+			cwd: options.cwd,
+			signal,
+		}).then(() => undefined),
+	);
+}
+
+/**
+ * Spawn a detached worker that executes the recommended verification for a run
+ * parked at awaiting-evidence, then re-evaluates and applies the release policy.
+ */
+export async function startBackgroundEvidenceResumption(options: {
+	paths: EvoPaths;
+	cwd: string;
+	runId: string;
+}): Promise<EvolutionRun> {
+	const run = await readEvolutionRun(options.paths, options.runId);
+	if (run.status !== "awaiting-evidence") {
+		throw new Error(`Evolution run ${run.id} is ${run.status}, not awaiting-evidence`);
+	}
+	if (run.workerPid && (await processMatchesRun(run.workerPid, run.id))) {
+		throw new Error(`Evolution run ${run.id} already has an active worker`);
+	}
+	const entrypoint = workerEntrypoint();
+	await access(entrypoint);
+	const logFile = join(evolutionRunDirectory(options.paths, run.id), "worker.log");
+	const log = await open(logFile, "a", 0o600);
+	try {
+		const child = spawn(process.execPath, [entrypoint, "__worker-resume", options.paths.root, run.id, options.cwd], {
+			cwd: options.cwd,
+			detached: true,
+			stdio: ["ignore", log.fd, log.fd],
+		});
+		if (!child.pid) throw new Error("Background worker did not start");
+		child.unref();
+		return await updateEvolutionRun(options.paths, run.id, {
+			workerPid: child.pid,
+			workerStartedAt: new Date().toISOString(),
+			logFile,
+		});
+	} finally {
+		await log.close();
 	}
 }
 

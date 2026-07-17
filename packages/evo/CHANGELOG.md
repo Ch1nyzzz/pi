@@ -4,6 +4,16 @@
 
 ### Added
 
+- Added `historicalReplay.mode: "recommended"` to the frozen evidence strategy: the researcher now recommends non-blocking replay evidence with a reason instead of freezing it as a release blocker. Scheduled runs execute recommendations automatically; request-triggered runs evaluate first, then park at `awaiting-evidence` with a `pending-verification.json` decision record so the user chooses 执行/跳过/拒绝 (Inspector decision card with `e`/`s`/`r` hotkeys, auto-prompted in the TUI, or `/evo verify [run-id] execute|skip|reject`).
+- Added `verification.approval` config (default `ask`): set `auto` to execute recommended verifications inline on request runs too.
+- Added a detached `__worker-resume` background worker: an approved execute decision runs the missing replay, re-evaluates, and applies the release policy without blocking the TUI (wires up the previously dormant `resumeEvolutionEvidence`).
+
+### Fixed
+
+- Fixed required replay execution to be contract-driven: a frozen plan that requires `paired-replay` now executes it inline for any proposal tier with replay scenarios, instead of only T2 — previously a T0/T1 candidate whose plan required replay was evaluated against evidence the harness never produced and was rejected as invalid.
+- Fixed durable preference ids to be enforced at the schema level: a session-sourced preference id must be the deterministic instruction hash (`pref-<sha256(instruction)[0:16]>`), so a builder can no longer stage ids derived from unrelated identifiers such as inbox UUIDs.
+- Evaluator passes now receive deferred recommended profiles explicitly and must not count their absence as a candidate defect.
+
 - Added `grants`: lists every component's persisted capability grants with per-capability usage against its budgets (calls, cost, tokens) plus in-flight operations and reservations.
 - Added `history [<count>]`: read-only view of the bundle transition audit log (initialize/keep/rollback/pause and proposal decisions) with digests, proposal ids, and reasons.
 - Added `triage [now]`: shows the streaming-triage cursor and backlog, and `triage now` forces an immediate scan of the new session digests regardless of the cadence.

@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { deterministicPreferenceId } from "../src/memory/preferences.ts";
 import { buildPackDataChanges } from "../src/pack/import.ts";
 import { parseEvoPackManifest } from "../src/pack/pack.ts";
 
@@ -22,7 +23,7 @@ describe("buildPackDataChanges", () => {
 					schemaVersion: 1,
 					preferences: [
 						{
-							id: "small-commits",
+							id: deterministicPreferenceId("Prefer small commits."),
 							instruction: "Prefer small commits.",
 							source: { sessionId: "source-session", sequence: 1, quote: "Prefer small commits." },
 							addedAt: "2026-07-15T00:00:00.000Z",
@@ -105,7 +106,7 @@ describe("buildPackDataChanges", () => {
 			schemaVersion: 1 as const,
 			preferences: [
 				{
-					id: "small-commits",
+					id: deterministicPreferenceId("Prefer small commits."),
 					instruction: "Use large commits.",
 					source: { sessionId: "active-session", sequence: 1, quote: "Use large commits." },
 					addedAt: "2026-07-14T00:00:00.000Z",
