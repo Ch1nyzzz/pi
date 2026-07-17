@@ -39,3 +39,6 @@ plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
 collect.sh
+
+# Locally generated workflow pack templates
+*-pack/
