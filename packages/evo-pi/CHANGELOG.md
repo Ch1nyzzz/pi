@@ -13,6 +13,7 @@
 
 ### Changed
 
+- Approved workflow components go live directly (no Canary trial): the executable dry run is the bug gate, activation stays rollbackable and audit-logged.
 - Changed Evo activity into a dedicated final status line that shows the active Canary component by name and can be entered with Down from the end of a draft without exposing internal IDs.
 
 ### Added

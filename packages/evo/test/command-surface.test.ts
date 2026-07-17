@@ -94,8 +94,8 @@ describe("evo command surface", () => {
 		await runEvoCli(["import"], { paths, service, io, model: "test/model", sandbox: false });
 		const output = messages.join("\n");
 		expect(output).toContain("可安装的 workflow 模板");
-		const trialing = (await service.listProposals()).find((entry) => entry.status === "trialing");
-		expect(trialing?.motivation).toContain("deepcode");
+		const kept = (await service.listProposals()).find((entry) => entry.status === "kept");
+		expect(kept?.motivation).toContain("deepcode");
 		expect(output).toContain("/deepcode 生效");
 
 		// Re-running the wizard now reports deepcode as active.
@@ -116,8 +116,13 @@ describe("evo command surface", () => {
 		// Import attaches the executable-validation, replay, and review artifacts
 		// so the tiered approval checks can actually pass without an evolution run.
 		expect(Object.keys(proposal.artifacts)).toEqual(expect.arrayContaining(["validation", "replay", "review"]));
+		// Workflows skip the Canary: a dry-run-validated sandboxed command goes
+		// live directly (rollbackable, audited as human-direct-keep).
 		const approved = await service.approve(proposal.id, proposalApproval(proposal));
-		expect(approved.status).toBe("trialing");
+		expect(approved.status).toBe("kept");
+		const workflows = captureCliOutput();
+		await runEvoCli(["workflows"], { paths, service, io: workflows.io });
+		expect(workflows.messages.join("\n")).toContain("/deepcode");
 	});
 
 	it("reports no active workflows on a fresh bundle", async () => {

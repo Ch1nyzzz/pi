@@ -1127,18 +1127,23 @@ export async function approveProposal(
 			return { kind: "code" as const, proposal, workspace };
 		}
 		const { candidate, evaluation } = await revalidateDataProposal(paths, proposal);
-		if (dataActivation?.mode === "direct" && !proposal.targetAbi) {
+		// Sandboxed workflow commands carry no product-behavior metrics a Canary
+		// could observe: once the executable dry run passed, approval activates
+		// them directly (still rollbackable and audit-logged as human-direct-keep).
+		const activation: DataApprovalActivation | undefined =
+			dataActivation ?? (proposal.targetAbi === "workflow/v1" ? { mode: "direct" } : undefined);
+		if (activation?.mode === "direct" && !proposal.targetAbi) {
 			throw new Error("Direct activation is limited to an existing host-defined component ABI");
 		}
 		const targetStatus: Proposal["status"] =
-			evaluation.tier === "T0" || dataActivation?.mode === "direct" ? "kept" : "trialing";
+			evaluation.tier === "T0" || activation?.mode === "direct" ? "kept" : "trialing";
 		if (proposal.status !== "pending" && proposal.status !== targetStatus) {
 			throw new Error(`Proposal ${id} is ${proposal.status}`);
 		}
 		if (evaluation.tier !== "T0") await assertApprovalArtifact(paths, proposal, "review");
 		if (evaluation.tier === "T2") await assertApprovalArtifact(paths, proposal, "replay");
-		if (dataActivation?.mode === "direct") await assertApprovalArtifact(paths, proposal, "validation");
-		return { kind: "data" as const, proposal, candidate, evaluation, targetStatus };
+		if (activation?.mode === "direct") await assertApprovalArtifact(paths, proposal, "validation");
+		return { kind: "data" as const, proposal, candidate, evaluation, targetStatus, activation };
 	});
 
 	if (prepared.kind === "code") {
@@ -1166,9 +1171,9 @@ export async function approveProposal(
 		candidateDigest: prepared.candidate.digest,
 		tier: prepared.evaluation.tier,
 		plan: prepared.proposal.trialPlan,
-		activation: dataActivation ?? { mode: "trial" },
+		activation: prepared.activation ?? { mode: "trial" },
 		reason:
-			dataActivation?.mode === "direct"
+			prepared.activation?.mode === "direct"
 				? `Human directly activated exact component diff ${prepared.proposal.diffDigest}`
 				: `Approved exact data diff ${prepared.proposal.diffDigest}`,
 		proposalBefore: prepared.proposal,

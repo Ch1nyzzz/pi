@@ -472,7 +472,11 @@ function describePermitOutcome(proposal: Proposal, trigger?: string): string {
 			? `已批准并进入 Canary；重开会话后 ${trigger} 生效`
 			: `Proposal ${proposal.id} approved; reversible trial started`;
 	}
-	if (proposal.status === "kept") return `Proposal ${proposal.id} approved and kept`;
+	if (proposal.status === "kept") {
+		return trigger
+			? `已直接上线；重开会话后 ${trigger} 生效（/evo rollback 可回滚）`
+			: `Proposal ${proposal.id} approved and kept`;
+	}
 	return `Proposal ${proposal.id} is ${proposal.status}`;
 }
 
@@ -619,10 +623,14 @@ export async function refreshEvoStatusIndicator(
 		items.length > 0
 			? items.map((item) => {
 					const status = item.kind === "run" ? item.run.status : item.proposal.status;
+					const needsDecision =
+						item.kind === "proposal"
+							? item.proposal.status === "pending"
+							: status === "awaiting-canary-approval" || status === "awaiting-decision";
 					const text =
 						status === "failed" || status === "cancelled"
 							? ctx.ui.theme.fg("error", item.text)
-							: status === "awaiting-canary-approval" || status === "awaiting-decision"
+							: needsDecision
 								? ctx.ui.theme.fg("warning", item.text)
 								: status === "trialing"
 									? ctx.ui.theme.fg("accent", item.text)

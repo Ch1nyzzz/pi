@@ -26,6 +26,7 @@
 
 ### Changed
 
+- Approved workflow components now activate directly instead of entering a Canary trial: a sandboxed slash command has no product-behavior metrics a Canary could observe, so once the executable dry run passed, approval makes it live immediately — still rollbackable via `/evo rollback` and audited as `human-direct-keep`.
 - Changed Evo activity into a dedicated final status line that names active Canary components, stays separate from provider quota status, and can be entered with Down from the end of a draft to open runs, trials, and proposals.
 - Raised default pack capability budgets (spawn-agent: 100 calls, 64-turn children, sized for parallel large-context reservations) and expanded the `workflow/v1` capability ceiling with `memory-read`/`memory-write` for persistent workflow state.
 - Spawned child agents now default to the host's real coding tools (`bash`, `edit`, `find`, `grep`, `ls`, `read`, `write`) and grant previews default their allowlist to the same set.
