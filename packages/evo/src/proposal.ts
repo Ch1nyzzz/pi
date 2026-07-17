@@ -26,6 +26,7 @@ import { atomicWriteJson, canonicalJson, readJson, sha256, withFileLock } from "
 import type {
 	BundlePolicy,
 	CompiledBundle,
+	DataApprovalActivation,
 	EvidenceReference,
 	Proposal,
 	ProposalApproval,
@@ -533,6 +534,11 @@ export async function stageProposal(options: {
 	draft: DraftProposal;
 	observationsMarkdown: string;
 	repositoryCwd?: string;
+	expectedCodeBase?: {
+		repositoryRoot: string;
+		repositoryIdentity: string;
+		baseCommit: string;
+	};
 	codeValidationExecutor?: CodeValidationExecutor;
 	signal?: AbortSignal;
 }): Promise<Proposal> {
@@ -553,6 +559,13 @@ export async function stageProposal(options: {
 				revision: 1,
 				parentBundleDigest: options.parentDigest,
 				patch: codePatch,
+				...(options.expectedCodeBase
+					? {
+							expectedRepositoryRoot: options.expectedCodeBase.repositoryRoot,
+							expectedRepositoryIdentity: options.expectedCodeBase.repositoryIdentity,
+							expectedBaseCommit: options.expectedCodeBase.baseCommit,
+						}
+					: {}),
 				...(options.codeValidationExecutor ? { validationExecutor: options.codeValidationExecutor } : {}),
 				...(options.signal ? { signal: options.signal } : {}),
 			});
@@ -1065,6 +1078,7 @@ export async function approveProposal(
 	registry: BundleRegistry = new BundleRegistry(paths),
 	idempotencyKey?: string,
 	expectedStateDigest?: string,
+	dataActivation?: DataApprovalActivation,
 ): Promise<Proposal> {
 	const prepared = await withProposalLock(paths, id, async () => {
 		const proposal = await loadProposal(paths, id);
@@ -1113,12 +1127,17 @@ export async function approveProposal(
 			return { kind: "code" as const, proposal, workspace };
 		}
 		const { candidate, evaluation } = await revalidateDataProposal(paths, proposal);
-		const targetStatus: Proposal["status"] = evaluation.tier === "T0" ? "kept" : "trialing";
+		if (dataActivation?.mode === "direct" && !proposal.targetAbi) {
+			throw new Error("Direct activation is limited to an existing host-defined component ABI");
+		}
+		const targetStatus: Proposal["status"] =
+			evaluation.tier === "T0" || dataActivation?.mode === "direct" ? "kept" : "trialing";
 		if (proposal.status !== "pending" && proposal.status !== targetStatus) {
 			throw new Error(`Proposal ${id} is ${proposal.status}`);
 		}
 		if (evaluation.tier !== "T0") await assertApprovalArtifact(paths, proposal, "review");
 		if (evaluation.tier === "T2") await assertApprovalArtifact(paths, proposal, "replay");
+		if (dataActivation?.mode === "direct") await assertApprovalArtifact(paths, proposal, "validation");
 		return { kind: "data" as const, proposal, candidate, evaluation, targetStatus };
 	});
 
@@ -1147,7 +1166,11 @@ export async function approveProposal(
 		candidateDigest: prepared.candidate.digest,
 		tier: prepared.evaluation.tier,
 		plan: prepared.proposal.trialPlan,
-		reason: `Approved exact data diff ${prepared.proposal.diffDigest}`,
+		activation: dataActivation ?? { mode: "trial" },
+		reason:
+			dataActivation?.mode === "direct"
+				? `Human directly activated exact component diff ${prepared.proposal.diffDigest}`
+				: `Approved exact data diff ${prepared.proposal.diffDigest}`,
 		proposalBefore: prepared.proposal,
 		proposalAfter: { ...prepared.proposal, status: prepared.targetStatus },
 	});

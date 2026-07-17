@@ -56,37 +56,54 @@ function runStatusLabel(run: EvolutionRun): string {
 	);
 }
 
+interface TrialDisplay {
+	due: boolean;
+	currentSessions: number;
+	minimumSessions: number;
+	maximumDurationDays: number;
+}
+
+function componentLabel(proposal: Proposal | undefined, component: string): string {
+	const surface = proposal?.targetAbi?.split("/", 1)[0] ?? "component";
+	const short = component.endsWith(`-${surface}`) ? component.slice(0, -surface.length - 1) : component;
+	return `${surface}/${short}`;
+}
+
 function runText(
 	run: EvolutionRun,
 	component: string | undefined,
 	proposal: Proposal | undefined,
-	trialDue: boolean,
+	trial: TrialDisplay | undefined,
 ): string {
 	if (component && run.status === "trialing") {
 		const state = proposal?.artifacts.retrospective
-			? "Canary comparison ready"
-			: trialDue
-				? "Canary comparison pending"
-				: "Canary 运行中";
-		return `Evo: ${component} · ${state}`;
+			? "comparison ready"
+			: trial?.due
+				? "comparison pending"
+				: `Canary ${trial ? `${trial.currentSessions}/${trial.minimumSessions}` : "运行中"}`;
+		const bound = trial ? ` · ≤${trial.maximumDurationDays}d` : "";
+		return `Evo: ${componentLabel(proposal, component)} · ${state}${bound} · [↓ 后 Enter 展开]`;
 	}
-	if (component && run.status === "awaiting-canary-approval") return `Evo: ${component} · 等待 Canary 确认`;
+	if (component && run.status === "awaiting-canary-approval") {
+		return `Evo: ${componentLabel(proposal, component)} · 等待发布确认 · [↓ 后 Enter 展开]`;
+	}
 	return `Evo: ${runStatusLabel(run)} · ${compact(run.request ?? "定时演化")}`;
 }
 
-function proposalText(proposal: Proposal, component: string | undefined, trialDue: boolean): string {
+function proposalText(proposal: Proposal, component: string | undefined, trial: TrialDisplay | undefined): string {
 	if (component && proposal.status === "trialing") {
 		const status = proposal.artifacts.retrospective
-			? "Canary comparison ready"
-			: trialDue
-				? "Canary comparison pending"
-				: "Canary 运行中";
-		return `Evo: ${component} · ${status}`;
+			? "comparison ready"
+			: trial?.due
+				? "comparison pending"
+				: `Canary ${trial ? `${trial.currentSessions}/${trial.minimumSessions}` : "运行中"}`;
+		const bound = trial ? ` · ≤${trial.maximumDurationDays}d` : "";
+		return `Evo: ${componentLabel(proposal, component)} · ${status}${bound} · [↓ 后 Enter 展开]`;
 	}
 	if (proposal.status === "trialing") {
 		const status = proposal.artifacts.retrospective
 			? "Trial comparison ready"
-			: trialDue
+			: trial?.due
 				? "Trial comparison pending"
 				: "Trial 运行中";
 		return `Evo: ${status} · ${compact(proposal.motivation)}`;
@@ -114,30 +131,38 @@ export async function listEvoActivityItems(
 		return componentNames.get(proposal.id);
 	};
 	const visibleRuns = options.includeHistory ? runs : runs.filter((run) => !TERMINAL_RUN_STATUSES.has(run.status));
-	let trialDue = false;
-	if (status.trial && options.includeTrialComparison !== false) {
+	let trialDisplay: TrialDisplay | undefined;
+	if (status.trial) {
 		const trialProposal = proposalById.get(status.trial.proposalId);
-		if (trialProposal && !trialProposal.artifacts.retrospective) {
+		if (trialProposal) {
 			const [schedule, comparison] = await Promise.all([
 				readScheduleConfig(dependencies.paths),
 				buildTrialComparison(dependencies.paths, trialProposal, status.trial),
 			]);
-			const dueAt = Date.parse(status.trial.startedAt) + schedule.trialDueAfterDays * 24 * 60 * 60 * 1_000;
-			trialDue =
-				(Number.isFinite(dueAt) && (options.now ?? (() => new Date()))().getTime() >= dueAt) ||
-				comparison.after.totals.sessions >= schedule.trialDueAfterSessions;
+			const maximumDurationDays = status.trial.canary?.maximumDurationDays ?? schedule.trialDueAfterDays;
+			const minimumSessions = status.trial.canary?.minimumSamples ?? schedule.trialDueAfterSessions;
+			const dueAt = Date.parse(status.trial.startedAt) + maximumDurationDays * 24 * 60 * 60 * 1_000;
+			trialDisplay = {
+				due:
+					trialProposal.artifacts.retrospective !== undefined ||
+					(Number.isFinite(dueAt) && (options.now ?? (() => new Date()))().getTime() >= dueAt) ||
+					comparison.after.totals.sessions >= minimumSessions,
+				currentSessions: comparison.after.totals.sessions,
+				minimumSessions,
+				maximumDurationDays,
+			};
 		}
 	}
 	const items: EvoActivityItem[] = [];
 	const linkedProposalIds = new Set<string>();
 	for (const run of visibleRuns) {
 		const proposal = run.proposalId ? proposalById.get(run.proposalId) : undefined;
-		if (proposal) linkedProposalIds.add(proposal.id);
+		if (proposal && !TERMINAL_RUN_STATUSES.has(run.status)) linkedProposalIds.add(proposal.id);
 		const component = await componentName(proposal);
 		items.push({
 			key: `run:${run.id}`,
 			kind: "run",
-			text: runText(run, component, proposal, trialDue && proposal?.id === status.trial?.proposalId),
+			text: runText(run, component, proposal, proposal?.id === status.trial?.proposalId ? trialDisplay : undefined),
 			run,
 			...(proposal ? { proposal } : {}),
 			...(component ? { component } : {}),
@@ -150,7 +175,7 @@ export async function listEvoActivityItems(
 		items.push({
 			key: `proposal:${proposal.id}`,
 			kind: "proposal",
-			text: proposalText(proposal, component, trialDue && proposal.id === status.trial?.proposalId),
+			text: proposalText(proposal, component, proposal.id === status.trial?.proposalId ? trialDisplay : undefined),
 			proposal,
 			...(component ? { component } : {}),
 		});

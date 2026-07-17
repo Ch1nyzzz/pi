@@ -18,7 +18,15 @@ import {
 	truncateIncompleteFinalLine,
 	withFileLock,
 } from "../storage.ts";
-import type { CompiledBundle, EvoStatus, HistoryEntry, Proposal, ProposalStatus, TrialState } from "../types.ts";
+import type {
+	CompiledBundle,
+	DataApprovalActivation,
+	EvoStatus,
+	HistoryEntry,
+	Proposal,
+	ProposalStatus,
+	TrialState,
+} from "../types.ts";
 
 async function readTextIfExists(path: string): Promise<string | undefined> {
 	try {
@@ -35,6 +43,7 @@ export type RegistryTransitionAction =
 	| "approve-data"
 	| "approve-code"
 	| "keep-trial"
+	| "direct-keep-trial"
 	| "keep-proposal"
 	| "rollback"
 	| "rollback-proposal"
@@ -123,6 +132,7 @@ const TRANSITION_ACTIONS = new Set<RegistryTransitionAction>([
 	"approve-data",
 	"approve-code",
 	"keep-trial",
+	"direct-keep-trial",
 	"keep-proposal",
 	"rollback",
 	"rollback-proposal",
@@ -159,7 +169,17 @@ function assertTrialState(value: unknown, label: string): asserts value is Trial
 		typeof trial.startedAt !== "string" ||
 		!Number.isFinite(Date.parse(trial.startedAt)) ||
 		typeof trial.plan !== "string" ||
-		!trial.plan.trim()
+		!trial.plan.trim() ||
+		(trial.canary !== undefined &&
+			(typeof trial.canary !== "object" ||
+				trial.canary === null ||
+				Array.isArray(trial.canary) ||
+				((trial.canary as Record<string, unknown>).customization !== "default" &&
+					(trial.canary as Record<string, unknown>).customization !== "custom") ||
+				!Number.isSafeInteger((trial.canary as Record<string, unknown>).minimumSamples) ||
+				((trial.canary as Record<string, unknown>).minimumSamples as number) <= 0 ||
+				!Number.isSafeInteger((trial.canary as Record<string, unknown>).maximumDurationDays) ||
+				((trial.canary as Record<string, unknown>).maximumDurationDays as number) <= 0))
 	) {
 		throw new Error(`${label} is invalid`);
 	}
@@ -873,10 +893,12 @@ export class BundleRegistry {
 		candidateDigest: string;
 		tier: "T0" | "T1" | "T2";
 		plan: string;
+		activation?: DataApprovalActivation;
 		reason: string;
 		proposalBefore: Proposal;
 		proposalAfter: Proposal;
 	}): Promise<{ proposal: Proposal; trial: TrialState | undefined }> {
+		const activation: DataApprovalActivation = options.activation ?? { mode: "trial" };
 		return withFileLock(this.paths, "registry", async () => {
 			const requestKey = transitionRequestKey({
 				action: "approve-data",
@@ -887,6 +909,7 @@ export class BundleRegistry {
 				candidateDigest: options.candidateDigest,
 				tier: options.tier,
 				plan: options.plan,
+				activation,
 				reason: options.reason,
 			});
 			const recovered = await this.recoverPendingUnlocked();
@@ -927,9 +950,16 @@ export class BundleRegistry {
 					await assertRequiredApprovalArtifact(this.paths, options.proposalBefore, "review");
 				if (options.tier === "T2")
 					await assertRequiredApprovalArtifact(this.paths, options.proposalBefore, "replay");
+				if (activation.mode === "direct") {
+					await assertRequiredApprovalArtifact(this.paths, options.proposalBefore, "validation");
+				}
+				if (activation.mode === "direct" && options.proposalBefore.targetAbi === undefined) {
+					throw new Error("Direct activation is limited to an existing host-defined component ABI");
+				}
+				const direct = options.tier === "T0" || activation.mode === "direct";
 				const expectedAfter = {
 					...options.proposalBefore,
-					status: options.tier === "T0" ? ("kept" as const) : ("trialing" as const),
+					status: direct ? ("kept" as const) : ("trialing" as const),
 				};
 				if (!sameState(options.proposalAfter, expectedAfter)) {
 					throw new Error("Data approval proposal after-image is invalid");
@@ -944,16 +974,16 @@ export class BundleRegistry {
 				if (candidate.manifest.parentDigest !== stable) {
 					throw new Error("Candidate bundle parent does not match the stable bundle");
 				}
-				const trial =
-					options.tier === "T0"
-						? undefined
-						: {
-								digest: options.candidateDigest,
-								parent: stable,
-								proposalId: options.proposalId,
-								startedAt: new Date().toISOString(),
-								plan: options.plan,
-							};
+				const trial = direct
+					? undefined
+					: {
+							digest: options.candidateDigest,
+							parent: stable,
+							proposalId: options.proposalId,
+							startedAt: new Date().toISOString(),
+							plan: options.plan,
+							...(activation.mode === "trial" && activation.canary ? { canary: activation.canary } : {}),
+						};
 				const paused = await this.readPausedUnlocked();
 				const history: HistoryTemplate[] = [];
 				if (trial) {
@@ -967,6 +997,18 @@ export class BundleRegistry {
 						diffDigest: options.diffDigest,
 						candidateDigest: options.candidateDigest,
 						reason: options.plan,
+					});
+				} else if (activation.mode === "direct") {
+					history.push({
+						action: "human-direct-keep",
+						actor: "human",
+						fromDigest: stable,
+						toDigest: options.candidateDigest,
+						proposalId: options.proposalId,
+						revision: options.revision,
+						diffDigest: options.diffDigest,
+						candidateDigest: options.candidateDigest,
+						reason: "Human explicitly bypassed Canary after reviewing the exact validated component",
 					});
 				}
 				history.push({
@@ -1144,6 +1186,86 @@ export class BundleRegistry {
 				}),
 			);
 			return trial;
+		});
+	}
+
+	async directKeepComponentTrial(options: {
+		proposalId: string;
+		reason: string;
+		idempotencyKey?: string;
+		expectedStateDigest?: string;
+	}): Promise<Proposal> {
+		return withFileLock(this.paths, "registry", async () => {
+			const requestKey = transitionRequestKey({
+				action: "direct-keep-trial",
+				proposalId: options.proposalId,
+				reason: options.reason,
+			});
+			const recovered = await this.recoverPendingUnlocked();
+			const receipt = await this.readMatchingReceipt(options.idempotencyKey, "direct-keep-trial", requestKey);
+			await this.assertExpectedOperationState(options.expectedStateDigest, options.idempotencyKey);
+			if (receipt) {
+				if (!receipt.proposalAfter) throw new Error("Direct keep receipt has no proposal after-image");
+				return receipt.proposalAfter;
+			}
+			if (
+				options.idempotencyKey === undefined &&
+				recovered?.action === "direct-keep-trial" &&
+				recovered.requestKey === requestKey
+			) {
+				if (!recovered.proposalAfter) throw new Error("Recovered direct keep has no proposal after-image");
+				return recovered.proposalAfter;
+			}
+			const trial = await this.readTrialUnlocked();
+			if (!trial || trial.proposalId !== options.proposalId) {
+				throw new Error("The requested component Canary is not active");
+			}
+			const stable = await this.readStableDigestUnlocked();
+			if (stable !== trial.digest) throw new Error("Component Canary and stable pointer disagree");
+			return this.withProposalLock(options.proposalId, async () => {
+				const proposal = await this.readProposal(options.proposalId);
+				if (
+					!proposal ||
+					proposal.status !== "trialing" ||
+					proposal.kind !== "data" ||
+					proposal.targetAbi === undefined ||
+					proposal.candidateDigest !== trial.digest
+				) {
+					throw new Error("Active trial is not a component proposal eligible for direct keep");
+				}
+				await assertRequiredApprovalArtifact(this.paths, proposal, "validation");
+				const proposalAfter: Proposal = { ...proposal, status: "kept" };
+				const paused = await this.readPausedUnlocked();
+				await this.executeTransitionUnlocked(
+					this.createTransition({
+						action: "direct-keep-trial",
+						requestKey,
+						operationId: options.idempotencyKey,
+						stableBefore: stable,
+						stableAfter: stable,
+						trialBefore: trial,
+						trialAfter: null,
+						pausedBefore: paused,
+						pausedAfter: paused,
+						proposalBefore: proposal,
+						proposalAfter,
+						history: [
+							{
+								action: "human-direct-keep",
+								actor: "human",
+								fromDigest: trial.parent,
+								toDigest: trial.digest,
+								proposalId: proposal.id,
+								revision: proposal.revision,
+								diffDigest: proposal.diffDigest,
+								candidateDigest: proposal.candidateDigest,
+								reason: options.reason,
+							},
+						],
+					}),
+				);
+				return proposalAfter;
+			});
 		});
 	}
 

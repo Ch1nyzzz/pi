@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { compileBundle } from "../src/bundle/compile.ts";
-import { approveCanaryRun } from "../src/cli.ts";
+import { approveCanaryRun, directKeepCanaryRun } from "../src/cli.ts";
 import { listEvoActivityItems } from "../src/evolve/activity.ts";
 import { runEvolutionCycle } from "../src/evolve/cycle.ts";
 import { EvolutionProcessInspector } from "../src/evolve/inspect-ui.ts";
@@ -35,10 +35,11 @@ class FakeRunner implements ModelRunner {
 		if (request.submission && normalized.submission === undefined) {
 			throw new Error(`Fake response is missing a ${request.submission.toolName} submission`);
 		}
-		const submission =
+		const validated =
 			request.submission && normalized.submission !== undefined
-				? (request.submission.validate?.(normalized.submission as Record<string, unknown>) ?? normalized.submission)
+				? await request.submission.validate?.(normalized.submission as Record<string, unknown>)
 				: undefined;
+		const submission = validated ?? normalized.submission;
 		return {
 			text: normalized.text ?? "",
 			...(submission !== undefined ? { submission } : {}),
@@ -264,6 +265,16 @@ describe("fixed evolution cycle", () => {
 		expect(runner.requests[3].prompt).toContain("Prefer design-first implementation.");
 		expect(runner.requests[3].systemPrompt).toContain("adversarial");
 		expect(result.proposals[0].artifacts.review?.file).toBe("revisions/1/review.md");
+
+		await updateEvolutionRun(f.paths, result.run.id, { status: "failed" });
+		const historicalActivity = await listEvoActivityItems(
+			{ paths: f.paths, service: f.service },
+			{ includeHistory: true },
+		);
+		expect(historicalActivity.map((item) => item.key)).toContain(`proposal:${result.proposals[0].id}`);
+		expect(historicalActivity.find((item) => item.key === `proposal:${result.proposals[0].id}`)?.text).toContain(
+			"等待处理",
+		);
 	});
 
 	it("materializes an existing-ABI component and waits for explicit Canary approval", async () => {
@@ -366,7 +377,7 @@ lines.on("line", line => {
 		});
 		expect(result.proposals[0].artifacts.replay).toBeUndefined();
 		const activity = await listEvoActivityItems({ paths: f.paths, service: f.service });
-		expect(activity[0]?.text).toBe("Evo: test-compaction · 等待 Canary 确认");
+		expect(activity[0]?.text).toBe("Evo: compaction/test · 等待发布确认 · [↓ 后 Enter 展开]");
 		expect(activity[0]?.text).not.toContain(result.run.id);
 		expect(activity[0]?.text).not.toContain(result.proposals[0].id);
 		expect(runner.requests).toHaveLength(4);
@@ -453,6 +464,7 @@ lines.on("line", line => {
 		const tui = { terminal: { rows: 200 }, requestRender: () => {} };
 		const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
 		let reviewedRun: string | undefined;
+		let reviewedDecision: unknown;
 		const inspector = new EvolutionProcessInspector(
 			tui as never,
 			theme as never,
@@ -460,8 +472,9 @@ lines.on("line", line => {
 			f.service,
 			`run:${retried.runId}`,
 			() => {},
-			async (runId) => {
+			async (runId, decision) => {
 				reviewedRun = runId;
+				reviewedDecision = decision;
 			},
 		);
 		await new Promise((resolve) => setTimeout(resolve, 20));
@@ -469,26 +482,112 @@ lines.on("line", line => {
 		expect(canaryCard).toContain("Exact diff");
 		expect(canaryCard).toContain("test-compaction");
 		expect(canaryCard).not.toContain(retried.proposal.id);
-		expect(canaryCard).toContain("按 Enter 同意以上精确候选");
+		expect(canaryCard).toContain("人工发布决策");
+		expect(canaryCard).toContain("直接上线，跳过 Canary");
 		inspector.handleInput("\r");
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(reviewedRun).toBe(retried.runId);
+		expect(reviewedDecision).toEqual({ mode: "canary", customization: "default" });
 		inspector.dispose();
+
+		let directDecision: unknown;
+		const directInspector = new EvolutionProcessInspector(
+			tui as never,
+			theme as never,
+			f.paths,
+			f.service,
+			`run:${retried.runId}`,
+			() => {},
+			async (_runId, decision) => {
+				directDecision = decision;
+			},
+		);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		directInspector.handleInput("\u001b[C");
+		directInspector.handleInput("\u001b[C");
+		directInspector.handleInput("\r");
+		expect(directInspector.render(160).join("\n")).toContain("直接上线将跳过所有 Canary 效果证据");
+		directInspector.handleInput("\r");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(directDecision).toEqual({ mode: "direct" });
+		directInspector.dispose();
 
 		await updateEvolutionRun(f.paths, retried.runId, { canaryCandidateDigest: "0".repeat(64) });
 		await expect(approveCanaryRun({ service: f.service, paths: f.paths }, retried.runId)).rejects.toThrow(
 			"Canary review metadata no longer matches",
 		);
 		await updateEvolutionRun(f.paths, retried.runId, { canaryCandidateDigest: retried.proposal.candidateDigest });
-		await approveCanaryRun({ service: f.service, paths: f.paths }, retried.runId);
-		expect(await f.service.registry.readTrial()).toMatchObject({ proposalId: retried.proposal.id });
+		await approveCanaryRun({ service: f.service, paths: f.paths }, retried.runId, {
+			mode: "canary",
+			customization: "custom",
+			minimumSamples: 4,
+			maximumDurationDays: 3,
+		});
+		expect(await f.service.registry.readTrial()).toMatchObject({
+			proposalId: retried.proposal.id,
+			canary: { customization: "custom", minimumSamples: 4, maximumDurationDays: 3 },
+		});
 		expect(await readEvolutionRun(f.paths, retried.runId)).toMatchObject({
 			status: "trialing",
 			canaryApprovalDigest: retried.proposal.approvalDigest,
 			canaryStableDigest: retried.proposal.parentBundleDigest,
+			componentApprovalMode: "custom-canary",
+			canaryMinimumSamples: 4,
+			canaryMaximumDurationDays: 3,
 		});
-		await f.service.rollback(undefined, "Finish Canary lifecycle test");
+		const customDeadline = () => new Date(Date.now() + 4 * 24 * 60 * 60 * 1000);
+		expect(
+			(await listEvoActivityItems({ paths: f.paths, service: f.service }, { now: customDeadline }))[0]?.text,
+		).toContain("comparison pending");
+		let keepRun: string | undefined;
+		const activeInspector = new EvolutionProcessInspector(
+			tui as never,
+			theme as never,
+			f.paths,
+			f.service,
+			`run:${retried.runId}`,
+			() => {},
+			async () => {},
+			async (runId) => {
+				keepRun = runId;
+			},
+		);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		expect(activeInspector.render(160).join("\n")).toContain("compaction/test");
+		activeInspector.handleInput("\r");
+		expect(activeInspector.render(160).join("\n")).toContain("立即正式上线将结束 Canary");
+		activeInspector.handleInput("\r");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(keepRun).toBe(retried.runId);
+		activeInspector.dispose();
+		await directKeepCanaryRun({ service: f.service, paths: f.paths }, retried.runId);
+		expect(await f.service.registry.readTrial()).toBeUndefined();
+		expect(await f.service.getProposal(retried.proposal.id)).toMatchObject({ status: "kept" });
+		expect(await readEvolutionRun(f.paths, retried.runId)).toMatchObject({
+			status: "completed",
+			componentApprovalMode: "direct",
+		});
+		await f.service.rollback(undefined, "Finish direct-kept Canary lifecycle test");
 		expect((await listEvolutionRuns(f.paths)).find((run) => run.id === retried.runId)?.status).toBe("completed");
+
+		const direct = await retryEvolutionFromValidation({
+			paths: f.paths,
+			sourceRunId: result.run.id,
+			cwd: f.root,
+			sandbox: false,
+		});
+		await approveCanaryRun({ service: f.service, paths: f.paths }, direct.runId, { mode: "direct" });
+		expect(await f.service.registry.readTrial()).toBeUndefined();
+		expect(await f.service.getProposal(direct.proposal.id)).toMatchObject({ status: "kept" });
+		expect(await readEvolutionRun(f.paths, direct.runId)).toMatchObject({
+			status: "completed",
+			componentApprovalMode: "direct",
+		});
+		const history = (await readFile(f.paths.history, "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as { action: string });
+		expect(history.some((entry) => entry.action === "human-direct-keep")).toBe(true);
 	});
 
 	it("resumes an awaiting-evidence run by executing the missing replay receipt", async () => {

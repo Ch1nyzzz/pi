@@ -166,6 +166,14 @@ function parseEvolutionRun(value: unknown): EvolutionRun {
 			(typeof run.canaryParentDigest !== "string" || !DIGEST_PATTERN.test(run.canaryParentDigest))) ||
 		(run.canaryTargetAbi !== undefined &&
 			(typeof run.canaryTargetAbi !== "string" || !/^[a-z][a-z0-9-]*\/v[1-9][0-9]*$/.test(run.canaryTargetAbi))) ||
+		(run.componentApprovalMode !== undefined &&
+			run.componentApprovalMode !== "direct" &&
+			run.componentApprovalMode !== "default-canary" &&
+			run.componentApprovalMode !== "custom-canary") ||
+		(run.canaryMinimumSamples !== undefined &&
+			(!Number.isSafeInteger(run.canaryMinimumSamples) || (run.canaryMinimumSamples as number) <= 0)) ||
+		(run.canaryMaximumDurationDays !== undefined &&
+			(!Number.isSafeInteger(run.canaryMaximumDurationDays) || (run.canaryMaximumDurationDays as number) <= 0)) ||
 		(run.experimentDigest !== undefined &&
 			(typeof run.experimentDigest !== "string" || !DIGEST_PATTERN.test(run.experimentDigest))) ||
 		(run.retryOfRunId !== undefined &&
@@ -206,6 +214,9 @@ export async function updateEvolutionRun(
 			| "canaryCandidateDigest"
 			| "canaryParentDigest"
 			| "canaryTargetAbi"
+			| "componentApprovalMode"
+			| "canaryMinimumSamples"
+			| "canaryMaximumDurationDays"
 			| "experimentDigest"
 			| "retryOfRunId"
 			| "sourceProposalId"

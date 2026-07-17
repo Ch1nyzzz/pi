@@ -89,6 +89,7 @@ function createHarness(cwd: string) {
 			getEntries: () => entries,
 		},
 		ui: {
+			theme: { fg: (_color: string, text: string) => text },
 			notify: (message: string, type?: string) => notifications.push({ message, type }),
 			setStatus: (key: string, text: string | undefined) => void statuses.push({ key, text }),
 			setStatusItems: (

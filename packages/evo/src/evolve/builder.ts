@@ -1,6 +1,13 @@
+import { join } from "node:path";
 import type { ThinkingLevel } from "@ch1nyzzz/pi-agent-core";
 import { Type } from "typebox";
 import { loadCompiledBundle } from "../bundle/compile.ts";
+import {
+	type CodeBuilderSnapshot,
+	createCodeBuilderWorkspace,
+	removeCodeBuilderWorkspace,
+	snapshotCodeBuilderWorkspace,
+} from "../code/worktree.ts";
 import { publishEvoComponentArtifact } from "../components/artifact.ts";
 import { createDefaultEvoAbiRegistry } from "../components/registry.ts";
 import type { EvoPaths } from "../paths.ts";
@@ -8,7 +15,7 @@ import { type DraftProposal, parseReflectorOutputValue, type ReflectorOutput } f
 import type { EvidenceCorpus } from "../reflect/evidence.ts";
 import type { ModelRunner, ModelRunRequest, ModelRunResult } from "../reflect/model-runner.ts";
 import { recordModelUsage } from "../reflect/usage.ts";
-import { canonicalJson } from "../storage.ts";
+import { atomicWriteFile, canonicalJson } from "../storage.ts";
 import type { EvolutionResearchPlan } from "../types.ts";
 import { readEvolutionWorkflow } from "./config.ts";
 import type { MaterializedCorpus } from "./research-corpus.ts";
@@ -20,6 +27,7 @@ import {
 
 export interface RunEvolutionBuilderOptions {
 	paths: EvoPaths;
+	runId: string;
 	plan: EvolutionResearchPlan;
 	parentDigest: string;
 	corpus: EvidenceCorpus;
@@ -40,6 +48,7 @@ export interface EvolutionBuilderResult {
 	draft: DraftProposal;
 	observationsMarkdown: string;
 	run: ModelRunResult;
+	codeBase?: Pick<CodeBuilderSnapshot, "repositoryRoot" | "repositoryIdentity" | "baseCommit">;
 }
 
 const MAX_UNKNOWN_ABI_OBSERVATIONS_BYTES = 16 * 1024;
@@ -248,7 +257,9 @@ export async function runEvolutionBuilder(options: RunEvolutionBuilderOptions): 
 	const outputInstruction =
 		options.plan.candidateKind === "component"
 			? "Deliver the candidate by calling the submit_candidate tool with observationsMarkdown, observationEvidence, proposal metadata, and component { id, version, capabilities, config, entrypointContent }. The .mjs entrypoint must implement Evo-Pi's line-delimited process protocol: read {id,method,payload} from stdin and answer {id,ok,result|error}. The proposal contains motivation, expectedEffect, risk, verifyPlan, trialPlan, source, evidence, inboxReferences, and replayScenarios but no changes or codePatch."
-			: "Deliver the candidate by calling the submit_candidate tool with observationsMarkdown, observationEvidence, and exactly one entry in proposals. The proposal must include motivation, expectedEffect, risk, verifyPlan, trialPlan, source, evidence, inboxReferences, replayScenarios, and either complete data changes or a unified codePatch.";
+			: options.plan.candidateKind === "code"
+				? "Implement the candidate by editing files in the isolated Builder worktree. Then call submit_candidate with observationsMarkdown, observationEvidence, and exactly one proposal containing metadata only. Do not include changes or codePatch; the host generates the patch from the worktree with Git."
+				: "Deliver the candidate by calling the submit_candidate tool with observationsMarkdown, observationEvidence, and exactly one entry in proposals. The proposal must include motivation, expectedEffect, risk, verifyPlan, trialPlan, source, evidence, inboxReferences, replayScenarios, and complete data changes.";
 	const prompt = [
 		"Implement the frozen Evo-Pi plan as one narrow candidate.",
 		outputInstruction,
@@ -284,24 +295,35 @@ export async function runEvolutionBuilder(options: RunEvolutionBuilderOptions): 
 					"</evidence_corpus>",
 				]),
 	].join("\n");
+	const codeWorkspace =
+		options.plan.candidateKind === "code"
+			? await createCodeBuilderWorkspace({
+					paths: options.paths,
+					repositoryCwd: options.cwd,
+					runId: options.runId,
+					...(options.signal ? { signal: options.signal } : {}),
+				})
+			: undefined;
+	let submittedCodeSnapshot: CodeBuilderSnapshot | undefined;
 	const modelRun = await options.runner.run({
-		cwd: options.cwd,
+		cwd: codeWorkspace?.worktreePath ?? options.cwd,
 		...(options.agentDir ? { agentDir: options.agentDir } : {}),
 		systemPrompt:
 			"You are Evo-Pi's Builder. Implement the saved plan, but never approve, activate, or alter its experiment and evaluation rules.",
 		prompt,
 		model: options.model,
 		...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
-		// Read-only repository inspection keeps implementation generation from mutating
-		// the caller's worktree. The returned patch is staged in Evo's isolated worktree.
-		tools: ["read", "grep", "find", "ls"],
+		tools:
+			options.plan.candidateKind === "code"
+				? ["read", "grep", "find", "ls", "edit", "write"]
+				: ["read", "grep", "find", "ls"],
 		...(options.sessionIdentity ? { sessionIdentity: options.sessionIdentity } : {}),
 		...(options.signal ? { signal: options.signal } : {}),
 		submission: {
 			toolName: "submit_candidate",
 			description: "Deliver the implemented candidate. Validation errors are returned for correction.",
 			parameters: BUILDER_PARAMETERS,
-			validate: (params) => {
+			validate: async (params) => {
 				if (options.plan.candidateKind === "component") {
 					if (!isRecord(params.component)) throw new Error("Component Builder output must contain component");
 					if (!isRecord(params.proposal)) throw new Error("Component Builder output must contain proposal");
@@ -313,8 +335,15 @@ export async function runEvolutionBuilder(options: RunEvolutionBuilderOptions): 
 				if (options.plan.candidateKind === "data" && candidate.changes === undefined) {
 					throw new Error("Builder returned code for a data plan");
 				}
-				if (options.plan.candidateKind === "code" && candidate.codePatch === undefined) {
-					throw new Error("Builder returned data for a code plan");
+				if (options.plan.candidateKind === "code") {
+					if (candidate.codePatch !== undefined || candidate.changes !== undefined) {
+						throw new Error("Code Builder must edit its isolated worktree instead of submitting patch text");
+					}
+					if (!codeWorkspace) throw new Error("Code Builder workspace is unavailable");
+					submittedCodeSnapshot = await snapshotCodeBuilderWorkspace({
+						workspace: codeWorkspace,
+						parentBundleDigest: options.parentDigest,
+					});
 				}
 				return output;
 			},
@@ -332,8 +361,21 @@ export async function runEvolutionBuilder(options: RunEvolutionBuilderOptions): 
 	}
 	const output = modelRun.submission as ReflectorOutput;
 	const candidate = output.proposals[0];
+	let codeSnapshot: CodeBuilderSnapshot | undefined;
+	if (codeWorkspace) {
+		codeSnapshot = await snapshotCodeBuilderWorkspace({
+			workspace: codeWorkspace,
+			parentBundleDigest: options.parentDigest,
+		});
+		if (submittedCodeSnapshot?.patch !== codeSnapshot.patch) {
+			throw new Error("Code Builder modified its worktree after submitting the candidate");
+		}
+		await atomicWriteFile(join(options.paths.runs, options.runId, "candidate.patch"), codeSnapshot.patch);
+		await removeCodeBuilderWorkspace(codeWorkspace);
+	}
 	const draft: DraftProposal = {
 		...candidate,
+		...(codeSnapshot ? { codePatch: codeSnapshot.patch } : {}),
 		...(options.plan.targetAbi ? { targetAbi: options.plan.targetAbi } : {}),
 		requiresNewAbi: options.plan.requiresNewAbi,
 		trialPlan: options.plan.experiment.trialPlan,
@@ -342,7 +384,20 @@ export async function runEvolutionBuilder(options: RunEvolutionBuilderOptions): 
 			`Frozen check profiles: ${options.plan.experiment.checkProfiles.join(", ") || "none"}.`,
 		].join("\n"),
 	};
-	return { draft, observationsMarkdown: output.observationsMarkdown, run: modelRun };
+	return {
+		draft,
+		observationsMarkdown: output.observationsMarkdown,
+		run: modelRun,
+		...(codeSnapshot
+			? {
+					codeBase: {
+						repositoryRoot: codeSnapshot.repositoryRoot,
+						repositoryIdentity: codeSnapshot.repositoryIdentity,
+						baseCommit: codeSnapshot.baseCommit,
+					},
+				}
+			: {}),
+	};
 }
 
 export async function runUnknownAbiBuilder(options: RunUnknownAbiBuilderOptions): Promise<UnknownAbiBuilderResult> {

@@ -15,9 +15,12 @@ import {
 	type CodeValidationExecutor,
 	CodeWorktreeIntegrityError,
 	codeApprovalDigest,
+	createCodeBuilderWorkspace,
 	DefaultSandboxCodeValidationExecutor,
 	loadCodeWorktreeRevision,
+	removeCodeBuilderWorkspace,
 	revalidateCodeWorktree,
+	snapshotCodeBuilderWorkspace,
 	stageCodeWorktree,
 } from "../src/code/worktree.ts";
 import { getEvoPaths } from "../src/paths.ts";
@@ -134,6 +137,69 @@ describe("code proposal worktrees", () => {
 
 	afterEach(async () => {
 		await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+	});
+
+	it("generates a valid patch from edits in an isolated Builder worktree", async () => {
+		const fixture = await createFixture();
+		roots.push(fixture.root);
+		const mainStatusBefore = git(fixture.repository, ["status", "--short"]);
+		const workspace = await createCodeBuilderWorkspace({
+			paths: fixture.paths,
+			repositoryCwd: fixture.repository,
+			runId: "r-builder-patch",
+		});
+
+		await writeFile(join(workspace.worktreePath, "src", "value.ts"), "export const value = 2;\n");
+		await writeFile(join(workspace.worktreePath, "src", "added.ts"), "export const added = true;\n");
+		const snapshot = await snapshotCodeBuilderWorkspace({
+			workspace,
+			parentBundleDigest: PARENT_BUNDLE_DIGEST,
+		});
+
+		expect(snapshot.changedPaths).toEqual(["src/added.ts", "src/value.ts"]);
+		expect(snapshot.patch).toContain("diff --git a/src/added.ts b/src/added.ts");
+		expect(snapshot.patch).toContain("export const value = 2;");
+		const patchFile = join(fixture.root, "builder.patch");
+		await writeFile(patchFile, snapshot.patch);
+		expect(git(fixture.repository, ["apply", "--check", patchFile])).toBe("");
+		expect(git(fixture.repository, ["status", "--short"])).toBe(mainStatusBefore);
+
+		await removeCodeBuilderWorkspace(workspace);
+		await expect(readFile(workspace.worktreePath)).rejects.toThrow();
+	});
+
+	it("rejects proposal staging when the repository moves after the Builder snapshot", async () => {
+		const fixture = await createFixture();
+		roots.push(fixture.root);
+		const workspace = await createCodeBuilderWorkspace({
+			paths: fixture.paths,
+			repositoryCwd: fixture.repository,
+			runId: "r-builder-drift",
+		});
+		await writeFile(join(workspace.worktreePath, "src", "value.ts"), "export const value = 2;\n");
+		const snapshot = await snapshotCodeBuilderWorkspace({
+			workspace,
+			parentBundleDigest: PARENT_BUNDLE_DIGEST,
+		});
+		await removeCodeBuilderWorkspace(workspace);
+		await writeFile(join(fixture.repository, "src", "other.ts"), "export {};\n");
+		git(fixture.repository, ["add", "src/other.ts"]);
+		git(fixture.repository, ["commit", "--quiet", "-m", "move head"]);
+
+		await expect(
+			stageCodeWorktree({
+				paths: fixture.paths,
+				parentBundleDigest: PARENT_BUNDLE_DIGEST,
+				repositoryCwd: fixture.repository,
+				proposalId: "p-builder-drift",
+				revision: 1,
+				patch: snapshot.patch,
+				expectedRepositoryRoot: snapshot.repositoryRoot,
+				expectedRepositoryIdentity: snapshot.repositoryIdentity,
+				expectedBaseCommit: snapshot.baseCommit,
+				validationExecutor: new FakeValidationExecutor(),
+			}),
+		).rejects.toThrow("Repository HEAD changed after Builder snapshot");
 	});
 
 	it("binds code approval to the parent bundle", () => {

@@ -41,7 +41,7 @@ export interface ModelRunSubmission {
 	 * (the model sees the message and can retry). A non-undefined return value
 	 * replaces the stored submission.
 	 */
-	validate?: (params: Record<string, unknown>) => unknown;
+	validate?: (params: Record<string, unknown>) => unknown | Promise<unknown>;
 	/** Reprompts when a run ends without a submission. Default 2; 0 disables reprompting. */
 	maxAttempts?: number;
 }
@@ -150,7 +150,7 @@ export function createPiModelRunner(options: PiModelRunnerOptions = {}): ModelRu
 						description: request.submission.description,
 						parameters: request.submission.parameters,
 						async execute(_toolCallId, params) {
-							const validated = request.submission?.validate?.(params as Record<string, unknown>);
+							const validated = await request.submission?.validate?.(params as Record<string, unknown>);
 							submitted = { value: validated === undefined ? params : validated };
 							return { content: [{ type: "text", text: "Submission accepted." }], details: {} };
 						},

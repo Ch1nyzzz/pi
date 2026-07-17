@@ -37,9 +37,9 @@ import { createRecorderStore, readSessionLog, resolveStoredPayload, type StoredI
 import { collectEvidenceCorpus } from "./reflect/evidence.ts";
 import { BundleRegistry, type BundleRegistryOptions } from "./registry/registry.ts";
 import { atomicWriteJson, canonicalJson, durableUnlink, readJsonIfExists, sha256, withFileLock } from "./storage.ts";
-import type { CompiledBundle, EvoStatus, Proposal, ProposalApproval } from "./types.ts";
+import type { CompiledBundle, DataApprovalActivation, EvoStatus, Proposal, ProposalApproval } from "./types.ts";
 
-type ServiceIntentAction = "approve" | "reject" | "defer" | "reopen" | "keep" | "rollback";
+type ServiceIntentAction = "approve" | "reject" | "defer" | "reopen" | "keep" | "direct-keep" | "rollback";
 
 interface ServiceIntent {
 	schemaVersion: 2;
@@ -291,6 +291,35 @@ export class EvoService {
 		return proposal;
 	}
 
+	async approveComponent(
+		id: string,
+		expected: ProposalApproval,
+		activation: DataApprovalActivation,
+	): Promise<Proposal> {
+		const proposal = await this.withIntent(
+			"approve",
+			{ id, expected, activation },
+			(idempotencyKey, expectedStateDigest) =>
+				approveProposal(
+					this.paths,
+					id,
+					expected,
+					undefined,
+					this.registry,
+					idempotencyKey,
+					expectedStateDigest,
+					activation,
+				),
+		);
+		if (proposal.status === "kept") {
+			await settleProposalInbox(this.paths, proposal);
+			await garbageCollectInbox(this.paths);
+		} else {
+			await linkProposalInbox(this.paths, proposal);
+		}
+		return proposal;
+	}
+
 	async reject(id: string, reason: string): Promise<Proposal> {
 		const proposal = await this.withIntent("reject", { id, reason }, (idempotencyKey, expectedStateDigest) =>
 			rejectProposal(this.paths, id, reason, this.registry, idempotencyKey, expectedStateDigest),
@@ -336,6 +365,23 @@ export class EvoService {
 				return { from, to };
 			},
 		);
+	}
+
+	async directKeepComponentTrial(proposalId: string, reason: string): Promise<Proposal> {
+		const proposal = await this.withIntent(
+			"direct-keep",
+			{ proposalId, reason },
+			(idempotencyKey, expectedStateDigest) =>
+				this.registry.directKeepComponentTrial({
+					proposalId,
+					reason,
+					idempotencyKey,
+					expectedStateDigest,
+				}),
+		);
+		await settleProposalInbox(this.paths, proposal);
+		await garbageCollectInbox(this.paths);
+		return proposal;
 	}
 
 	async keep(reason: string): Promise<Proposal> {

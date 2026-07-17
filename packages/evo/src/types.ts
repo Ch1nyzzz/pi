@@ -210,13 +210,32 @@ export interface Proposal {
 	artifacts: ProposalArtifacts;
 }
 
+export interface CanaryTrialControl {
+	customization: "default" | "custom";
+	minimumSamples: number;
+	maximumDurationDays: number;
+}
+
 export interface TrialState {
 	digest: string;
 	parent: string;
 	proposalId: string;
 	startedAt: string;
 	plan: string;
+	canary?: CanaryTrialControl;
 }
+
+export type ComponentApprovalDecision =
+	| { mode: "direct" }
+	| { mode: "canary"; customization: "default" }
+	| {
+			mode: "canary";
+			customization: "custom";
+			minimumSamples: number;
+			maximumDurationDays: number;
+	  };
+
+export type DataApprovalActivation = { mode: "direct" } | { mode: "trial"; canary?: CanaryTrialControl };
 
 export type HistoryAction =
 	| "initialize"
@@ -225,6 +244,7 @@ export type HistoryAction =
 	| "proposal-deferred"
 	| "proposal-reopened"
 	| "trial-start"
+	| "human-direct-keep"
 	| "trial-keep"
 	| "rollback"
 	| "pause"
@@ -383,6 +403,9 @@ export interface EvolutionRun {
 	canaryCandidateDigest?: string;
 	canaryParentDigest?: string;
 	canaryTargetAbi?: string;
+	componentApprovalMode?: "direct" | "default-canary" | "custom-canary";
+	canaryMinimumSamples?: number;
+	canaryMaximumDurationDays?: number;
 	experimentDigest?: string;
 	retryOfRunId?: string;
 	sourceProposalId?: string;

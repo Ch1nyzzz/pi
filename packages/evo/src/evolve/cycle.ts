@@ -193,6 +193,7 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 		await updateEvolutionRun(options.paths, run.id, { status: "building" });
 		const built = await runEvolutionBuilder({
 			paths: options.paths,
+			runId: run.id,
 			plan: research.plan,
 			parentDigest: stable,
 			corpus,
@@ -217,6 +218,7 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 			draft: groundedDraft,
 			observationsMarkdown: built.observationsMarkdown,
 			repositoryCwd: cwd,
+			...(built.codeBase ? { expectedCodeBase: built.codeBase } : {}),
 			...(options.codeValidationExecutor ? { codeValidationExecutor: options.codeValidationExecutor } : {}),
 			...(options.signal ? { signal: options.signal } : {}),
 		});

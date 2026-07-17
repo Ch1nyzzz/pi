@@ -143,10 +143,12 @@ export function createEvoAutoImproveExtension(options: EvoAutoImproveExtensionOp
 							online && online.mode !== "none" ? parseTrialDurationDays(online.maximumDuration) : undefined;
 						const contractSamples = online && online.mode !== "none" ? online.minimumSamples : 0;
 						const dueAfterDays =
-							contractDays === undefined
+							status.trial.canary?.maximumDurationDays ??
+							(contractDays === undefined
 								? schedule.trialDueAfterDays
-								: Math.min(schedule.trialDueAfterDays, contractDays);
-						const dueAfterSessions = Math.max(schedule.trialDueAfterSessions, contractSamples);
+								: Math.min(schedule.trialDueAfterDays, contractDays));
+						const dueAfterSessions =
+							status.trial.canary?.minimumSamples ?? Math.max(schedule.trialDueAfterSessions, contractSamples);
 						const dueAt = Date.parse(status.trial.startedAt) + dueAfterDays * 24 * 60 * 60 * 1_000;
 						const due = now().getTime() >= dueAt || comparison.after.totals.sessions >= dueAfterSessions;
 						if (due) {

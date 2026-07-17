@@ -95,6 +95,22 @@ export interface CodeWorktreeRevision {
 
 type PersistedCodeWorktreeRevision = Omit<CodeWorktreeRevision, "diff">;
 
+export interface CodeBuilderWorkspace {
+	runId: string;
+	repositoryRoot: string;
+	repositoryIdentity: string;
+	baseCommit: string;
+	worktreePath: string;
+}
+
+export interface CodeBuilderSnapshot {
+	patch: string;
+	changedPaths: string[];
+	repositoryRoot: string;
+	repositoryIdentity: string;
+	baseCommit: string;
+}
+
 export interface StageCodeWorktreeOptions {
 	paths: EvoPaths;
 	repositoryCwd: string;
@@ -102,6 +118,9 @@ export interface StageCodeWorktreeOptions {
 	revision: number;
 	parentBundleDigest: string;
 	patch: string;
+	expectedRepositoryRoot?: string;
+	expectedRepositoryIdentity?: string;
+	expectedBaseCommit?: string;
 	commandRunner?: CommandRunner;
 	validationExecutor?: CodeValidationExecutor;
 	signal?: AbortSignal;
@@ -800,6 +819,109 @@ async function removeEmptyRevisionParents(paths: ReturnType<typeof revisionPaths
 	}
 }
 
+function builderWorktreePath(paths: EvoPaths, runId: string): string {
+	if (!PROPOSAL_ID_PATTERN.test(runId)) throw new Error(`Invalid evolution run id: ${runId}`);
+	return join(paths.worktrees, "builders", runId);
+}
+
+export async function createCodeBuilderWorkspace(options: {
+	paths: EvoPaths;
+	repositoryCwd: string;
+	runId: string;
+	commandRunner?: CommandRunner;
+	signal?: AbortSignal;
+}): Promise<CodeBuilderWorkspace> {
+	const runner = options.commandRunner ?? new SpawnCommandRunner();
+	const repository = await inspectRepository(runner, options.repositoryCwd);
+	const worktreePath = builderWorktreePath(options.paths, options.runId);
+	options.signal?.throwIfAborted();
+	await mkdir(dirname(worktreePath), { recursive: true, mode: 0o700 });
+	await runGit(
+		runner,
+		repository.root,
+		["worktree", "add", "--detach", worktreePath, repository.baseCommit],
+		"Create isolated Builder worktree",
+	);
+	return {
+		runId: options.runId,
+		repositoryRoot: repository.root,
+		repositoryIdentity: repository.identity,
+		baseCommit: repository.baseCommit,
+		worktreePath,
+	};
+}
+
+export async function snapshotCodeBuilderWorkspace(options: {
+	workspace: CodeBuilderWorkspace;
+	parentBundleDigest: string;
+	commandRunner?: CommandRunner;
+}): Promise<CodeBuilderSnapshot> {
+	assertBundleDigest(options.parentBundleDigest);
+	const runner = options.commandRunner ?? new SpawnCommandRunner();
+	const identity = await repositoryIdentity(runner, options.workspace.worktreePath);
+	if (identity !== options.workspace.repositoryIdentity) {
+		throw new CodeWorktreeIntegrityError("Builder worktree repository identity changed");
+	}
+	const head = (
+		await runGit(
+			runner,
+			options.workspace.worktreePath,
+			["rev-parse", "--verify", "HEAD^{commit}"],
+			"Verify Builder base",
+		)
+	).stdout.trim();
+	if (head !== options.workspace.baseCommit) {
+		throw new CodeWorktreeIntegrityError("Builder worktree base commit changed");
+	}
+	const [tracked, untracked] = await Promise.all([
+		runGit(
+			runner,
+			options.workspace.worktreePath,
+			["diff", "--name-only", "-z", "HEAD", "--"],
+			"List Builder tracked changes",
+		),
+		runGit(
+			runner,
+			options.workspace.worktreePath,
+			["ls-files", "--others", "--exclude-standard", "-z"],
+			"List Builder untracked changes",
+		),
+	]);
+	const changedPaths = [...new Set([...tracked.stdout.split("\0"), ...untracked.stdout.split("\0")].filter(Boolean))];
+	if (changedPaths.length === 0) throw new Error("Builder did not modify its isolated worktree");
+	for (const path of changedPaths) assertSafeChangedPath(path);
+	await runGit(runner, options.workspace.worktreePath, ["add", "--all", "--"], "Stage Builder candidate");
+	const snapshot = await inspectCandidate(
+		runner,
+		options.workspace.worktreePath,
+		options.workspace.repositoryRoot,
+		options.workspace.repositoryIdentity,
+		options.workspace.baseCommit,
+		options.parentBundleDigest,
+	);
+	await assertNoUnstagedChanges(runner, options.workspace.worktreePath);
+	return {
+		patch: snapshot.diff,
+		changedPaths: snapshot.changedPaths,
+		repositoryRoot: options.workspace.repositoryRoot,
+		repositoryIdentity: options.workspace.repositoryIdentity,
+		baseCommit: options.workspace.baseCommit,
+	};
+}
+
+export async function removeCodeBuilderWorkspace(
+	workspace: CodeBuilderWorkspace,
+	commandRunner: CommandRunner = new SpawnCommandRunner(),
+): Promise<void> {
+	await runGit(
+		commandRunner,
+		workspace.repositoryRoot,
+		["worktree", "remove", "--force", "--", workspace.worktreePath],
+		"Remove isolated Builder worktree",
+	);
+	await rmdir(dirname(workspace.worktreePath)).catch(() => undefined);
+}
+
 async function cleanupFailedRevision(
 	runner: CommandRunner,
 	repositoryRoot: string,
@@ -835,6 +957,15 @@ export async function stageCodeWorktree(options: StageCodeWorktreeOptions): Prom
 		`code-${options.proposalId}-r${options.revision}`,
 		async () => {
 			const repository = await inspectRepository(runner, options.repositoryCwd);
+			if (options.expectedRepositoryRoot && repository.root !== options.expectedRepositoryRoot) {
+				throw new CodeWorktreeIntegrityError("Repository root changed after Builder snapshot");
+			}
+			if (options.expectedRepositoryIdentity && repository.identity !== options.expectedRepositoryIdentity) {
+				throw new CodeWorktreeIntegrityError("Repository identity changed after Builder snapshot");
+			}
+			if (options.expectedBaseCommit && repository.baseCommit !== options.expectedBaseCommit) {
+				throw new CodeWorktreeIntegrityError("Repository HEAD changed after Builder snapshot");
+			}
 			let revisionDirectoryCreated = false;
 			let branchCreated = false;
 			let worktreeAddAttempted = false;

@@ -2,10 +2,11 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Theme } from "@ch1nyzzz/pi-coding-agent";
 import { type Component, Key, matchesKey, type TUI, wrapTextWithAnsi } from "@ch1nyzzz/pi-tui";
+import { buildTrialComparison, type TrialComparison } from "../comparison.ts";
 import type { EvoPaths } from "../paths.ts";
 import { loadProposal } from "../proposal.ts";
 import type { EvoService } from "../service.ts";
-import type { EvolutionRun, EvolutionRunStatus, Proposal } from "../types.ts";
+import type { ComponentApprovalDecision, EvolutionRun, EvolutionRunStatus, Proposal, TrialState } from "../types.ts";
 import { type EvoActivityItem, listEvoActivityItems } from "./activity.ts";
 import { evolutionRunDirectory, readEvolutionRun } from "./run.ts";
 
@@ -191,9 +192,22 @@ export class EvolutionProcessInspector implements Component {
 	private readonly paths: EvoPaths;
 	private readonly service: EvoService;
 	private readonly close: () => void;
-	private readonly approveCanary: (runId: string) => Promise<void>;
+	private readonly approveCanary: (runId: string, decision: ComponentApprovalDecision) => Promise<void>;
+	private readonly directKeepCanary: (runId: string) => Promise<void>;
 	private approving = false;
 	private approvalError?: string;
+	private approvalView: "choice" | "custom" | "direct-confirm" = "choice";
+	private approvalChoice = 0;
+	private customField = 0;
+	private customMinimumSamples = 10;
+	private customMaximumDurationDays = 7;
+	private customDefaultsInitialized = false;
+	private trial?: TrialState;
+	private trialComparison?: TrialComparison;
+	private nextTrialComparisonRefresh = 0;
+	private keepConfirming = false;
+	private keeping = false;
+	private keepError?: string;
 	private itemKey?: string;
 
 	constructor(
@@ -203,7 +217,10 @@ export class EvolutionProcessInspector implements Component {
 		service: EvoService,
 		itemKey: string | undefined,
 		close: () => void,
-		approveCanary: (runId: string) => Promise<void>,
+		approveCanary: (runId: string, decision: ComponentApprovalDecision) => Promise<void>,
+		directKeepCanary: (runId: string) => Promise<void> = async () => {
+			throw new Error("Direct keep is unavailable");
+		},
 	) {
 		this.tui = tui;
 		this.theme = theme;
@@ -212,6 +229,7 @@ export class EvolutionProcessInspector implements Component {
 		this.itemKey = itemKey;
 		this.close = close;
 		this.approveCanary = approveCanary;
+		this.directKeepCanary = directKeepCanary;
 		this.mode = itemKey ? "run" : "tasks";
 		void this.refresh();
 		this.timer = setInterval(() => void this.refresh(), 250);
@@ -233,6 +251,8 @@ export class EvolutionProcessInspector implements Component {
 					this.proposal = this.item.proposal;
 					this.events = [];
 					this.artifacts = {};
+					this.trial = undefined;
+					this.trialComparison = undefined;
 				} else {
 					this.run = await readEvolutionRun(this.paths, this.item.run.id);
 					const directory = evolutionRunDirectory(this.paths, this.run.id);
@@ -256,6 +276,12 @@ export class EvolutionProcessInspector implements Component {
 							join(this.paths.proposals, this.proposal.id, this.proposal.artifacts.review.file),
 						);
 					}
+					const status = await this.service.status();
+					this.trial = status.trial?.proposalId === this.proposal?.id ? status.trial : undefined;
+					if (this.trial && this.proposal && Date.now() >= this.nextTrialComparisonRefresh) {
+						this.trialComparison = await buildTrialComparison(this.paths, this.proposal, this.trial);
+						this.nextTrialComparisonRefresh = Date.now() + 5_000;
+					} else if (!this.trial) this.trialComparison = undefined;
 				}
 			}
 			this.tui.requestRender();
@@ -302,6 +328,62 @@ export class EvolutionProcessInspector implements Component {
 		return `${marker} ${expanded} ${this.theme.bold(SECTION_NAMES[index] ?? "详情")}  ${this.theme.fg("muted", summary)}`;
 	}
 
+	private initializeCustomCanaryDefaults(): void {
+		if (this.customDefaultsInitialized) return;
+		try {
+			const experiment = JSON.parse(this.artifacts.experiment ?? "null") as {
+				evidenceStrategy?: { online?: { mode?: string; minimumSamples?: number; maximumDuration?: string } };
+			};
+			const online = experiment.evidenceStrategy?.online;
+			if (online?.mode === "canary") {
+				if (Number.isSafeInteger(online.minimumSamples) && (online.minimumSamples ?? 0) > 0) {
+					this.customMinimumSamples = online.minimumSamples ?? this.customMinimumSamples;
+				}
+				const days = /^([1-9]\d*)d$/.exec(online.maximumDuration ?? "");
+				if (days) this.customMaximumDurationDays = Number(days[1]);
+			}
+		} catch {
+			// The exact experiment remains visible; malformed display defaults do not enable approval.
+		}
+		this.customDefaultsInitialized = true;
+	}
+
+	private approvalControlLines(metadataMatches: boolean, directAvailable: boolean): string[] {
+		if (!metadataMatches) return [this.theme.fg("error", "审批已禁用：运行记录与当前提案不一致")];
+		if (this.approving) return [this.theme.fg("accent", "正在应用人工发布决策……")];
+		if (this.approvalView === "direct-confirm") {
+			return [
+				this.theme.fg("warning", this.theme.bold("直接上线将跳过所有 Canary 效果证据。")),
+				"候选会立即成为 stable；其 parent 仍可通过 /evo rollback 恢复。",
+				this.theme.fg("accent", "再次按 Enter 确认直接上线；Esc 返回选择"),
+			];
+		}
+		if (this.approvalView === "custom") {
+			const rows = [
+				`最少 candidate sessions：${this.customMinimumSamples}`,
+				`最长持续时间：${this.customMaximumDurationDays} 天`,
+				"以以上参数启动 Canary",
+			];
+			return [
+				this.theme.bold("自定义 Canary"),
+				...rows.map((row, index) => `${index === this.customField ? this.theme.fg("accent", "›") : " "} ${row}`),
+				this.theme.fg("dim", "↑↓ 选择 • ←→ 调整 • Enter 启动 • Esc 返回"),
+			];
+		}
+		const choices = [
+			"按冻结计划和本地默认值启动 Canary",
+			"自定义 Canary 样本数与最长时间",
+			directAvailable ? "直接上线，跳过 Canary" : "直接上线不可用：缺少可执行 validation artifact",
+		];
+		return [
+			this.theme.bold("人工发布决策"),
+			...choices.map(
+				(choice, index) => `${index === this.approvalChoice ? this.theme.fg("accent", "›") : " "} ${choice}`,
+			),
+			this.theme.fg("dim", "←→ 选择 • Enter 确认 • ↑↓ 滚动 • Home/End 跳转 • Esc 返回任务列表"),
+		];
+	}
+
 	private canaryLines(run: EvolutionRun): string[] {
 		const proposal = this.proposal;
 		const metadataMatches =
@@ -310,6 +392,7 @@ export class EvolutionProcessInspector implements Component {
 			proposal.parentBundleDigest === run.canaryParentDigest &&
 			proposal.candidateDigest === run.canaryCandidateDigest &&
 			proposal.targetAbi === run.canaryTargetAbi;
+		this.initializeCustomCanaryDefaults();
 		const evaluation = this.artifacts.evaluation?.trim() ?? "没有评估报告";
 		const validation = this.artifacts.validation?.trim() ?? "没有可执行验证报告";
 		const diff = proposal?.diff.trim() ?? "没有可审阅 diff";
@@ -339,13 +422,55 @@ export class EvolutionProcessInspector implements Component {
 			...diff.split("\n"),
 			"",
 			...(this.approvalError ? [this.theme.fg("error", this.approvalError), ""] : []),
-			metadataMatches
-				? this.theme.fg(
-						"accent",
-						this.approving ? "正在启动 Canary……" : "按 Enter 同意以上精确候选并启动可回滚 Canary",
-					)
-				: this.theme.fg("error", "审批已禁用：运行记录与当前提案不一致"),
-			this.theme.fg("dim", "↑↓ 滚动 • Home/End 跳转 • Enter 审批 • Esc 返回任务列表"),
+			...this.approvalControlLines(metadataMatches, proposal?.artifacts.validation !== undefined),
+		];
+	}
+
+	private activeCanaryLines(): string[] {
+		const proposal = this.proposal;
+		const trial = this.trial;
+		const comparison = this.trialComparison;
+		const component = this.item?.component ?? "unknown";
+		const surface = proposal?.targetAbi?.split("/", 1)[0] ?? "component";
+		const shortComponent = component.endsWith(`-${surface}`) ? component.slice(0, -surface.length - 1) : component;
+		const minimumSamples = trial?.canary?.minimumSamples;
+		const currentSamples = comparison?.after.totals.sessions;
+		const duration = trial?.canary?.maximumDurationDays;
+		const progress =
+			minimumSamples === undefined || currentSamples === undefined
+				? "等待 session evidence"
+				: `${currentSamples}/${minimumSamples} candidate sessions`;
+		const decision = this.keepConfirming
+			? [
+					this.theme.fg("warning", this.theme.bold("立即正式上线将结束 Canary，不再等待剩余效果证据。")),
+					"当前 candidate 保持为 stable；parent 仍可通过 /evo rollback 恢复。",
+					this.theme.fg("accent", "再次按 Enter 确认正式上线；Esc 取消"),
+				]
+			: [
+					this.theme.fg("accent", "按 Enter 选择立即正式上线（随后需要二次确认）"),
+					this.theme.fg("dim", "Esc 返回事项列表 • /evo rollback 可立即回滚"),
+				];
+		return [
+			this.theme.fg("accent", this.theme.bold("Evo Component Canary")),
+			"",
+			`${this.theme.bold("Component")}  ${surface}/${shortComponent}`,
+			`${this.theme.bold("进度")}  ${progress}${duration === undefined ? "" : ` · 最长 ${duration} 天`}`,
+			`${this.theme.bold("模式")}  ${trial?.canary?.customization === "custom" ? "自定义 Canary" : "默认 Canary"}`,
+			"",
+			this.theme.fg("warning", this.theme.bold("风险")),
+			proposal?.risk ?? "unknown",
+			"",
+			this.theme.bold("Canary 与回滚计划"),
+			trial?.plan ?? proposal?.trialPlan ?? "unknown",
+			"",
+			this.theme.bold("可执行验证"),
+			...(this.artifacts.validation?.trim().split("\n") ?? ["没有可执行 validation artifact"]),
+			"",
+			this.theme.bold("独立评估"),
+			...(this.artifacts.evaluation?.trim().split("\n") ?? ["没有评估报告"]),
+			"",
+			...(this.keepError ? [this.theme.fg("error", this.keepError), ""] : []),
+			...(this.keeping ? [this.theme.fg("accent", "正在正式上线……")] : decision),
 		];
 	}
 
@@ -372,6 +497,7 @@ export class EvolutionProcessInspector implements Component {
 			this.theme.bold("变更"),
 			...proposal.diff.split("\n"),
 			"",
+			this.theme.fg("accent", `运行 /evo permit ${proposal.id} 处理此提案`),
 			this.theme.fg("dim", "↑↓ 滚动 • Home/End 跳转 • Esc 返回事项列表"),
 		];
 	}
@@ -381,6 +507,7 @@ export class EvolutionProcessInspector implements Component {
 		const run = this.run;
 		if (!run) return [this.theme.fg("warning", "正在连接后台任务……")];
 		if (run.status === "awaiting-canary-approval") return this.canaryLines(run);
+		if (run.status === "trialing" && this.item?.component) return this.activeCanaryLines();
 		const thinking = thinkingText(this.events);
 		const tools = toolEvents(this.events);
 		const outcomes = [
@@ -473,7 +600,74 @@ export class EvolutionProcessInspector implements Component {
 		return wrapped.slice(start, start + viewport);
 	}
 
+	private startComponentApproval(decision: ComponentApprovalDecision): void {
+		if (!this.run || this.approving) return;
+		const proposal = this.proposal;
+		if (
+			!proposal ||
+			proposal.status !== "pending" ||
+			proposal.parentBundleDigest !== this.run.canaryParentDigest ||
+			proposal.candidateDigest !== this.run.canaryCandidateDigest ||
+			proposal.targetAbi !== this.run.canaryTargetAbi
+		) {
+			this.approvalError = "运行记录与当前提案不一致";
+			this.tui.requestRender();
+			return;
+		}
+		this.approving = true;
+		this.approvalError = undefined;
+		void this.approveCanary(this.run.id, decision)
+			.then(() => this.refresh())
+			.catch((error) => {
+				this.approvalError = error instanceof Error ? error.message : String(error);
+			})
+			.finally(() => {
+				this.approving = false;
+				this.tui.requestRender();
+			});
+	}
+
+	private startDirectKeep(): void {
+		if (!this.run || this.keeping) return;
+		if (!this.proposal?.artifacts.validation) {
+			this.keepError = "正式上线要求绑定可执行 validation artifact";
+			this.tui.requestRender();
+			return;
+		}
+		this.keeping = true;
+		this.keepError = undefined;
+		void this.directKeepCanary(this.run.id)
+			.then(() => this.refresh())
+			.catch((error) => {
+				this.keepError = error instanceof Error ? error.message : String(error);
+			})
+			.finally(() => {
+				this.keeping = false;
+				this.tui.requestRender();
+			});
+	}
+
 	handleInput(data: string): void {
+		if (
+			this.mode === "run" &&
+			this.run?.status === "trialing" &&
+			this.keepConfirming &&
+			matchesKey(data, Key.escape)
+		) {
+			this.keepConfirming = false;
+			this.tui.requestRender();
+			return;
+		}
+		if (
+			this.mode === "run" &&
+			this.run?.status === "awaiting-canary-approval" &&
+			this.approvalView !== "choice" &&
+			matchesKey(data, Key.escape)
+		) {
+			this.approvalView = "choice";
+			this.tui.requestRender();
+			return;
+		}
 		if (matchesKey(data, Key.escape) || data === "q") {
 			if (this.mode === "run") {
 				this.mode = "tasks";
@@ -497,6 +691,12 @@ export class EvolutionProcessInspector implements Component {
 					this.sectionIndex = 0;
 					this.expandedSection = undefined;
 					this.scrollFromBottom = 0;
+					this.approvalView = "choice";
+					this.approvalChoice = 0;
+					this.customField = 0;
+					this.customDefaultsInitialized = false;
+					this.keepConfirming = false;
+					this.keepError = undefined;
 					void this.refresh();
 				}
 			}
@@ -509,35 +709,54 @@ export class EvolutionProcessInspector implements Component {
 				this.tui.requestRender();
 				return;
 			}
-			if (this.run?.status === "awaiting-canary-approval") {
+			if (this.run?.status === "trialing" && this.item?.component) {
 				if (matchesKey(data, Key.up)) this.scrollFromBottom++;
 				else if (matchesKey(data, Key.down)) this.scrollFromBottom = Math.max(0, this.scrollFromBottom - 1);
 				else if (matchesKey(data, Key.home)) this.scrollFromBottom = Number.MAX_SAFE_INTEGER;
 				else if (matchesKey(data, Key.end)) this.scrollFromBottom = 0;
-				else if (matchesKey(data, Key.enter) && !this.approving) {
-					const proposal = this.proposal;
-					if (
-						!proposal ||
-						proposal.status !== "pending" ||
-						proposal.parentBundleDigest !== this.run.canaryParentDigest ||
-						proposal.candidateDigest !== this.run.canaryCandidateDigest ||
-						proposal.targetAbi !== this.run.canaryTargetAbi
-					) {
-						this.approvalError = "运行记录与当前提案不一致";
-						this.tui.requestRender();
-						return;
-					}
-					this.approving = true;
-					this.approvalError = undefined;
-					void this.approveCanary(this.run.id)
-						.then(() => this.refresh())
-						.catch((error) => {
-							this.approvalError = error instanceof Error ? error.message : String(error);
-						})
-						.finally(() => {
-							this.approving = false;
-							this.tui.requestRender();
+				else if (matchesKey(data, Key.enter) && !this.keeping) {
+					if (this.keepConfirming) this.startDirectKeep();
+					else this.keepConfirming = true;
+				}
+				this.tui.requestRender();
+				return;
+			}
+			if (this.run?.status === "awaiting-canary-approval") {
+				if (this.approvalView === "custom") {
+					if (matchesKey(data, Key.up)) this.customField = Math.max(0, this.customField - 1);
+					else if (matchesKey(data, Key.down)) this.customField = Math.min(2, this.customField + 1);
+					else if (matchesKey(data, Key.left) && this.customField === 0)
+						this.customMinimumSamples = Math.max(1, this.customMinimumSamples - 1);
+					else if (matchesKey(data, Key.right) && this.customField === 0)
+						this.customMinimumSamples = Math.min(10_000, this.customMinimumSamples + 1);
+					else if (matchesKey(data, Key.left) && this.customField === 1)
+						this.customMaximumDurationDays = Math.max(1, this.customMaximumDurationDays - 1);
+					else if (matchesKey(data, Key.right) && this.customField === 1)
+						this.customMaximumDurationDays = Math.min(365, this.customMaximumDurationDays + 1);
+					else if (matchesKey(data, Key.enter) && this.customField === 2) {
+						this.startComponentApproval({
+							mode: "canary",
+							customization: "custom",
+							minimumSamples: this.customMinimumSamples,
+							maximumDurationDays: this.customMaximumDurationDays,
 						});
+					}
+				} else if (this.approvalView === "direct-confirm") {
+					if (matchesKey(data, Key.enter)) this.startComponentApproval({ mode: "direct" });
+				} else if (matchesKey(data, Key.left)) {
+					this.approvalChoice = Math.max(0, this.approvalChoice - 1);
+				} else if (matchesKey(data, Key.right)) {
+					this.approvalChoice = Math.min(2, this.approvalChoice + 1);
+				} else if (matchesKey(data, Key.up)) this.scrollFromBottom++;
+				else if (matchesKey(data, Key.down)) this.scrollFromBottom = Math.max(0, this.scrollFromBottom - 1);
+				else if (matchesKey(data, Key.home)) this.scrollFromBottom = Number.MAX_SAFE_INTEGER;
+				else if (matchesKey(data, Key.end)) this.scrollFromBottom = 0;
+				else if (matchesKey(data, Key.enter) && !this.approving) {
+					if (this.approvalChoice === 0) {
+						this.startComponentApproval({ mode: "canary", customization: "default" });
+					} else if (this.approvalChoice === 1) this.approvalView = "custom";
+					else if (this.proposal?.artifacts.validation) this.approvalView = "direct-confirm";
+					else this.approvalError = "直接上线要求通过并绑定可执行 validation artifact";
 				}
 				this.tui.requestRender();
 				return;
