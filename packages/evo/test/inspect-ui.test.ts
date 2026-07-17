@@ -123,6 +123,47 @@ describe("evolution inspector viewport", () => {
 		expect(view).toContain("提案已拒绝");
 	});
 
+	it("moves the proposal section cursor with the arrow keys and toggles with Space", async () => {
+		const { paths, service, digest } = await seedFixture(0);
+		const proposal = await stageProposal({
+			paths,
+			parentDigest: digest,
+			observationsMarkdown: "Arrow-key navigation fixture.",
+			draft: {
+				motivation: "Navigate sections with arrows",
+				expectedEffect: "The cursor moves",
+				risk: "Arrow keys felt dead before",
+				verifyPlan: "Press Down and watch the cursor",
+				trialPlan: "Do not activate",
+				source: "pattern",
+				evidence: [],
+				inboxReferences: [],
+				replayScenarios: [],
+				changes: [{ path: "memory/nav.md", content: "Navigation.\n" }],
+			},
+		});
+		const bigTui = { terminal: { rows: 40 }, requestRender: () => {} };
+		const inspector = new EvolutionProcessInspector(
+			bigTui as never,
+			theme as never,
+			paths,
+			service,
+			`proposal:${proposal.id}`,
+			() => {},
+			async () => {},
+		);
+		await waitForRefresh();
+		expect(inspector.render(120).join("\n")).toMatch(/› ▸ .*目标与预期效果/);
+		inspector.handleInput("\u001b[B"); // Down: cursor moves to the next section
+		expect(inspector.render(120).join("\n")).toMatch(/› ▸ .*风险/);
+		inspector.handleInput(" "); // Space: expand the focused section
+		expect(inspector.render(120).join("\n")).toContain("Arrow keys felt dead before");
+		inspector.handleInput("\u001b[A"); // Up: back to the first section
+		const view = inspector.render(120).join("\n");
+		inspector.dispose();
+		expect(view).toMatch(/› [▸▾] .*目标与预期效果/);
+	});
+
 	it("keeps the top items visible by default and scrolls the selection into view", async () => {
 		const { paths, service } = await seedFixture(12);
 		const inspector = new EvolutionProcessInspector(

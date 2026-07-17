@@ -452,6 +452,12 @@ export class EvolutionProcessInspector implements Component {
 		this.followFocus = true;
 	}
 
+	private moveSectionFocus(delta: number): void {
+		if (this.activeSectionIds.length === 0) return;
+		this.sectionFocus = Math.min(Math.max(0, this.sectionFocus + delta), this.activeSectionIds.length - 1);
+		this.followFocus = true;
+	}
+
 	private toggleFocusedSection(): void {
 		const id = this.activeSectionIds[this.sectionFocus];
 		if (!id) return;
@@ -885,7 +891,11 @@ export class EvolutionProcessInspector implements Component {
 		}
 		const actions = this.availableProposalActions(proposal);
 		if (actions.length === 0) {
-			return [divider, ...error, this.theme.fg("dim", "此提案已处理完毕 · ↑↓ 滚动 · Esc 返回事项列表")];
+			return [
+				divider,
+				...error,
+				this.theme.fg("dim", "此提案已处理完毕 · ↑↓ 章节 · Enter/Space 展开收起 · Esc 返回事项列表"),
+			];
 		}
 		const row = actions
 			.map((action, index) => {
@@ -900,7 +910,7 @@ export class EvolutionProcessInspector implements Component {
 			divider,
 			...error,
 			`${this.theme.bold("处理此提案")}  ${row}`,
-			this.theme.fg("dim", `${consequence} · 快捷键或 ←→+Enter · Tab 章节 · Space 展开 · ↑↓ 滚动 · Esc 返回`),
+			this.theme.fg("dim", `${consequence} · 快捷键或 ←→+Enter · ↑↓ 章节 · Space 展开收起 · Esc 返回`),
 		];
 	}
 
@@ -1276,14 +1286,15 @@ export class EvolutionProcessInspector implements Component {
 				if (matchesKey(data, Key.left)) this.proposalChoice = Math.max(0, this.proposalChoice - 1);
 				else if (matchesKey(data, Key.right)) {
 					this.proposalChoice = Math.min(Math.max(0, actions.length - 1), this.proposalChoice + 1);
-				} else if (matchesKey(data, Key.up)) this.scrollFromBottom++;
-				else if (matchesKey(data, Key.down)) this.scrollFromBottom = Math.max(0, this.scrollFromBottom - 1);
+				} else if (matchesKey(data, Key.up)) this.moveSectionFocus(-1);
+				else if (matchesKey(data, Key.down)) this.moveSectionFocus(1);
 				else if (matchesKey(data, Key.home)) this.scrollFromBottom = Number.MAX_SAFE_INTEGER;
 				else if (matchesKey(data, Key.end)) this.scrollFromBottom = 0;
 				else if (matchesKey(data, Key.tab)) this.focusNextSection();
 				else if (matchesKey(data, Key.space)) this.toggleFocusedSection();
-				else if (matchesKey(data, Key.enter) && actions.length > 0 && !this.proposalActing) {
-					this.startProposalAction(proposal);
+				else if (matchesKey(data, Key.enter) && !this.proposalActing) {
+					if (actions.length > 0) this.startProposalAction(proposal);
+					else this.toggleFocusedSection();
 				} else if (data.length === 1 && !data.startsWith("\u001b") && !this.proposalActing) {
 					const hotkeyIndex = actions.findIndex((action) => PROPOSAL_ACTION_HOTKEYS[action.id] === data);
 					if (hotkeyIndex >= 0) {

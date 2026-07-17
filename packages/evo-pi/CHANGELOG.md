@@ -22,6 +22,7 @@
 
 ### Fixed
 
+- Fixed dead arrow keys in the proposal detail view: ↑↓ move the section cursor, Space/Enter expand or collapse the focused section.
 - Fixed imported workflow packs being unapprovable ("missing required review artifact"): import now executes each component (dry run / fixture / health probe) and attaches the approval artifacts, so `packs init` → `import` → `permit` works end to end.
 - Fixed `/evo inspect` on small terminals hiding the top of the task list (pending proposals sort first), permanently showing "正在连接后台任务……" when an opened item no longer exists, and proposal cards opening scrolled to the bottom.
 - Pending proposals can now be processed directly inside `/evo inspect`: a pinned action bar offers approve/reject/defer (reopen for deferred) with reason input and strict digest confirmation, and the task list gained status glyphs and inline timing.
