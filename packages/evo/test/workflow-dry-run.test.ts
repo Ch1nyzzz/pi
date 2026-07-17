@@ -5,7 +5,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { publishEvoComponentArtifact } from "../src/components/artifact.ts";
 import { composeWorkflowEntrypoint } from "../src/components/workflow-sdk/index.ts";
 import { dryRunWorkflowSelection } from "../src/evolve/workflow-dry-run.ts";
+import { composeDeepResearchEntrypoint } from "../src/pack/templates/deep-research.ts";
 import { composeDeepReviewEntrypoint } from "../src/pack/templates/deep-review.ts";
+import { composeDeepcodeEntrypoint } from "../src/pack/templates/deepcode.ts";
 import { getEvoPaths } from "../src/paths.ts";
 import type { EvoWorkflowSelection } from "../src/types.ts";
 
@@ -59,6 +61,18 @@ describe("workflow dry run", () => {
 		const outcome = await dryRunWorkflowSelection(paths, selection, { sandbox: false });
 		expect(outcome.passed).toBe(true);
 		expect(["result", "clean-error"]).toContain(outcome.invokeOutcome);
+	});
+
+	it("passes the deep-research and deepcode templates", async () => {
+		for (const [id, entrypoint] of [
+			["deep-research", await composeDeepResearchEntrypoint()],
+			["deepcode", await composeDeepcodeEntrypoint()],
+		] as const) {
+			const { paths, selection } = await workflowSelection(id, entrypoint);
+			const outcome = await dryRunWorkflowSelection(paths, selection, { sandbox: false });
+			expect(outcome.passed).toBe(true);
+			expect(["result", "clean-error"]).toContain(outcome.invokeOutcome);
+		}
 	});
 
 	it("fails a protocol-violating component", async () => {

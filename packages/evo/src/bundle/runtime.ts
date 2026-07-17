@@ -66,6 +66,7 @@ import {
 	type WorkflowV1Input,
 	type WorkflowV1Output,
 } from "../components/registry.ts";
+import { createEvolutionResearchTools } from "../evolve/research-tools.ts";
 import { renderBundlePreferenceInstructions } from "../memory/preferences.ts";
 import { getEvoPaths } from "../paths.ts";
 import { BundleRegistry } from "../registry/registry.ts";
@@ -100,11 +101,15 @@ const WORKFLOW_INVOKE_TIMEOUT_MS = 60 * 60_000;
 /**
  * Tool names offered to spawned child agents when the embedder does not supply
  * its own trusted tool set. Grant previews default their spawn-agent allowlist
- * to this same list so imported packs work against the default host.
+ * to this same list so imported packs work against the default host. The two
+ * research tools give retrieval-heavy workflows (deep-research) allowlisted
+ * public search/fetch without credentials.
  */
 export const DEFAULT_SPAWN_AGENT_TOOL_NAMES: readonly string[] = [
 	"bash",
 	"edit",
+	"evo_research_fetch",
+	"evo_research_search",
 	"find",
 	"grep",
 	"ls",
@@ -113,8 +118,9 @@ export const DEFAULT_SPAWN_AGENT_TOOL_NAMES: readonly string[] = [
 ];
 
 /**
- * The host's standard coding tools, rebuilt against the session cwd. The
- * `agent` tool is deliberately excluded: spawned children must not recurse.
+ * The host's standard coding tools plus the public research tools, rebuilt
+ * against the session cwd. The `agent` tool is deliberately excluded: spawned
+ * children must not recurse.
  */
 function createDefaultSpawnAgentTools(cwd: string): AgentTool[] {
 	const definitions: ToolDefinition<any, any>[] = [
@@ -125,6 +131,7 @@ function createDefaultSpawnAgentTools(cwd: string): AgentTool[] {
 		createLsToolDefinition(cwd),
 		createReadToolDefinition(cwd),
 		createWriteToolDefinition(cwd),
+		...createEvolutionResearchTools(),
 	];
 	return definitions.map((definition) => ({
 		name: definition.name,

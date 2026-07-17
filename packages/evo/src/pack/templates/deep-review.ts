@@ -1,10 +1,5 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { publishEvoComponentArtifact } from "../../components/artifact.ts";
 import { composeWorkflowEntrypoint } from "../../components/workflow-sdk/index.ts";
-import { getEvoPaths } from "../../paths.ts";
-import { computeEvoPackIntegrity, type EvoPackManifest, parseEvoPackManifest } from "../pack.ts";
+import { type WrittenWorkflowPack, writeWorkflowPack } from "./write-pack.ts";
 
 export const DEEP_REVIEW_WORKFLOW_ID = "deep-review";
 export const DEEP_REVIEW_TRIGGER = "/deep-review";
@@ -15,7 +10,7 @@ export const DEEP_REVIEW_TRIGGER = "/deep-review";
  * Fixed orchestration — the script holds the control flow; child agents do
  * the reading and judging.
  */
-export const DEEP_REVIEW_WORKFLOW_BODY = String.raw`
+export const DEEP_REVIEW_WORKFLOW_BODY = `
 const FILES_SCHEMA = {
 	type: "object",
 	required: ["files"],
@@ -96,58 +91,13 @@ export function composeDeepReviewEntrypoint(): Promise<string> {
 	return composeWorkflowEntrypoint(DEEP_REVIEW_WORKFLOW_BODY);
 }
 
-export interface WrittenDeepReviewPack {
-	manifest: EvoPackManifest;
-	integrity: string;
-}
-
-/**
- * Write a complete, importable /deep-review optimization pack into
- * `directory`: the composed workflow artifact plus a signed-integrity
- * pack.json. The staging component store is temporary and removed.
- */
-export async function writeDeepReviewPack(directory: string): Promise<WrittenDeepReviewPack> {
-	const staging = await mkdtemp(join(tmpdir(), "pi-evo-deep-review-pack-"));
-	try {
-		const artifact = await publishEvoComponentArtifact(getEvoPaths(join(staging, "evo")), {
-			id: DEEP_REVIEW_WORKFLOW_ID,
-			version: "1.0.0",
-			abi: "workflow/v1",
-			activationBoundary: "invocation",
-			capabilities: ["spawn-agent"],
-			entrypointContent: await composeDeepReviewEntrypoint(),
-		});
-		const artifactDirectory = join(directory, "workflows", DEEP_REVIEW_WORKFLOW_ID);
-		await mkdir(artifactDirectory, { recursive: true });
-		await writeFile(
-			join(artifactDirectory, "manifest.json"),
-			await readFile(join(artifact.directory, "manifest.json")),
-		);
-		await writeFile(join(artifactDirectory, artifact.manifest.entrypoint), await readFile(artifact.entrypoint));
-		const unsigned = parseEvoPackManifest({
-			packFormat: 1,
-			name: "deep-review",
-			version: "1.0.0",
-			description: "Voting-style code review workflow: per-file reviewers plus adversarial verification.",
-			contents: {
-				workflows: [
-					{
-						id: DEEP_REVIEW_WORKFLOW_ID,
-						trigger: DEEP_REVIEW_TRIGGER,
-						abi: "workflow/v1",
-						artifact: `workflows/${DEEP_REVIEW_WORKFLOW_ID}`,
-						capabilities: ["spawn-agent"],
-					},
-				],
-			},
-			requiresAbis: ["workflow/v1"],
-			requiresCapabilities: ["spawn-agent"],
-		});
-		const integrity = await computeEvoPackIntegrity(directory, unsigned);
-		const manifest: EvoPackManifest = { ...unsigned, integrity };
-		await writeFile(join(directory, "pack.json"), `${JSON.stringify(manifest, undefined, "\t")}\n`);
-		return { manifest, integrity };
-	} finally {
-		await rm(staging, { recursive: true, force: true });
-	}
+/** Write a complete, importable /deep-review optimization pack into `directory`. */
+export function writeDeepReviewPack(directory: string): Promise<WrittenWorkflowPack> {
+	return writeWorkflowPack(directory, {
+		id: DEEP_REVIEW_WORKFLOW_ID,
+		trigger: DEEP_REVIEW_TRIGGER,
+		version: "1.0.0",
+		description: "Voting-style code review workflow: per-file reviewers plus adversarial verification.",
+		body: DEEP_REVIEW_WORKFLOW_BODY,
+	});
 }

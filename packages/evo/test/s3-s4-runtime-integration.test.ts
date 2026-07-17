@@ -18,7 +18,9 @@ import { publishEvoComponentArtifact } from "../src/components/artifact.ts";
 import { EvoCapabilityBroker, type EvoCapabilityGrant } from "../src/components/capabilities/broker.ts";
 import type { EvoCapabilityService } from "../src/components/capabilities/service.ts";
 import { EvoMemoryStore } from "../src/components/memory/store.ts";
+import { composeDeepResearchEntrypoint } from "../src/pack/templates/deep-research.ts";
 import { composeDeepReviewEntrypoint } from "../src/pack/templates/deep-review.ts";
+import { composeDeepcodeEntrypoint } from "../src/pack/templates/deepcode.ts";
 import { type EvoPaths, getEvoPaths } from "../src/paths.ts";
 import { BundleRegistry } from "../src/registry/registry.ts";
 import { sha256, withFileLock } from "../src/storage.ts";
@@ -1108,6 +1110,140 @@ describe("S3/S4 runtime integration", () => {
 			},
 		});
 		expect(faux.state.callCount).toBe(3);
+		await harness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
+	});
+
+	it("runs the composed /deep-research template end to end", async () => {
+		const { paths } = await temporaryRoot("pi-evo-deep-research-e2e-");
+		const faux = registerFauxProvider();
+		cleanups.push(faux.unregister);
+		faux.setResponses([
+			fauxAssistantMessage('{"angles":["angle one"]}'),
+			fauxAssistantMessage('{"claims":[{"claim":"X is true","source":"https://example.com"}]}'),
+			fauxAssistantMessage('{"confirmed":true,"reason":"source supports it"}'),
+			fauxAssistantMessage('{"report":"final cited report"}'),
+		]);
+		const model = faux.getModel();
+		const modelRegistry: HarnessRegistry = {
+			getAll: () => [model],
+			find: (provider, id) => (provider === model.provider && id === model.id ? model : undefined),
+			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "faux-key" }),
+		};
+		const spawnGrant: EvoCapabilityGrant = {
+			capability: "spawn-agent",
+			maxCalls: 8,
+			models: [`${model.provider}/${model.id}`],
+			maxInputTokens: model.contextWindow * 4,
+			maxOutputTokens: 64 * 8,
+			maxTotalTokens: model.contextWindow * 4 + 64 * 8,
+			maxCostUsd: 5,
+			maxOutputTokensPerCall: 64,
+			tools: [],
+		};
+		const selection = await publishSelection(paths, {
+			id: "deep-research",
+			abi: "workflow/v1",
+			boundary: "invocation",
+			capabilities: ["spawn-agent"],
+			source: await composeDeepResearchEntrypoint(),
+			grants: [spawnGrant],
+		});
+		const workflows: EvoWorkflowSelection[] = [{ ...selection, trigger: "/deep-research" }];
+		const bundle = await compilePolicy(paths, { schemaVersion: 1, workflows }, null, "deep research template");
+		await new BundleRegistry(paths).initialize(bundle.digest);
+
+		const harness = createHarness(paths.root, { modelRegistry });
+		createPolicyRuntimeExtension({
+			root: paths.root,
+			componentSandbox: false,
+			spawnAgentMaxTurns: 1,
+		})(harness.api);
+		await harness.emit("session_start", { type: "session_start", reason: "startup" });
+		await harness.invokeCommand("deep-research", "does X hold?");
+
+		expect(harness.sentMessages).toHaveLength(1);
+		expect(harness.sentMessages[0]).toMatchObject({
+			customType: "evo.workflow-result",
+			details: {
+				id: "deep-research",
+				result: {
+					question: "does X hold?",
+					report: "final cited report",
+					confirmed: [{ claim: "X is true", source: "https://example.com", confirmed: true }],
+					refuted: [],
+				},
+			},
+		});
+		expect(faux.state.callCount).toBe(4);
+		await harness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
+	});
+
+	it("runs the composed /deepcode template end to end", async () => {
+		const { paths } = await temporaryRoot("pi-evo-deepcode-e2e-");
+		const faux = registerFauxProvider();
+		cleanups.push(faux.unregister);
+		faux.setResponses([
+			fauxAssistantMessage('{"notes":"codebase notes"}'),
+			fauxAssistantMessage('{"notes":"codebase notes"}'),
+			fauxAssistantMessage('{"notes":"codebase notes"}'),
+			fauxAssistantMessage(
+				'{"steps":[{"title":"implement it","instructions":"edit the file"}],"checkCommand":"npm test"}',
+			),
+			fauxAssistantMessage('{"done":true,"summary":"implemented"}'),
+			fauxAssistantMessage('{"passed":true,"detail":"all green"}'),
+		]);
+		const model = faux.getModel();
+		const modelRegistry: HarnessRegistry = {
+			getAll: () => [model],
+			find: (provider, id) => (provider === model.provider && id === model.id ? model : undefined),
+			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "faux-key" }),
+		};
+		const spawnGrant: EvoCapabilityGrant = {
+			capability: "spawn-agent",
+			maxCalls: 12,
+			models: [`${model.provider}/${model.id}`],
+			maxInputTokens: model.contextWindow * 4,
+			maxOutputTokens: 64 * 12,
+			maxTotalTokens: model.contextWindow * 4 + 64 * 12,
+			maxCostUsd: 5,
+			maxOutputTokensPerCall: 64,
+			tools: [],
+		};
+		const selection = await publishSelection(paths, {
+			id: "deepcode",
+			abi: "workflow/v1",
+			boundary: "invocation",
+			capabilities: ["spawn-agent"],
+			source: await composeDeepcodeEntrypoint(),
+			grants: [spawnGrant],
+		});
+		const workflows: EvoWorkflowSelection[] = [{ ...selection, trigger: "/deepcode" }];
+		const bundle = await compilePolicy(paths, { schemaVersion: 1, workflows }, null, "deepcode template");
+		await new BundleRegistry(paths).initialize(bundle.digest);
+
+		const harness = createHarness(paths.root, { modelRegistry });
+		createPolicyRuntimeExtension({
+			root: paths.root,
+			componentSandbox: false,
+			spawnAgentMaxTurns: 1,
+		})(harness.api);
+		await harness.emit("session_start", { type: "session_start", reason: "startup" });
+		await harness.invokeCommand("deepcode", "add a --version flag");
+
+		expect(harness.sentMessages).toHaveLength(1);
+		expect(harness.sentMessages[0]).toMatchObject({
+			customType: "evo.workflow-result",
+			details: {
+				id: "deepcode",
+				result: {
+					task: "add a --version flag",
+					steps: [{ title: "implement it", done: true, summary: "implemented" }],
+					checkCommand: "npm test",
+					verification: { passed: true, detail: "all green" },
+				},
+			},
+		});
+		expect(faux.state.callCount).toBe(6);
 		await harness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
 	});
 

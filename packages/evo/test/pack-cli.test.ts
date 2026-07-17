@@ -7,7 +7,9 @@ import { type EvoCliIO, runEvoCli } from "../src/cli.ts";
 import { publishEvoComponentArtifact } from "../src/components/artifact.ts";
 import { readEvoControlConfig } from "../src/evolve/config.ts";
 import { computeEvoPackIntegrity, loadEvoPack, parseEvoPackManifest } from "../src/pack/pack.ts";
+import { writeDeepResearchPack } from "../src/pack/templates/deep-research.ts";
 import { writeDeepReviewPack } from "../src/pack/templates/deep-review.ts";
+import { writeDeepcodePack } from "../src/pack/templates/deepcode.ts";
 import { getEvoPaths } from "../src/paths.ts";
 import { BundleRegistry } from "../src/registry/registry.ts";
 import { EvoService } from "../src/service.ts";
@@ -251,6 +253,26 @@ describe("optimization pack CLI", () => {
 		expect(output).toContain(written.integrity);
 		expect(output).toContain("Capability grants auto-approved (grants.approval is 'auto')");
 		expect(output).toContain("deep-review");
+	});
+
+	it("imports the deep-research and deepcode template packs", async () => {
+		const root = await temporary("evo-pack-cli-templates-");
+		const { paths, service } = await seedActiveBundle(root);
+		for (const [index, write] of [writeDeepResearchPack, writeDeepcodePack].entries()) {
+			const packDirectory = await temporary(`evo-pack-cli-template-${index}-`);
+			const written = await write(packDirectory);
+			expect((await loadEvoPack(packDirectory)).integrity.ok).toBe(true);
+			const { io, messages } = captureCliOutput();
+			await runEvoCli(["import", packDirectory], {
+				paths,
+				service,
+				io,
+				model: "faux/model",
+				spawnAgentToolNames: ["read", "bash", "evo_research_search", "evo_research_fetch"],
+			});
+			expect(messages.join("\n")).toContain(written.integrity);
+		}
+		expect(await service.listProposals()).toHaveLength(2);
 	});
 
 	it("persists confirmed component grants in the candidate without activating the broker", async () => {

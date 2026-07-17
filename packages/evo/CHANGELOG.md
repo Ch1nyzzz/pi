@@ -4,6 +4,11 @@
 
 ### Added
 
+- Added the bundled `/deep-research` workflow template and `writeDeepResearchPack()`: decompose a question into angles, fan out parallel searchers over allowlisted public sources (arXiv/Crossref/GitHub plus bash curl), adversarially verify each claim against its source, and synthesize a cited report.
+- Added the bundled `/deepcode` workflow template and `writeDeepcodePack()`: dynamic-workflow style multi-agent coding — parallel read-only explorers, a frozen step plan, serial per-step implementation, and a verify-fix loop bounded by progress.
+- Added `writeWorkflowPack()`, the generic single-workflow pack writer the bundled templates share.
+- Spawned child agents now also carry the public research tools (`evo_research_search`, `evo_research_fetch`) by default.
+- Added explicit component release choices in the focused approval view: activate directly with rollback/audit history, use the frozen Canary, persist custom session and duration bounds that drive the live trial deadline, or end an active Canary and keep the validated component immediately.
 - Added the workflow SDK: `composeWorkflowEntrypoint()` composes a dependency-free prelude into a workflow component entrypoint, giving authors `runWorkflow()`, `agent()` (with JSON-schema structured output and retry), barrier `parallel()`, streaming `pipeline()`, and `log()` over the JSONL-RPC protocol.
 - Added workflow host defaults: `workflow/v1` invokes now carry an optional `host` record (default model, granted tools, per-call output ceiling) derived from the spawn-agent grant, and workflow invokes get a dedicated 60-minute request timeout.
 - Added the bundled `/deep-review` workflow template and `writeDeepReviewPack()`: per-file reviewers plus adversarial verification, shipped as an importable integrity-signed pack.
