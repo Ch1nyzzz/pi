@@ -1,5 +1,6 @@
 import { rm } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
+import type { ThinkingLevel } from "@ch1nyzzz/pi-agent-core";
 import type { ExtensionCommandContext, ExtensionContext, ExtensionFactory } from "@ch1nyzzz/pi-coding-agent";
 import { DEFAULT_SPAWN_AGENT_TOOL_NAMES } from "./bundle/runtime.ts";
 import {
@@ -31,13 +32,15 @@ import { type EvoActivityItem, listEvoActivityItems } from "./evolve/activity.ts
 import {
 	formatEvolutionRuns,
 	inspectBackgroundEvolutions,
+	startBackgroundBuildingResume,
 	startBackgroundEvidenceResumption,
+	startBackgroundEvolution,
 } from "./evolve/background.ts";
-import { readEvoControlConfig } from "./evolve/config.ts";
+import { readEvoControlConfig, updateEvoControlConfigValue } from "./evolve/config.ts";
 import { runUnknownAbiBuilderCycle, type UnknownAbiBuilderCycleResult } from "./evolve/cycle.ts";
 import { EvolutionProcessInspector, type VerificationDecision } from "./evolve/inspect-ui.ts";
 import { changesComponentSelection } from "./evolve/release.ts";
-import { retryEvolutionFromValidation } from "./evolve/retry.ts";
+import { type EvolutionRetryFrom, resolveRetryFrom, retryEvolutionFromValidation } from "./evolve/retry.ts";
 import {
 	listEvolutionRuns,
 	readEvolutionRun,
@@ -101,6 +104,7 @@ const SUBCOMMANDS = [
 	"inbox",
 	"usage",
 	"list",
+	"model",
 	"show",
 	"note",
 	"request",
@@ -135,12 +139,13 @@ const EVO_HELP = `Usage: /evo <command>
   pause <run-id>               Pause a background task
   resume <run-id>              Resume a paused task
   delete <run-id>              Stop and permanently delete a task
-  retry <run-id>               Reuse a built component and continue from validation
+  retry <run-id> [--from research|building|validating]  Resume a terminal task: fresh research, the frozen plan from the builder, or the built component from validation
   schedule [cadence]           Show or set the evolution cadence (daily, 3d, weekly, manual)
   playbook [reset]             Show or reset the evolution playbook (guides research)
   workflows                    List active workflow components and their triggers
   packs [init <name> [dir]]    List bundled workflow pack templates or write one
   config [set <key> <value>]   Show or update the evo control config
+  model [role]                 Interactively pick the model and thinking level for an evolution phase
   grants                       Show component capability grants, usage, and budgets
   history [<count>]            Show the bundle transition audit history (keep/rollback)
   triage [now]                 Show streaming-triage status, or scan new sessions now
@@ -236,11 +241,13 @@ function requireArgumentCount(args: string[], minimum: number, maximum: number, 
 	if (args.length < minimum || args.length > maximum) throw new Error(`Usage: ${usage}`);
 }
 
-function parseRetryArgs(value: string, usage: string): string {
+function parseRetryArgs(value: string, usage: string): { id: string; from?: EvolutionRetryFrom } {
 	const { first: id, rest } = splitFirst(value);
 	requireValue(id, usage);
-	if (rest && rest !== "--from validating") throw new Error(`Usage: ${usage}`);
-	return id;
+	if (!rest.trim()) return { id };
+	const match = /^--from\s+(research|building|validating)$/.exec(rest.trim());
+	if (!match) throw new Error(`Usage: ${usage}`);
+	return { id, from: match[1] as EvolutionRetryFrom };
 }
 
 function parsePackSelection(value: string, usage: string): { name: string; version?: string } {
@@ -1113,6 +1120,59 @@ async function dispatchExtensionCommand(
 		case "help":
 			sendCustomCard(pi, "evo.help", EVO_HELP, { command: "help" });
 			return;
+		case "model": {
+			if (!ctx.hasUI) {
+				throw new Error(
+					"/evo model requires an interactive UI; use /evo config set models.<role>.model <provider/model>",
+				);
+			}
+			const config = await readEvoControlConfig(dependencies.paths);
+			const roles = [
+				{ key: "researchPlanner", label: "研究 (researchPlanner)" },
+				{ key: "builder", label: "构建 (builder)" },
+				{ key: "evaluator", label: "评估 (evaluator)" },
+				{ key: "triage", label: "分流 (triage)" },
+			] as const;
+			let role: (typeof roles)[number] | undefined;
+			if (rest.trim()) {
+				role = roles.find((candidate) => candidate.key === rest.trim());
+				if (!role) {
+					throw new Error(`Usage: /evo model [${roles.map((candidate) => candidate.key).join("|")}]`);
+				}
+			} else {
+				const roleOptions = roles.map(
+					(candidate) => `${candidate.label} — 当前 ${config.models[candidate.key].model}`,
+				);
+				const roleChoice = await ctx.ui.select("选择要配置模型的进化阶段", roleOptions);
+				role = roles[roleOptions.indexOf(roleChoice ?? "")];
+				if (!role) return;
+			}
+
+			const current = config.models[role.key];
+			const available = ctx.modelRegistry.getAvailable();
+			if (available.length === 0) {
+				ctx.ui.notify("没有已配置鉴权的可用模型，请先登录对应 provider", "warning");
+				return;
+			}
+			const routes = [...new Set(available.map((model) => `${model.provider}/${model.id}`))].sort((a, b) =>
+				a === current.model ? -1 : b === current.model ? 1 : a.localeCompare(b),
+			);
+			const modelOptions = routes.map((route) => (route === current.model ? `${route} (当前)` : route));
+			const modelChoice = await ctx.ui.select(`选择 ${role.label} 的模型`, modelOptions);
+			const route = routes[modelOptions.indexOf(modelChoice ?? "")];
+			if (!route) return;
+
+			const levels: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+			const levelOptions = levels.map((level) => (level === current.thinkingLevel ? `${level} (当前)` : level));
+			const levelChoice = await ctx.ui.select(`选择 ${role.label} 的 thinking level`, levelOptions);
+			const level = levels[levelOptions.indexOf(levelChoice ?? "")];
+			if (!level) return;
+
+			await updateEvoControlConfigValue(dependencies.paths, `models.${role.key}.model`, route);
+			await updateEvoControlConfigValue(dependencies.paths, `models.${role.key}.thinkingLevel`, level);
+			ctx.ui.notify(`Evo ${role.key} 模型已更新: ${route} (thinking ${level})`, "info");
+			return;
+		}
 		case "init": {
 			const bundle = await dependencies.service.init(pi.getActiveTools());
 			ctx.ui.notify(`Evo-Pi initialized at ${bundle.digest}`, "info");
@@ -1317,7 +1377,28 @@ async function dispatchExtensionCommand(
 			return;
 		}
 		case "retry": {
-			const id = parseRetryArgs(rest, "/evo retry <run-id> [--from validating]");
+			const { id, from } = parseRetryArgs(rest, "/evo retry <run-id> [--from research|building|validating]");
+			const resolved = from ?? (await resolveRetryFrom(dependencies.paths, id));
+			if (resolved === "research") {
+				const source = await readEvolutionRun(dependencies.paths, id);
+				const run = await startBackgroundEvolution({
+					paths: dependencies.paths,
+					cwd: dependencies.cwd ?? ctx.cwd,
+					...(source.request ? { request: source.request } : {}),
+					retryOfRunId: id,
+				});
+				ctx.ui.notify(`Evolution task ${run.id} restarted from research in the background`, "info");
+				return;
+			}
+			if (resolved === "building") {
+				const run = await startBackgroundBuildingResume({
+					paths: dependencies.paths,
+					sourceRunId: id,
+					cwd: dependencies.cwd ?? ctx.cwd,
+				});
+				ctx.ui.notify(`Evolution task ${run.id} resumed at the builder in the background`, "info");
+				return;
+			}
 			const sandboxAvailable = await canUseEvoComponentSandbox();
 			if (!sandboxAvailable && !ctx.hasUI) {
 				throw new Error(
@@ -1922,7 +2003,28 @@ export async function runEvoCli(args: string[], options: RunEvoCliOptions = {}):
 			io.write(formatEvolutionRuns(await inspectBackgroundEvolutions(dependencies.paths), rest || undefined));
 			return;
 		case "retry": {
-			const id = parseRetryArgs(rest, "evo-pi-admin retry <run-id> [--from validating]");
+			const { id, from } = parseRetryArgs(rest, "evo-pi-admin retry <run-id> [--from research|building|validating]");
+			const resolved = from ?? (await resolveRetryFrom(dependencies.paths, id));
+			if (resolved === "research") {
+				const source = await readEvolutionRun(dependencies.paths, id);
+				const run = await startBackgroundEvolution({
+					paths: dependencies.paths,
+					cwd: dependencies.cwd ?? process.cwd(),
+					...(source.request ? { request: source.request } : {}),
+					retryOfRunId: id,
+				});
+				io.write(`Evolution task ${run.id} restarted from research in the background`);
+				return;
+			}
+			if (resolved === "building") {
+				const run = await startBackgroundBuildingResume({
+					paths: dependencies.paths,
+					sourceRunId: id,
+					cwd: dependencies.cwd ?? process.cwd(),
+				});
+				io.write(`Evolution task ${run.id} resumed at the builder in the background`);
+				return;
+			}
 			const sandboxAvailable = await canUseEvoComponentSandbox();
 			const allowDirect =
 				!sandboxAvailable &&

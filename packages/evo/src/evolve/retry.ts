@@ -1,4 +1,4 @@
-import { copyFile, readFile, rm } from "node:fs/promises";
+import { copyFile, cp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { loadCompiledBundle } from "../bundle/compile.ts";
 import { validateEvoComponentSelection } from "../components/artifact.ts";
@@ -312,6 +312,73 @@ export interface ResumeEvolutionEvidenceResult {
 	release: EvolutionReleaseResult;
 	verdict: EvolutionEvaluationVerdict;
 	executedProfilesNow: EvoCheckProfile[];
+}
+
+export type EvolutionRetryFrom = "research" | "building" | "validating";
+
+/** A terminal run's surviving assets decide where a retry can resume. */
+async function frozenPlanResumable(paths: EvoPaths, run: EvolutionRun): Promise<boolean> {
+	if (run.planFile !== "plan.md" || run.experimentFile !== "experiment.json" || !run.experimentDigest) {
+		return false;
+	}
+	const directory = evolutionRunDirectory(paths, run.id);
+	const planJson = await readFile(join(directory, "plan.json"), "utf8").catch(() => undefined);
+	if (!planJson) return false;
+	return (await readMaterializedCorpus(directory)) !== undefined;
+}
+
+/**
+ * The default resume point for a retry: a built component continues at validation,
+ * a frozen plan continues at the builder, anything else starts research over.
+ */
+export async function resolveRetryFrom(paths: EvoPaths, sourceRunId: string): Promise<EvolutionRetryFrom> {
+	const run = await readEvolutionRun(paths, sourceRunId);
+	if (run.proposalId) return "validating";
+	if (await frozenPlanResumable(paths, run)) return "building";
+	return "research";
+}
+
+/**
+ * Queue a new run that resumes a terminal run at the builder: the frozen plan,
+ * experiment, and evidence corpus are copied into the new run directory and the
+ * cycle skips research. Spawning the worker is the caller's job.
+ */
+export async function prepareBuildingResume(options: { paths: EvoPaths; sourceRunId: string }): Promise<EvolutionRun> {
+	const source = await readEvolutionRun(options.paths, options.sourceRunId);
+	if (!["completed", "failed", "cancelled"].includes(source.status)) {
+		throw new Error(`Evolution task ${source.id} is still active; pause or finish it before retrying`);
+	}
+	if (!(await frozenPlanResumable(options.paths, source))) {
+		throw new Error(
+			`Evolution task ${source.id} has no reusable frozen plan; retry with --from research to start over`,
+		);
+	}
+	const run = await createEvolutionRun({
+		paths: options.paths,
+		trigger: source.trigger,
+		...(source.request ? { request: source.request } : {}),
+		evidenceDigest: source.evidenceDigest,
+		status: "queued",
+	});
+	const sourceDirectory = evolutionRunDirectory(options.paths, source.id);
+	const retryDirectory = evolutionRunDirectory(options.paths, run.id);
+	try {
+		await copyFile(join(sourceDirectory, "plan.md"), join(retryDirectory, "plan.md"));
+		await copyFile(join(sourceDirectory, "plan.json"), join(retryDirectory, "plan.json"));
+		await copyFile(join(sourceDirectory, "experiment.json"), join(retryDirectory, "experiment.json"));
+		await cp(join(sourceDirectory, "corpus"), join(retryDirectory, "corpus"), { recursive: true });
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		await updateEvolutionRun(options.paths, run.id, { status: "failed", error: message }).catch(() => undefined);
+		throw error;
+	}
+	return updateEvolutionRun(options.paths, run.id, {
+		retryOfRunId: source.id,
+		resumeFrom: "building",
+		experimentDigest: source.experimentDigest,
+		planFile: "plan.md",
+		experimentFile: "experiment.json",
+	});
 }
 
 /**

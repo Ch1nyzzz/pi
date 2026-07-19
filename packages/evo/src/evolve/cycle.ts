@@ -16,6 +16,8 @@ import { attachProposalArtifact, proposalApproval, stageProposal } from "../prop
 import {
 	advanceEvidenceReviewCursor,
 	collectEvidenceCorpus,
+	type EvidenceCorpus,
+	type EvidenceReviewCursor,
 	MATERIALIZED_CORPUS_BYTES,
 	readEvidenceReviewCursor,
 	validateDraftGrounding,
@@ -35,7 +37,7 @@ import {
 	type EvolutionReleaseResult,
 	RELEASE_ACTION_RUN_STATUS,
 } from "./release.ts";
-import { materializeEvidenceCorpus } from "./research-corpus.ts";
+import { type MaterializedCorpus, materializeEvidenceCorpus, readMaterializedCorpus } from "./research-corpus.ts";
 import { persistEvolutionResearchPlan, runEvolutionResearchPlan } from "./research-plan.ts";
 import { validateComponentCandidate } from "./retry.ts";
 import { createEvolutionRun, evolutionRunDirectory, readEvolutionRun, updateEvolutionRun } from "./run.ts";
@@ -141,52 +143,83 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 	if (!stable) throw new Error("Evo-Pi registry is not initialized");
 	const stableBundle = await loadCompiledBundle(options.paths, stable);
 	const activePreferences = await renderBundlePreferenceInstructions(stableBundle);
-	const reviewCursor = await readEvidenceReviewCursor(options.paths);
-	const corpus = await collectEvidenceCorpus(options.paths, {
-		mode: "incremental",
-		// The cycle materializes the corpus to disk, so it can afford the large budget.
-		maxBytes: options.maxCorpusBytes ?? MATERIALIZED_CORPUS_BYTES,
-		...(reviewCursor ? { reviewCursor } : {}),
-	});
-	const request = options.request ?? (await firstCorpusRequest(options.paths, corpus.inboxFiles));
-	const run = options.runId
-		? await updateEvolutionRun(options.paths, (await readEvolutionRun(options.paths, options.runId)).id, {
-				status: "researching",
-				...(request ? { request } : {}),
-				evidenceDigest: corpus.evidenceDigest,
-				error: undefined,
-			})
-		: await createEvolutionRun({
-				paths: options.paths,
-				trigger: options.trigger ?? (request ? "request" : "scheduled"),
-				...(request ? { request } : {}),
-				evidenceDigest: corpus.evidenceDigest,
-			});
+	// A run created by `retry --from building` already carries its frozen research plan
+	// and evidence corpus; the cycle skips research and resumes at the builder.
+	const priorRun = options.runId ? await readEvolutionRun(options.paths, options.runId) : undefined;
+	const resumeFromBuilding = priorRun?.resumeFrom === "building";
+	let collected: EvidenceCorpus | undefined;
+	let run: EvolutionRun;
+	if (priorRun && resumeFromBuilding) {
+		run = priorRun;
+	} else {
+		const reviewCursor = await readEvidenceReviewCursor(options.paths);
+		collected = await collectEvidenceCorpus(options.paths, {
+			mode: "incremental",
+			// The cycle materializes the corpus to disk, so it can afford the large budget.
+			maxBytes: options.maxCorpusBytes ?? MATERIALIZED_CORPUS_BYTES,
+			...(reviewCursor ? { reviewCursor } : {}),
+		});
+		const request = options.request ?? (await firstCorpusRequest(options.paths, collected.inboxFiles));
+		run = priorRun
+			? await updateEvolutionRun(options.paths, priorRun.id, {
+					status: "researching",
+					...(request ? { request } : {}),
+					evidenceDigest: collected.evidenceDigest,
+					error: undefined,
+				})
+			: await createEvolutionRun({
+					paths: options.paths,
+					trigger: options.trigger ?? (request ? "request" : "scheduled"),
+					...(request ? { request } : {}),
+					evidenceDigest: collected.evidenceDigest,
+				});
+	}
 	try {
 		const config = options.config ?? (await readEvoControlConfig(options.paths));
 		const cwd = options.cwd ?? process.cwd();
-		// The corpus lives on disk as an on-demand file tree; prompts carry only its index
-		// so large evidence never crowds the context window.
-		const materializedCorpus = await materializeEvidenceCorpus(corpus, evolutionRunDirectory(options.paths, run.id));
-		const research = await runEvolutionResearchPlan({
-			paths: options.paths,
-			run,
-			corpus,
-			materializedCorpus,
-			runner: options.runner,
-			cwd,
-			...(options.agentDir ? { agentDir: options.agentDir } : {}),
-			model: config.models.researchPlanner.model,
-			...(config.models.researchPlanner.thinkingLevel
-				? { thinkingLevel: config.models.researchPlanner.thinkingLevel }
-				: {}),
-			...(activePreferences ? { activePreferences } : {}),
-			...(options.signal ? { signal: options.signal } : {}),
-		});
-		await assertFrozenExperiment(options.paths, research.state, research.plan.experiment);
-		await applyInboxDecisions(options.paths, research.plan.inboxDecisions, new Set(corpus.inboxFiles));
-		if (research.plan.candidateKind === "none") {
-			await advanceEvidenceReviewCursor(options.paths, corpus.nextReviewCursor);
+		const directory = evolutionRunDirectory(options.paths, run.id);
+		let plan: EvolutionResearchPlan;
+		let corpus: Pick<EvidenceCorpus, "text" | "truncated">;
+		let materializedCorpus: MaterializedCorpus;
+		// Set only by a run that collected fresh evidence; resume runs leave the review
+		// cursor untouched because their corpus was frozen by the source run.
+		let reviewCursorToAdvance: EvidenceReviewCursor | undefined;
+		if (resumeFromBuilding) {
+			plan = JSON.parse(await readFile(join(directory, "plan.json"), "utf8")) as EvolutionResearchPlan;
+			await assertFrozenExperiment(options.paths, run, plan.experiment);
+			const frozenCorpus = await readMaterializedCorpus(directory);
+			if (!frozenCorpus) throw new Error(`Evolution task ${run.id} has no frozen evidence corpus to resume`);
+			materializedCorpus = frozenCorpus;
+			corpus = { text: "", truncated: false };
+		} else if (collected) {
+			// The corpus lives on disk as an on-demand file tree; prompts carry only its index
+			// so large evidence never crowds the context window.
+			materializedCorpus = await materializeEvidenceCorpus(collected, directory);
+			const research = await runEvolutionResearchPlan({
+				paths: options.paths,
+				run,
+				corpus: collected,
+				materializedCorpus,
+				runner: options.runner,
+				cwd,
+				...(options.agentDir ? { agentDir: options.agentDir } : {}),
+				model: config.models.researchPlanner.model,
+				...(config.models.researchPlanner.thinkingLevel
+					? { thinkingLevel: config.models.researchPlanner.thinkingLevel }
+					: {}),
+				...(activePreferences ? { activePreferences } : {}),
+				...(options.signal ? { signal: options.signal } : {}),
+			});
+			await assertFrozenExperiment(options.paths, research.state, research.plan.experiment);
+			await applyInboxDecisions(options.paths, research.plan.inboxDecisions, new Set(collected.inboxFiles));
+			plan = research.plan;
+			corpus = collected;
+			reviewCursorToAdvance = collected.nextReviewCursor;
+		} else {
+			throw new Error("Evolution cycle cannot research without an evidence corpus");
+		}
+		if (plan.candidateKind === "none") {
+			if (reviewCursorToAdvance) await advanceEvidenceReviewCursor(options.paths, reviewCursorToAdvance);
 			await garbageCollectInbox(options.paths);
 			const completed = await updateEvolutionRun(options.paths, run.id, { status: "completed" });
 			return { run: completed, proposals: [] };
@@ -195,7 +228,7 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 		const built = await runEvolutionBuilder({
 			paths: options.paths,
 			runId: run.id,
-			plan: research.plan,
+			plan,
 			parentDigest: stable,
 			corpus,
 			materializedCorpus,
@@ -271,7 +304,7 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 		// always do; request runs only when configured). A recommendation that is
 		// not auto-executed is deferred to an explicit user decision after
 		// evaluation instead of silently blocking or silently skipping.
-		const historicalReplay = research.plan.experiment.evidenceStrategy.historicalReplay;
+		const historicalReplay = plan.experiment.evidenceStrategy.historicalReplay;
 		const autoExecuteRecommended = run.trigger === "scheduled" || config.verification.approval === "auto";
 		const replayDeclared =
 			(historicalReplay.mode === "required" ||
@@ -297,11 +330,7 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 				artifact: sha256(replay.markdown),
 			});
 		}
-		await assertFrozenExperiment(
-			options.paths,
-			await readEvolutionRun(options.paths, run.id),
-			research.plan.experiment,
-		);
+		await assertFrozenExperiment(options.paths, await readEvolutionRun(options.paths, run.id), plan.experiment);
 		const deferredProfiles =
 			historicalReplay.mode === "recommended" && !autoExecuteRecommended
 				? await (async () => {
@@ -312,7 +341,7 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 		await updateEvolutionRun(options.paths, run.id, { status: "evaluating", proposalId: proposal.id });
 		const evaluation = await runEvolutionEvaluator({
 			paths: options.paths,
-			plan: research.plan,
+			plan,
 			proposal,
 			corpus,
 			materializedCorpus,
@@ -348,7 +377,7 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 				verdict: evaluation.verdict,
 				evaluatedAt: new Date().toISOString(),
 			});
-			await advanceEvidenceReviewCursor(options.paths, corpus.nextReviewCursor);
+			if (reviewCursorToAdvance) await advanceEvidenceReviewCursor(options.paths, reviewCursorToAdvance);
 			await garbageCollectInbox(options.paths);
 			const parked = await updateEvolutionRun(options.paths, run.id, {
 				status: "awaiting-evidence",
@@ -370,10 +399,10 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 			config,
 			proposal,
 			verdict: evaluation.verdict,
-			evidenceStrategy: research.plan.experiment.evidenceStrategy,
+			evidenceStrategy: plan.experiment.evidenceStrategy,
 			receipts: await readProfileReceipts(options.paths, run.id),
 		});
-		await advanceEvidenceReviewCursor(options.paths, corpus.nextReviewCursor);
+		if (reviewCursorToAdvance) await advanceEvidenceReviewCursor(options.paths, reviewCursorToAdvance);
 		await garbageCollectInbox(options.paths);
 		const completed = await updateEvolutionRun(options.paths, run.id, {
 			status: RELEASE_ACTION_RUN_STATUS[release.action],

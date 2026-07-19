@@ -11,6 +11,7 @@ import type {
 import { afterEach, describe, expect, it } from "vitest";
 import { compileBundle } from "../src/bundle/compile.ts";
 import { createEvoCommandExtension, refreshEvoStatusIndicator, runEvoCli } from "../src/cli.ts";
+import { readEvoControlConfig } from "../src/evolve/config.ts";
 import { createEvoExtension } from "../src/extension.ts";
 import { getEvoPaths } from "../src/paths.ts";
 import { saveProposal, stageProposal } from "../src/proposal.ts";
@@ -52,6 +53,7 @@ function createHarness(cwd: string) {
 	let inputResponse: string | undefined;
 	let inputHandler: (() => Promise<string | undefined>) | undefined;
 	let selectResponse: string | undefined = "Approve";
+	let selectResponses: Array<string | undefined> = [];
 	let confirmResponse = false;
 	let sessionId = "session-cli";
 	let activeTools = ["read", "bash", "edit"];
@@ -96,12 +98,19 @@ function createHarness(cwd: string) {
 				key: string,
 				items: ReadonlyArray<{ id: string; text: string; onSelect: () => unknown }> | undefined,
 			) => void statusItems.push({ key, items }),
-			select: async () => selectResponse,
+			select: async () => (selectResponses.length > 0 ? selectResponses.shift() : selectResponse),
 			input: async () => (inputHandler ? inputHandler() : inputResponse),
 			confirm: async (title: string, message: string) => {
 				confirmations.push({ title, message });
 				return confirmResponse;
 			},
+		},
+		modelRegistry: {
+			getAvailable: () => [
+				{ provider: "openai-codex", id: "gpt-5.6-sol" },
+				{ provider: "openai-codex", id: "gpt-5.6-terra" },
+				{ provider: "kimi-coding", id: "k2" },
+			],
 		},
 	} as unknown as ExtensionCommandContext;
 
@@ -130,6 +139,9 @@ function createHarness(cwd: string) {
 		},
 		setSelectResponse: (value: string | undefined) => {
 			selectResponse = value;
+		},
+		setSelectResponses: (values: Array<string | undefined>) => {
+			selectResponses = [...values];
 		},
 		setSessionId: (value: string) => {
 			sessionId = value;
@@ -234,6 +246,54 @@ describe("Evo CLI extension", () => {
 		expect((await fixture.service.getProposal(proposal.id)).status).toBe("pending");
 		expect(harness.notifications.some((entry) => entry.message.includes("confirmed final diff"))).toBe(true);
 		expect(fixture.getModelCalls()).toBe(0);
+	});
+
+	it("configures an evolution phase model through the interactive picker", async () => {
+		const fixture = await createFixture();
+		await fixture.service.init();
+		const harness = createHarness(fixture.root);
+		await createEvoCommandExtension({ service: fixture.service, runner: fixture.runner })(harness.api);
+		const command = harness.commands.get("evo");
+
+		harness.setSelectResponses(["构建 (builder) — 当前 openai-codex/gpt-5.6-terra", "kimi-coding/k2", "high"]);
+		await command?.handler("model", harness.context);
+
+		const config = await readEvoControlConfig(getEvoPaths(fixture.root));
+		expect(config.models.builder.model).toBe("kimi-coding/k2");
+		expect(config.models.builder.thinkingLevel).toBe("high");
+		expect(config.models.researchPlanner.model).toBe("openai-codex/gpt-5.6-sol");
+		expect(harness.notifications.at(-1)?.message).toContain("kimi-coding/k2");
+	});
+
+	it("configures a phase model directly when the role argument is given", async () => {
+		const fixture = await createFixture();
+		await fixture.service.init();
+		const harness = createHarness(fixture.root);
+		await createEvoCommandExtension({ service: fixture.service, runner: fixture.runner })(harness.api);
+		const command = harness.commands.get("evo");
+
+		harness.setSelectResponses(["kimi-coding/k2", "medium"]);
+		await command?.handler("model triage", harness.context);
+
+		const config = await readEvoControlConfig(getEvoPaths(fixture.root));
+		expect(config.models.triage.model).toBe("kimi-coding/k2");
+		expect(config.models.triage.thinkingLevel).toBe("medium");
+		expect(config.models.builder.model).toBe("openai-codex/gpt-5.6-terra");
+	});
+
+	it("leaves the evolution model config unchanged when the picker is cancelled", async () => {
+		const fixture = await createFixture();
+		await fixture.service.init();
+		const harness = createHarness(fixture.root);
+		await createEvoCommandExtension({ service: fixture.service, runner: fixture.runner })(harness.api);
+		const command = harness.commands.get("evo");
+
+		harness.setSelectResponses([undefined]);
+		await command?.handler("model", harness.context);
+
+		const config = await readEvoControlConfig(getEvoPaths(fixture.root));
+		expect(config.models.builder.model).toBe("openai-codex/gpt-5.6-terra");
+		expect(config.models.builder.thinkingLevel).toBe("max");
 	});
 
 	it("shows and applies a pending T0 proposal through the quick shortcut", async () => {

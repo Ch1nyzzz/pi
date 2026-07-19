@@ -9,8 +9,19 @@ import { runEvolutionCycle } from "../src/evolve/cycle.ts";
 import { EvolutionProcessInspector } from "../src/evolve/inspect-ui.ts";
 import { applyEvolutionReleasePolicy } from "../src/evolve/release.ts";
 import { parseEvolutionResearchPlanValue } from "../src/evolve/research-plan.ts";
-import { resumeEvolutionEvidence, retryEvolutionFromValidation } from "../src/evolve/retry.ts";
-import { evolutionRunDirectory, listEvolutionRuns, readEvolutionRun, updateEvolutionRun } from "../src/evolve/run.ts";
+import {
+	prepareBuildingResume,
+	resolveRetryFrom,
+	resumeEvolutionEvidence,
+	retryEvolutionFromValidation,
+} from "../src/evolve/retry.ts";
+import {
+	createEvolutionRun,
+	evolutionRunDirectory,
+	listEvolutionRuns,
+	readEvolutionRun,
+	updateEvolutionRun,
+} from "../src/evolve/run.ts";
 import { skipPendingVerification } from "../src/evolve/verification-decision.ts";
 import { initializeInboxLifecycle, readInboxLifecycleStates } from "../src/inbox.ts";
 import { deterministicPreferenceId } from "../src/memory/preferences.ts";
@@ -280,6 +291,84 @@ describe("fixed evolution cycle", () => {
 		expect(historicalActivity.find((item) => item.key === `proposal:${result.proposals[0].id}`)?.text).toContain(
 			"等待处理",
 		);
+	});
+
+	it("resumes a builder-failed run at the builder with its frozen plan", async () => {
+		const f = await fixture();
+		// The source run freezes a plan, then the builder dies (provider failure).
+		await expect(
+			runEvolutionCycle({
+				paths: f.paths,
+				service: f.service,
+				runner: new FakeRunner([{ submission: JSON.parse(planResponse()) }]),
+				cwd: f.root,
+				config,
+				request: "reduce repeated friction",
+			}),
+		).rejects.toThrow("No fake response");
+		const failedRun = (await listEvolutionRuns(f.paths))[0];
+		expect(failedRun?.status).toBe("failed");
+		expect(await resolveRetryFrom(f.paths, failedRun?.id ?? "")).toBe("building");
+
+		const queued = await prepareBuildingResume({ paths: f.paths, sourceRunId: failedRun?.id ?? "" });
+		expect(queued.status).toBe("queued");
+		expect(queued.resumeFrom).toBe("building");
+		expect(queued.retryOfRunId).toBe(failedRun?.id);
+		expect(queued.experimentDigest).toBe(failedRun?.experimentDigest);
+
+		const runner = new FakeRunner([
+			{ submission: JSON.parse(builderResponse()) },
+			{
+				submission: {
+					verdict: "verified",
+					summary: "The candidate matches the frozen experiment.",
+					findings: [],
+				},
+			},
+			{
+				submission: {
+					verdict: "needs-evidence",
+					summary: "A real trial is still needed.",
+					findings: [{ title: "Trial pending", detail: "No online samples exist yet." }],
+				},
+			},
+		]);
+		const result = await runEvolutionCycle({
+			paths: f.paths,
+			service: f.service,
+			runner,
+			runId: queued.id,
+			cwd: f.root,
+			config,
+		});
+
+		// No research call: the builder runs first against the frozen plan.
+		expect(runner.requests.map((request) => request.model)).toEqual(["fake/terra-max", "fake/terra", "fake/terra"]);
+		expect(runner.requests[0]?.prompt).toContain("<research_plan>");
+		expect(runner.requests[0]?.prompt).toContain("<evidence_corpus_index");
+		expect(result.run.status).toBe("awaiting-evidence");
+		expect(result.proposals).toHaveLength(1);
+		expect(result.evaluation?.verdict).toBe("needs-evidence");
+		// The frozen assets were copied into the resume run's directory.
+		const directory = evolutionRunDirectory(f.paths, queued.id);
+		expect(await readFile(join(directory, "plan.md"), "utf8")).toContain("# Plan");
+		const renderedSession = await readFile(join(directory, "corpus", "sessions", "evidence-session.md"), "utf8");
+		expect(renderedSession).toContain("Repeated friction happened.");
+		// The resumed run now has a proposal, so a further retry would continue at validation.
+		expect(await resolveRetryFrom(f.paths, result.run.id)).toBe("validating");
+	});
+
+	it("resolves research as the retry point for a run without reusable assets", async () => {
+		const f = await fixture();
+		const bare = await createEvolutionRun({
+			paths: f.paths,
+			trigger: "request",
+			request: "nothing survived",
+			evidenceDigest: "pending",
+			status: "queued",
+		});
+		await updateEvolutionRun(f.paths, bare.id, { status: "failed", error: "research exploded" });
+		expect(await resolveRetryFrom(f.paths, bare.id)).toBe("research");
 	});
 
 	it("materializes an existing-ABI component and waits for explicit Canary approval", async () => {

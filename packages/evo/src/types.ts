@@ -421,6 +421,8 @@ export interface EvolutionRun {
 	experimentDigest?: string;
 	retryOfRunId?: string;
 	sourceProposalId?: string;
+	/** Set by `retry --from building`: the cycle skips research and resumes at the builder. */
+	resumeFrom?: "building";
 }
 
 export interface EvoRoleModelConfig {

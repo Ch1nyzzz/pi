@@ -18,7 +18,16 @@ const TERMINAL_STATUSES = new Set<EvolutionRunStatus>(["completed", "failed", "c
  * of "completed") unrepresentable instead of merely unlikely.
  */
 const RUN_TRANSITIONS: Record<EvolutionRunStatus, ReadonlySet<EvolutionRunStatus>> = {
-	queued: new Set(["researching", "validating", "awaiting-canary-approval", "paused", "failed", "cancelled"]),
+	queued: new Set([
+		"researching",
+		"building",
+		"completed",
+		"validating",
+		"awaiting-canary-approval",
+		"paused",
+		"failed",
+		"cancelled",
+	]),
 	researching: new Set(["planned", "paused", "failed", "cancelled"]),
 	planned: new Set(["building", "completed", "paused", "failed", "cancelled"]),
 	building: new Set(["validating", "paused", "failed", "cancelled"]),
@@ -179,7 +188,8 @@ function parseEvolutionRun(value: unknown): EvolutionRun {
 		(run.retryOfRunId !== undefined &&
 			(typeof run.retryOfRunId !== "string" || !RUN_ID_PATTERN.test(run.retryOfRunId))) ||
 		(run.sourceProposalId !== undefined &&
-			(typeof run.sourceProposalId !== "string" || !PROPOSAL_ID_PATTERN.test(run.sourceProposalId)))
+			(typeof run.sourceProposalId !== "string" || !PROPOSAL_ID_PATTERN.test(run.sourceProposalId))) ||
+		(run.resumeFrom !== undefined && run.resumeFrom !== "building")
 	) {
 		throw new Error("Evolution run is invalid");
 	}
@@ -220,6 +230,7 @@ export async function updateEvolutionRun(
 			| "experimentDigest"
 			| "retryOfRunId"
 			| "sourceProposalId"
+			| "resumeFrom"
 		>
 	>,
 	now: () => Date = () => new Date(),

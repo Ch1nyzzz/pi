@@ -30,7 +30,7 @@ export interface RunEvolutionBuilderOptions {
 	runId: string;
 	plan: EvolutionResearchPlan;
 	parentDigest: string;
-	corpus: EvidenceCorpus;
+	corpus: Pick<EvidenceCorpus, "text" | "truncated">;
 	/** On-disk corpus tree; when present the prompt carries only its index. */
 	materializedCorpus?: MaterializedCorpus;
 	runner: ModelRunner;

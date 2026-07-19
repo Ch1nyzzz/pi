@@ -3,6 +3,10 @@ import {
 	type AuthStorage,
 	createAgentSessionFromServices,
 	createAgentSessionServices,
+	createFindToolDefinition,
+	createGrepToolDefinition,
+	createLsToolDefinition,
+	createReadToolDefinition,
 	type ModelRegistry,
 	resolveCliModel,
 	SessionManager,
@@ -56,6 +60,12 @@ export interface ModelRunRequest {
 	history?: readonly AgentMessage[];
 	/** Explicit built-in/custom tool allowlist. Omit to run with no tools. */
 	tools?: string[];
+	/**
+	 * Execution budget per built-in read-family tool call (read/grep/find/ls). Headless
+	 * phases have no human to interrupt a runaway filesystem scan, so an over-budget call
+	 * is aborted and returned to the model as a tool error. Defaults to 120s.
+	 */
+	toolTimeoutMs?: number;
 	customTools?: ToolDefinition[];
 	/** Structured result channel; when set, the run's result is the submitted object. */
 	submission?: ModelRunSubmission;
@@ -98,6 +108,58 @@ const DEFAULT_RECOVERY_PROMPT =
 	"Your previous response was cut off because it exhausted the available output space. " +
 	"Produce your complete final answer now. Do not call tools. " +
 	"Keep deliberation brief and output the final deliverable directly.";
+
+const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
+
+/** Uniform execution surface: the concrete parameter schemas stay with the factories. */
+type AnyToolDefinition = ToolDefinition<any, any, any>;
+
+/**
+ * Read-family tools traverse arbitrary directory trees, and a headless run has no human
+ * to interrupt a scan that wanders onto huge or slow filesystems. The runner shadows the
+ * built-ins with copies that enforce a hard execution budget: exceeding it aborts the
+ * call (signal-aware tools kill their child process) and the model receives a tool error.
+ */
+const READ_FAMILY_TOOL_FACTORIES: Record<string, (cwd: string) => AnyToolDefinition> = {
+	read: createReadToolDefinition,
+	grep: createGrepToolDefinition,
+	find: createFindToolDefinition,
+	ls: createLsToolDefinition,
+};
+
+function withExecutionTimeout(definition: AnyToolDefinition, timeoutMs: number): AnyToolDefinition {
+	return {
+		...definition,
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const controller = new AbortController();
+			const forwardAbort = () => controller.abort();
+			if (signal?.aborted) controller.abort();
+			else signal?.addEventListener("abort", forwardAbort, { once: true });
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				return await Promise.race([
+					definition.execute(toolCallId, params, controller.signal, onUpdate, ctx),
+					new Promise<never>((_, reject) => {
+						controller.signal.addEventListener(
+							"abort",
+							() => reject(new Error(`${definition.name} execution aborted`)),
+							{ once: true },
+						);
+						timer = setTimeout(() => {
+							reject(
+								new Error(`${definition.name} execution exceeded the ${Math.round(timeoutMs / 1000)}s limit`),
+							);
+							controller.abort();
+						}, timeoutMs);
+					}),
+				]);
+			} finally {
+				if (timer) clearTimeout(timer);
+				signal?.removeEventListener("abort", forwardAbort);
+			}
+		},
+	};
+}
 
 export interface PiModelRunnerOptions {
 	/** Optional shared auth backend, primarily for embedded runtimes and tests. */
@@ -157,7 +219,16 @@ export function createPiModelRunner(options: PiModelRunnerOptions = {}): ModelRu
 					}
 				: undefined;
 			const toolNames = [...(request.tools ?? []), ...(submissionTool ? [submissionTool.name] : [])];
-			const customTools = [...(request.customTools ?? []), ...(submissionTool ? [submissionTool] : [])];
+			const toolTimeoutMs = request.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
+			const timedReadTools = (request.tools ?? [])
+				.map((name) => READ_FAMILY_TOOL_FACTORIES[name]?.(request.cwd))
+				.filter((definition) => definition !== undefined)
+				.map((definition) => withExecutionTimeout(definition, toolTimeoutMs));
+			const customTools = [
+				...timedReadTools,
+				...(request.customTools ?? []),
+				...(submissionTool ? [submissionTool] : []),
+			];
 
 			const sessionManager = SessionManager.inMemory(request.cwd, { id: request.sessionIdentity });
 			const { session, modelFallbackMessage } = await createAgentSessionFromServices({
@@ -239,6 +310,17 @@ export function createPiModelRunner(options: PiModelRunnerOptions = {}): ModelRu
 					throw new Error("Model run completed without a final assistant message");
 				}
 
+				// A provider-level failure ends the turn for good. Surface its message
+				// immediately: recovery and submission reprompts cannot succeed on a session
+				// whose requests keep failing, and they masked the real error.
+				const throwIfTerminated = (message: { stopReason: string; errorMessage?: string }) => {
+					if (message.stopReason === "error" || message.stopReason === "aborted") {
+						const detail = message.errorMessage ? `: ${message.errorMessage}` : "";
+						throw new Error(`Model run ended with stop reason "${message.stopReason}"${detail}`);
+					}
+				};
+				throwIfTerminated(finalMessage);
+
 				// A "length" stop means the output space or context window ran out. The session
 				// survives, so recover in place: the pre-prompt compaction check frees the window
 				// (overflow-shaped usage triggers it) and a fresh turn gets a fresh output budget.
@@ -263,6 +345,7 @@ export function createPiModelRunner(options: PiModelRunnerOptions = {}): ModelRu
 						throw new Error("Model run recovery completed without a final assistant message");
 					}
 					finalMessage = recovered;
+					throwIfTerminated(recovered);
 				}
 
 				// The submission is the result; a run that ends without one gets bounded,
@@ -282,6 +365,7 @@ export function createPiModelRunner(options: PiModelRunnerOptions = {}): ModelRu
 							throw new Error("Submission reprompt completed without a final assistant message");
 						}
 						finalMessage = reprompted;
+						throwIfTerminated(reprompted);
 					}
 					if (!submitted) {
 						throw new Error(`Model run ended without a ${request.submission.toolName} submission`);

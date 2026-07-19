@@ -323,6 +323,66 @@ describe("createPiModelRunner", () => {
 		).rejects.toThrow("Model run ended without a submit_verdict submission");
 	});
 
+	it("surfaces the provider error instead of reprompting for a missing submission", async () => {
+		const { faux, model, runner } = createFauxRunner();
+		faux.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "401 Unauthorized: token expired" }),
+		]);
+		const events: Array<{ type: string }> = [];
+
+		await expect(
+			runner.run({
+				cwd: process.cwd(),
+				systemPrompt: "builder",
+				prompt: "build",
+				model: `${model.provider}/${model.id}`,
+				submission: VERDICT_SUBMISSION,
+				onStreamEvent: (event) => events.push(event),
+			}),
+		).rejects.toThrow('Model run ended with stop reason "error": 401 Unauthorized: token expired');
+		expect(faux.state.callCount).toBe(1);
+		expect(events.some((event) => event.type === "submission-retry")).toBe(false);
+	});
+
+	it("surfaces an abort instead of reporting a missing submission", async () => {
+		const { faux, model, runner } = createFauxRunner();
+		faux.setResponses([fauxAssistantMessage("", { stopReason: "aborted", errorMessage: "Request was aborted." })]);
+
+		await expect(
+			runner.run({
+				cwd: process.cwd(),
+				systemPrompt: "builder",
+				prompt: "build",
+				model: `${model.provider}/${model.id}`,
+				submission: VERDICT_SUBMISSION,
+			}),
+		).rejects.toThrow('Model run ended with stop reason "aborted": Request was aborted.');
+		expect(faux.state.callCount).toBe(1);
+	});
+
+	it("bounds built-in read tools with the headless execution timeout", async () => {
+		const { faux, model, runner } = createFauxRunner();
+		faux.setResponses([
+			fauxAssistantMessage([fauxToolCall("grep", { pattern: "needle", path: "." })]),
+			(context) => {
+				const toolResult = context.messages.find((message) => message.role === "toolResult");
+				expect(JSON.stringify(toolResult)).toMatch(/grep execution exceeded the \d+s limit/);
+				return fauxAssistantMessage("recovered");
+			},
+		]);
+
+		const result = await runner.run({
+			cwd: process.cwd(),
+			systemPrompt: "judge",
+			prompt: "search",
+			model: `${model.provider}/${model.id}`,
+			tools: ["grep"],
+			toolTimeoutMs: 1,
+		});
+
+		expect(result.text).toBe("recovered");
+	});
+
 	it("disables length recovery when maxLengthRecoveries is zero", async () => {
 		const { faux, model, runner } = createFauxRunner();
 		faux.setResponses([fauxAssistantMessage("partial", { stopReason: "length" })]);

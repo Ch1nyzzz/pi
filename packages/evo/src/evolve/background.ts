@@ -8,7 +8,7 @@ import { loadProposal } from "../proposal.ts";
 import { createPiModelRunner } from "../reflect/model-runner.ts";
 import type { EvolutionRun, EvolutionRunActiveStatus } from "../types.ts";
 import { runEvolutionCycle } from "./cycle.ts";
-import { resumeEvolutionEvidence } from "./retry.ts";
+import { prepareBuildingResume, resumeEvolutionEvidence } from "./retry.ts";
 import {
 	createEvolutionRun,
 	deleteEvolutionRun,
@@ -47,41 +47,33 @@ async function processMatchesRun(pid: number, runId: string): Promise<boolean> {
 	}
 }
 
-export async function startBackgroundEvolution(options: {
-	paths: EvoPaths;
-	cwd: string;
-	request?: string;
-}): Promise<EvolutionRun> {
+async function assertNoActiveEvolution(paths: EvoPaths): Promise<void> {
 	// Single-writer semantics: a second trigger fails fast instead of queueing
 	// behind the evolution-cycle lock for up to a day.
-	const existing = await inspectBackgroundEvolutions(options.paths);
+	const existing = await inspectBackgroundEvolutions(paths);
 	const active = existing.find((run) => ACTIVE_STATUSES.has(run.status) || run.status === "paused");
 	if (active) {
 		throw new Error(
 			`Evolution run ${active.id} is already ${active.status}; wait for it or remove it before starting another`,
 		);
 	}
-	const run = await createEvolutionRun({
-		paths: options.paths,
-		trigger: options.request ? "request" : "scheduled",
-		...(options.request ? { request: options.request } : {}),
-		evidenceDigest: "pending",
-		status: "queued",
-	});
+}
+
+async function spawnEvolutionWorker(paths: EvoPaths, run: EvolutionRun, cwd: string): Promise<EvolutionRun> {
 	const entrypoint = workerEntrypoint();
-	const logFile = join(evolutionRunDirectory(options.paths, run.id), "worker.log");
+	const logFile = join(evolutionRunDirectory(paths, run.id), "worker.log");
 	try {
 		await access(entrypoint);
 		const log = await open(logFile, "a", 0o600);
 		try {
-			const child = spawn(process.execPath, [entrypoint, "__worker", options.paths.root, run.id, options.cwd], {
-				cwd: options.cwd,
+			const child = spawn(process.execPath, [entrypoint, "__worker", paths.root, run.id, cwd], {
+				cwd,
 				detached: true,
 				stdio: ["ignore", log.fd, log.fd],
 			});
 			if (!child.pid) throw new Error("Background worker did not start");
 			child.unref();
-			return await updateEvolutionRun(options.paths, run.id, {
+			return await updateEvolutionRun(paths, run.id, {
 				workerPid: child.pid,
 				workerStartedAt: new Date().toISOString(),
 				logFile,
@@ -91,9 +83,40 @@ export async function startBackgroundEvolution(options: {
 		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		await updateEvolutionRun(options.paths, run.id, { status: "failed", error: message });
+		await updateEvolutionRun(paths, run.id, { status: "failed", error: message });
 		throw error;
 	}
+}
+
+export async function startBackgroundEvolution(options: {
+	paths: EvoPaths;
+	cwd: string;
+	request?: string;
+	retryOfRunId?: string;
+}): Promise<EvolutionRun> {
+	await assertNoActiveEvolution(options.paths);
+	const created = await createEvolutionRun({
+		paths: options.paths,
+		trigger: options.request ? "request" : "scheduled",
+		...(options.request ? { request: options.request } : {}),
+		evidenceDigest: "pending",
+		status: "queued",
+	});
+	const run = options.retryOfRunId
+		? await updateEvolutionRun(options.paths, created.id, { retryOfRunId: options.retryOfRunId })
+		: created;
+	return spawnEvolutionWorker(options.paths, run, options.cwd);
+}
+
+/** Spawn a detached worker that resumes a terminal run's frozen plan at the builder. */
+export async function startBackgroundBuildingResume(options: {
+	paths: EvoPaths;
+	sourceRunId: string;
+	cwd: string;
+}): Promise<EvolutionRun> {
+	await assertNoActiveEvolution(options.paths);
+	const run = await prepareBuildingResume(options);
+	return spawnEvolutionWorker(options.paths, run, options.cwd);
 }
 
 async function appendWorkerProgress(paths: EvoPaths, runId: string, event: Record<string, unknown>): Promise<void> {
