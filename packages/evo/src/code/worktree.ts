@@ -14,6 +14,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { EvoPaths } from "../paths.ts";
 import { atomicWriteFile, atomicWriteJson, canonicalJson, readJson, sha256, withFileLock } from "../storage.ts";
 import { type CommandResult, type CommandRunner, SpawnCommandRunner } from "./command-runner.ts";
@@ -242,6 +243,23 @@ async function inspectRepository(runner: CommandRunner, cwd: string): Promise<Re
 		await runGit(runner, root, ["rev-parse", "--verify", "HEAD^{commit}"], "Resolve repository HEAD")
 	).stdout.trim();
 	return { root, identity: await repositoryIdentity(runner, root), baseCommit };
+}
+
+/**
+ * Code candidates always patch Evo-Pi's own source repository — the git
+ * repository containing this file — never the incidental working directory of
+ * whichever session happened to trigger the evolution cycle.
+ */
+export async function resolveEvoSourceRepositoryRoot(runner?: CommandRunner): Promise<string> {
+	const commandRunner = runner ?? new SpawnCommandRunner();
+	const sourceDirectory = dirname(fileURLToPath(import.meta.url));
+	const root = await runGit(
+		commandRunner,
+		sourceDirectory,
+		["rev-parse", "--show-toplevel"],
+		"Resolve Evo-Pi source repository root",
+	);
+	return realpath(root.stdout.trim());
 }
 
 function assertSafeChangedPath(path: string): void {

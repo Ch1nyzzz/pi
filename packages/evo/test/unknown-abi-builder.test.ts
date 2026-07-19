@@ -319,6 +319,7 @@ describe("unregistered ABI Builder path", () => {
 			parentDigest: bundle.digest,
 			runner,
 			cwd: repository,
+			repositoryCwd: repository,
 			config,
 			codeValidationExecutor: validator,
 		});
@@ -354,6 +355,7 @@ describe("unregistered ABI Builder path", () => {
 				parentDigest: bundle.digest,
 				runner,
 				cwd: repository,
+				repositoryCwd: repository,
 				config,
 				codeValidationExecutor: validator,
 			}),

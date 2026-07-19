@@ -8,6 +8,7 @@ import {
 	type CodeL1Result,
 	type CodeValidationExecutor,
 	codeApprovalDigest,
+	resolveEvoSourceRepositoryRoot,
 	revalidateCodeWorktree,
 	stageCodeWorktree,
 } from "./code/worktree.ts";
@@ -554,7 +555,7 @@ export async function stageProposal(options: {
 			await rm(temporaryDirectory, { recursive: true, force: true });
 			const staged = await stageCodeWorktree({
 				paths: options.paths,
-				repositoryCwd: options.repositoryCwd ?? process.cwd(),
+				repositoryCwd: options.repositoryCwd ?? (await resolveEvoSourceRepositoryRoot()),
 				proposalId: id,
 				revision: 1,
 				parentBundleDigest: options.parentDigest,
@@ -943,7 +944,10 @@ export async function reviseProposal(options: {
 			const codePatch = options.draft.codePatch ?? "";
 			const staged = await stageCodeWorktree({
 				paths: options.paths,
-				repositoryCwd: options.repositoryCwd ?? current.codeWorkspace?.repositoryRoot ?? process.cwd(),
+				repositoryCwd:
+					options.repositoryCwd ??
+					current.codeWorkspace?.repositoryRoot ??
+					(await resolveEvoSourceRepositoryRoot()),
 				proposalId: current.id,
 				revision,
 				parentBundleDigest: current.parentBundleDigest,

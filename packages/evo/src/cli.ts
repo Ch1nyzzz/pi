@@ -808,7 +808,7 @@ async function runExtensionPermit(
 				proposalId: proposal.id,
 				expected,
 				instruction,
-				...(dependencies.cwd ? { cwd: dependencies.cwd, repositoryCwd: dependencies.cwd } : {}),
+				...(dependencies.cwd ? { cwd: dependencies.cwd } : {}),
 				...(dependencies.agentDir ? { agentDir: dependencies.agentDir } : {}),
 				...(dependencies.model ? { model: dependencies.model } : {}),
 			});
@@ -1763,7 +1763,7 @@ async function runLocalPermit(
 				proposalId: proposal.id,
 				expected,
 				instruction,
-				...(dependencies.cwd ? { cwd: dependencies.cwd, repositoryCwd: dependencies.cwd } : {}),
+				...(dependencies.cwd ? { cwd: dependencies.cwd } : {}),
 				...(dependencies.agentDir ? { agentDir: dependencies.agentDir } : {}),
 				...(dependencies.model ? { model: dependencies.model } : {}),
 			});

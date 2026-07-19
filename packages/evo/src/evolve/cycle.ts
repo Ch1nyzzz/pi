@@ -2,6 +2,7 @@ import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { loadCompiledBundle } from "../bundle/compile.ts";
 import type { CodeValidationExecutor } from "../code/worktree.ts";
+import { resolveEvoSourceRepositoryRoot } from "../code/worktree.ts";
 import { createDefaultEvoAbiRegistry } from "../components/registry.ts";
 import {
 	applyInboxDecisions,
@@ -53,6 +54,8 @@ export interface RunEvolutionCycleOptions {
 	runner: ModelRunner;
 	service?: EvoService;
 	cwd?: string;
+	/** Repository that code candidates patch; defaults to Evo-Pi's own source repository. */
+	repositoryCwd?: string;
 	agentDir?: string;
 	request?: string;
 	trigger?: EvolutionRun["trigger"];
@@ -81,6 +84,8 @@ export interface RunUnknownAbiBuilderCycleOptions {
 	/** Stable bundle observed by pack import; drift fails before a run is created. */
 	parentDigest?: string;
 	cwd?: string;
+	/** Repository that the infrastructure patch is staged against; defaults to Evo-Pi's own source repository. */
+	repositoryCwd?: string;
 	agentDir?: string;
 	config?: EvoControlConfig;
 	codeValidationExecutor?: CodeValidationExecutor;
@@ -224,6 +229,12 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 			const completed = await updateEvolutionRun(options.paths, run.id, { status: "completed" });
 			return { run: completed, proposals: [] };
 		}
+		// Code candidates always patch Evo-Pi's own source repository, never the
+		// incidental launch directory of the triggering session.
+		const codeRepositoryCwd =
+			plan.candidateKind === "code"
+				? (options.repositoryCwd ?? (await resolveEvoSourceRepositoryRoot()))
+				: undefined;
 		await updateEvolutionRun(options.paths, run.id, { status: "building" });
 		const built = await runEvolutionBuilder({
 			paths: options.paths,
@@ -234,7 +245,7 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 			materializedCorpus,
 			sessionIdentity: `evo-builder-${run.id}`,
 			runner: options.runner,
-			cwd,
+			cwd: codeRepositoryCwd ?? cwd,
 			...(options.agentDir ? { agentDir: options.agentDir } : {}),
 			model: config.models.builder.model,
 			...(config.models.builder.thinkingLevel ? { thinkingLevel: config.models.builder.thinkingLevel } : {}),
@@ -251,7 +262,7 @@ async function runEvolutionCycleUnlocked(options: RunEvolutionCycleOptions): Pro
 			parentDigest: stable,
 			draft: groundedDraft,
 			observationsMarkdown: built.observationsMarkdown,
-			repositoryCwd: cwd,
+			repositoryCwd: codeRepositoryCwd ?? cwd,
 			...(built.codeBase ? { expectedCodeBase: built.codeBase } : {}),
 			...(options.codeValidationExecutor ? { codeValidationExecutor: options.codeValidationExecutor } : {}),
 			...(options.signal ? { signal: options.signal } : {}),
@@ -537,14 +548,14 @@ async function runUnknownAbiBuilderCycleUnlocked(
 		});
 		await assertFrozenExperiment(options.paths, persisted.state, persisted.plan.experiment);
 		const config = options.config ?? (await readEvoControlConfig(options.paths));
-		const cwd = options.cwd ?? process.cwd();
+		const repositoryCwd = options.repositoryCwd ?? (await resolveEvoSourceRepositoryRoot());
 		await updateEvolutionRun(options.paths, run.id, { status: "building" });
 		const built = await runUnknownAbiBuilder({
 			paths: options.paths,
 			plan: persisted.plan,
 			request,
 			runner: options.runner,
-			cwd,
+			cwd: repositoryCwd,
 			...(options.agentDir ? { agentDir: options.agentDir } : {}),
 			model: config.models.builder.model,
 			...(config.models.builder.thinkingLevel ? { thinkingLevel: config.models.builder.thinkingLevel } : {}),
@@ -559,7 +570,7 @@ async function runUnknownAbiBuilderCycleUnlocked(
 			parentDigest: stable,
 			draft: built.draft,
 			observationsMarkdown: built.observationsMarkdown,
-			repositoryCwd: cwd,
+			repositoryCwd,
 			...(options.codeValidationExecutor ? { codeValidationExecutor: options.codeValidationExecutor } : {}),
 			...(options.signal ? { signal: options.signal } : {}),
 		});
