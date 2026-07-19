@@ -34,9 +34,9 @@ export const OPENCODE_GO_MODELS = {
 		thinkingLevelMap: {"minimal":null,"low":null,"medium":null,"high":"high","max":"max"},
 		input: ["text"],
 		cost: {
-			input: 1.74,
-			output: 3.48,
-			cacheRead: 0.0145,
+			input: 0.435,
+			output: 0.87,
+			cacheRead: 0.003625,
 			cacheWrite: 0,
 		},
 		contextWindow: 1000000,
@@ -82,10 +82,10 @@ export const OPENCODE_GO_MODELS = {
 	"grok-4.5": {
 		id: "grok-4.5",
 		name: "Grok 4.5",
-		api: "openai-completions",
+		api: "openai-responses",
 		provider: "opencode-go",
 		baseUrl: "https://opencode.ai/zen/go/v1",
-		compat: {"supportsStore":false,"supportsDeveloperRole":false,"maxTokensField":"max_tokens"},
+		compat: {"sessionAffinityFormat":"openai-nosession"},
 		reasoning: true,
 		input: ["text", "image"],
 		cost: {
@@ -96,7 +96,7 @@ export const OPENCODE_GO_MODELS = {
 		},
 		contextWindow: 500000,
 		maxTokens: 500000,
-	} satisfies Model<"openai-completions">,
+	} satisfies Model<"openai-responses">,
 	"kimi-k2.6": {
 		id: "kimi-k2.6",
 		name: "Kimi K2.6",
@@ -136,7 +136,7 @@ export const OPENCODE_GO_MODELS = {
 	} satisfies Model<"openai-completions">,
 	"kimi-k3": {
 		id: "kimi-k3",
-		name: "Kimi K3",
+		name: "Kimi K3 (2x usage)",
 		api: "openai-completions",
 		provider: "opencode-go",
 		baseUrl: "https://opencode.ai/zen/go/v1",
@@ -180,9 +180,9 @@ export const OPENCODE_GO_MODELS = {
 		reasoning: true,
 		input: ["text"],
 		cost: {
-			input: 1.74,
-			output: 3.48,
-			cacheRead: 0.0145,
+			input: 0.435,
+			output: 0.87,
+			cacheRead: 0.003625,
 			cacheWrite: 0,
 		},
 		contextWindow: 1048576,
